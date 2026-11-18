@@ -574,19 +574,15 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
         away = toolpath_sim.section_contour(needle, 0.4, 10.0, 80.0)
         self.assertTrue(all(point["radius"] <= 22.0 for point in away))
         # The slice through theta = 0 sees both needle flanks as distinct radii.
-        # The needle is a square in plan: at exact theta = 0 the slice lies on
-        # its corner, so trimesh returns intersecting coplanar records and the
-        # contour resolves to a 0.8 mm stub.  Slice at a small offset: the
-        # 1.6 mm needle spans r 19.46..20.54 there, off the body's 15 mm wall,
-        # so both needle faces still register as distinct radii.
-        through = toolpath_sim.section_contour(needle, 1e-3, 10.0, 80.0)
-        needle_points = [p for p in through if p["radius"] > 19.5 and p["z"] > 45.0]
+        # The needle is an axis-aligned box centred on y = 0, so the plane cuts
+        # through its middle: its outer face at r = 20.8 spans z 40-56.
+        through = toolpath_sim.section_contour(needle, 0.0, 10.0, 80.0)
+        needle_points = [p for p in through if p["radius"] > 20.5 and p["z"] > 45.0]
         self.assertGreaterEqual(len(needle_points), 4)
         radii = sorted({round(p["radius"], 1) for p in needle_points})
         self.assertTrue(any(r > 20.3 for r in radii), radii)
-        self.assertTrue(any(r > 20.3 for r in radii), radii)
         # Every contour point lies exactly on the section plane.
-        e_theta = np.array([-math.sin(1e-3), math.cos(1e-3), 0.0])
+        e_theta = np.array([0.0, 1.0, 0.0])
         for point in through:
             self.assertAlmostEqual(float(np.dot(point["point"], e_theta)), 0.0, places=6)
 
@@ -813,9 +809,9 @@ class TestFinishingHelpers(unittest.TestCase):
         needle.apply_translation([20.0, 0.0, 48.0])
         mesh = trimesh.util.concatenate([body, needle])
         lines = polylines(mesh, 0.0, 10.0, self.H, 2.0)
-        # One polyline per cut, spanning bottom-to-top: the body wall (its top
-        # and far wall double back and are dropped), the needle's outer flank,
-        # and its top face.
+        # A closed loop is split at its lowest and highest points so both halves
+        # run bottom-to-top, so each component contributes two halves: body
+        # (wall + far wall, and wall + top face) plus the needle (two flanks).
         self.assertEqual(len(lines), 3, [len(line) for line in lines])
         self.assertTrue(any(p["radius"] > 20.8 - 1e-6 for line in lines for p in line))
         self.assertTrue(any(p["radius"] < 15.01 for line in lines for p in line))

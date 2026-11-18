@@ -298,8 +298,8 @@ def shadow_radius(
         return 0.0
     return float(np.max(above) + allowance)
 
-def _vkey(point: Sequence[float], quantum: float = 1e-5) -> tuple[int, int, int]:
-    """Hash a slice endpoint; ``mesh_plane`` reuses vertex positions exactly."""
+def _vkey(point: Sequence[float], quantum: float = 1e-6) -> tuple[int, int, int]:
+    """Hash a slice endpoint; ``mesh_plane`` returns shared vertices exactly."""
 
     return (
         int(round(float(point[0]) / quantum)),
@@ -308,481 +308,235 @@ def _vkey(point: Sequence[float], quantum: float = 1e-5) -> tuple[int, int, int]
     )
 
 
-def _sample_between(first: dict[str, Any], second: dict[str, Any], t: float) -> dict[str, Any]:
-    """Linear interpolation of one polyline sample (``t`` in ``[0, 1]``)."""
+def _chain_loops(
+    segments: np.ndarray,
+    normals: list[tuple[float, float]],
+) -> list[tuple[list[np.ndarray], list[tuple[float, float]], bool]]:
+    """Chain slice segments into runs by shared endpoints.
 
-    keys = ("radius", "z", "n_r", "n_z")
-    values = {key: first[key] + t * (second[key] - first[key]) for key in keys}
-    return {
-        "point": np.asarray(first["point"] + t * (second["point"] - first["point"])),
-        "radius": float(values["radius"]),
-        "z": float(values["z"]),
-        "n_r": float(values["n_r"]),
-        "n_z": float(values["n_z"]),
-    }
-
-
-def _resample_piece(
-    piece: list[dict[str, Any]], step: float, clip_floor: float | None = None
-) -> list[dict[str, Any]]:
-    """Resample one connected piece at arc-length ``step`` (mm).
-
-    Endpoints are kept as-is so neighbouring slices stay aligned, and every
-    inserted point interpolates ``radius``/``z``/normal along its source segment,
-    so a resampled sample never leaves the section plane.
+    Returns ``(points, point_normals, closed)`` per run, where ``point_normals``
+    is the intersected face's planar normal carried per vertex (outward, from
+    the face normal).  A run that returns to its start is closed; its start
+    point is not repeated.
     """
 
-    out: list[dict[str, Any]] = [dict(piece[0])]
-    carry = 0.0
-    for first, second in zip(piece, piece[1:]):
-        length = math.hypot(second["radius"] - first["radius"], second["z"] - first["z"])
-        if length <= EPS:
-            continue
-        # ``carry`` is the distance already covered since the last sample.
-        travelled = step - carry
-        while travelled < length - EPS:
-            out.append(_sample_between(first, second, travelled / length))
-            travelled += step
-        carry = max(0.0, length - (travelled - step))
-        if carry >= step - EPS:
-            carry -= step
-    tail = dict(piece[-1])
-    ends_at_clip = clip_floor is not None and abs(tail["z"] - clip_floor) <= 1e-6
-    if len(out) > 1 and ends_at_clip:
-        gap = math.hypot(
-            tail["radius"] - out[-1]["radius"], tail["z"] - out[-1]["z"]
-        )
-        if gap < 0.5 * step:
-            # A stub shorter than half a step only exists because the clip cut
-            # the chain there; keep it only if it carries a real length.
-            out.pop()
-    out.append(tail)
-    return out
-
-
-def _ordered_segment_ids(
-    records: list[dict[str, Any]],
-) -> list[list[int]]:
-    """Chain mesh_plane segments into connected runs by shared endpoints.
-
-    Plain dict adjacency keyed by :func:`_vkey`; no networkx.  Open chains start
-    at a degree-1 endpoint (all real slices are open), and whatever is left is
-    walked from an arbitrary endpoint so closed loops are not dropped.
-    """
+    records: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
+    for first, second in segments:
+        key_a, key_b = _vkey(first), _vkey(second)
+        if key_a != key_b:
+            records.append((key_a, key_b))
+    if not records:
+        return []
 
     adjacency: dict[tuple[int, int, int], list[int]] = {}
-    for segment_id, record in enumerate(records):
-        adjacency.setdefault(record["ka"], []).append(segment_id)
-        adjacency.setdefault(record["kb"], []).append(segment_id)
+    for segment_id, (key_a, key_b) in enumerate(records):
+        adjacency.setdefault(key_a, []).append(segment_id)
+        adjacency.setdefault(key_b, []).append(segment_id)
 
     visited: set[int] = set()
 
-    def walk(start_key: tuple[int, int, int], first: int) -> list[int]:
-        order: list[int] = []
+    def walk(start_key: tuple[int, int, int], first: int) -> tuple[
+        list[np.ndarray], list[tuple[float, float]], bool
+    ]:
+        points: list[np.ndarray] = [np.asarray(segments[first, 0], dtype=np.float64)]
+        carried: list[tuple[float, float]] = [normals[first]]
         key = start_key
         segment_id: int | None = first
+        closed = False
         while segment_id is not None and segment_id not in visited:
             visited.add(segment_id)
-            order.append(segment_id)
-            record = records[segment_id]
-            key = record["kb"] if record["ka"] == key else record["ka"]
-            following = [s for s in adjacency.get(key, []) if s not in visited]
-            segment_id = following[0] if following else None
-        return order
-
-    chains: list[list[int]] = []
-    for key in sorted(k for k, ids in adjacency.items() if len(ids) == 1):
-        for segment_id in adjacency[key]:
-            if segment_id not in visited:
-                chains.append(walk(key, segment_id))
-    for segment_id, record in enumerate(records):
-        if segment_id not in visited:
-            chains.append(walk(record["ka"], segment_id))
-    return chains
-
-
-def _is_proper_chain(records: list[dict[str, Any]], order: list[int]) -> bool:
-    """True when every interior vertex of the run joins exactly two segments."""
-
-    keys = [records[order[0]]["ka"]]
-    for segment_id in order:
-        record = records[segment_id]
-        keys.append(record["kb"] if record["ka"] == keys[-1] else record["ka"])
-    counts: dict[tuple[int, int, int], int] = {}
-    for segment_id in order:
-        for key in (records[segment_id]["ka"], records[segment_id]["kb"]):
-            counts[key] = counts.get(key, 0) + 1
-    return all(counts[key] == 2 for key in keys[1:-1])
-
-
-def _chain_model(
-    segments: list[tuple[np.ndarray, np.ndarray]],
-    quantum: float = 1e-4,
-) -> list[list[tuple[int, int, int]]]:
-    """Chain 2D segments by shared endpoints, merging vertices within ``quantum``.
-
-    This is the fallback for a slice that lands on a coplanar face and meets
-    itself: coplanar records are collapsed onto the section plane, collinear
-    overlaps are rendered as isolated segments, and the merged keys reconnect
-    them so a proper contour is recovered.
-    """
-
-    keys: dict[tuple[int, int], int] = {}
-    flat: list[list[int]] = []
-    merged: list[np.ndarray] = []
-    for point_a, point_b in segments:
-        pair = []
-        for point in (point_a, point_b):
-            key = (int(round(float(point[0]) / quantum)), int(round(float(point[1]) / quantum)))
-            if key not in keys:
-                keys[key] = len(merged)
-                merged.append(np.asarray(point, dtype=np.float64))
-            pair.append(keys[key])
-        if pair[0] != pair[1]:
-            flat.append(pair)
-
-    adjacency: dict[int, list[int]] = {}
-    for segment_id, pair in enumerate(flat):
-        for key in pair:
-            adjacency.setdefault(key, []).append(segment_id)
-    visited: set[int] = set()
-
-    def walk(start: int, first: int) -> list[tuple[int, int, int]]:
-        # Each step is (segment id, entry key, exit key); ties are emitted at
-        # the *exact* merged position whenever a key is first stored.
-        order: list[tuple[int, int, int]] = []
-        key = start
-        segment_id: int | None = first
-        while segment_id is not None and segment_id not in visited:
-            visited.add(segment_id)
-            first_key, second_key = flat[segment_id]
-            exit_key = second_key if first_key == key else first_key
-            order.append((segment_id, key, exit_key))
+            key_a, key_b = records[segment_id]
+            exit_key = key_b if key_a == key else key_a
+            point = np.asarray(
+                segments[segment_id, 1] if key_a == key else segments[segment_id, 0],
+                dtype=np.float64,
+            )
+            if exit_key == start_key:
+                closed = True
+                break
+            points.append(point)
+            carried.append(normals[segment_id])
             key = exit_key
             following = [s for s in adjacency.get(key, []) if s not in visited]
             segment_id = following[0] if following else None
-        return order
+        return points, carried, closed
 
-    _ = merged
-
-    chains: list[list[tuple[int, int, int]]] = []
+    loops = []
     for key in sorted(k for k, ids in adjacency.items() if len(ids) == 1):
         for segment_id in adjacency[key]:
             if segment_id not in visited:
-                chains.append(walk(key, segment_id))
-    for segment_id in range(len(flat)):
+                loops.append(walk(key, segment_id))
+    for segment_id in range(len(records)):
         if segment_id not in visited:
-            chains.append(walk(flat[segment_id][0], segment_id))
-    return chains
+            loops.append(walk(records[segment_id][0], segment_id))
+    return loops
 
 
-def _chain_points(records: list[dict[str, Any]], order: list[int]) -> list[dict[str, Any]]:
-    """Vertex list for one ordered run of segments, carrying its face normal."""
+def _clip_band(
+    points: list[np.ndarray],
+    normals: list[tuple[float, float]],
+    z_lo: float,
+    z_hi: float,
+) -> list[tuple[list[np.ndarray], list[tuple[float, float]]]]:
+    """Clip ``(r, z)`` points to ``r >= 0`` and ``z in [z_lo, z_hi]``.
 
-    points: list[dict[str, Any]] = []
-    for position, segment_id in enumerate(order):
-        record = records[segment_id]
-        if position == 0:
-            first, second = record["a"], record["b"]
-            point_key = record["kb"]
-        elif record["ka"] == point_key:
-            first, second = record["a"], record["b"]
-            point_key = record["kb"]
-        else:
-            first, second = record["b"], record["a"]
-            point_key = record["ka"]
-        normal = {"n_r": record["n_r"], "n_z": record["n_z"]}
-        if position == 0:
-            points.append({"point": np.asarray(first, dtype=np.float64), **normal})
-        points.append({"point": np.asarray(second, dtype=np.float64), **normal})
-    return points
-
-
-def _clip_polyline(
-    points: list[dict[str, Any]], z_lo: float, z_hi: float
-) -> list[list[dict[str, Any]]]:
-    """Clip to ``radius >= 0`` and ``z in [z_lo, z_hi]``, splitting at the edge.
-
-    Walking is done in *section order*, not in ``(z, radius)`` order, so an
-    overhang between two accepted points is never bridged by a chord.
+    Implements the half-plane clip: each segment is trimmed to the band and
+    every crossing is interpolated (its normal too), so no output sample lies
+    outside the band - neither the plinth foot at ``z < z_lo`` nor the
+    ``theta + pi`` half at ``r < 0``.  Returns open pieces; a closed input is
+    returned whole only when it never leaves the band.
     """
 
-    def inside(value: dict[str, Any]) -> bool:
-        x, y, z = (float(component) for component in value["point"][:3])
-        return x * x + y * y >= 0.0 and z_lo - 1e-9 <= z <= z_hi + 1e-9
+    def inside(value: np.ndarray) -> bool:
+        return float(value[0]) >= 0.0 and z_lo - 1e-9 <= float(value[1]) <= z_hi + 1e-9
 
-    pieces: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    for value in points:
-        if inside(value):
-            current.append(value)
-            continue
-        # Leaving the band: close the piece on this boundary sample.
-        if current:
-            current.append(value)
-            pieces.append(current)
-            current = []
-    if current:
-        pieces.append(current)
-    return [piece for piece in pieces if len(piece) >= 2]
+    def crossing_parameters(first: np.ndarray, second: np.ndarray) -> list[float]:
+        delta = second - first
+        parameters = []
+        for axis in (0, 1):
+            if abs(float(delta[axis])) <= EPS:
+                continue
+            for bound in (0.0, z_lo, z_hi):
+                t = (bound - float(first[axis])) / float(delta[axis])
+                if 0.0 < t < 1.0:
+                    parameters.append(t)
+        return sorted(parameters)
 
-
-def _split_by_normal(piece: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    """Split a chain wherever the intersected face's normal changes.
-
-    A resampled sample interpolates one face's normal, so a cut never carries
-    a blended normal across a sharp edge (a box corner, a wall-to-top fillet).
-    The corner is snapped to the *next* face exactly and re-normalised, because
-    the next cut's Contact-Point offset (and ``finishing_phi``) are computed from
-    that point's normal.  Returns ``(island, run)`` lists: a new island starts
-    at a segment whose two faces are mutually perpendicular (a real edge), while
-    a change within a smooth band stays in the same island.
-    """
-
-    if not piece:
-        return []
-    islands: list[list[list[dict[str, Any]]]] = [[[dict(piece[0])]]]
-    for value in piece[1:]:
-        previous = islands[-1][-1][-1]
-        d_r = value["n_r"] - previous["n_r"]
-        d_z = value["n_z"] - previous["n_z"]
-        if abs(d_r) <= 1e-6 and abs(d_z) <= 1e-6:
-            islands[-1][-1].append(dict(value))
-            continue
-        corner = dict(value)
-        is_edge = (
-            abs(d_r) > 0.35 or abs(d_z) > 0.35
+    def mix_normal(first: tuple[float, float], second: tuple[float, float], t: float):
+        return (
+            first[0] + t * (second[0] - first[0]),
+            first[1] + t * (second[1] - first[1]),
         )
-        if is_edge:
-            islands[-1][-1][-1] = dict(corner)
-            islands.append([[corner, dict(corner)]])
-        else:
-            islands[-1][-1][-1] = dict(corner)
-            islands[-1].append([corner, dict(corner)])
-    return [run for island in islands for run in island]
 
+    pieces: list[tuple[list[np.ndarray], list[tuple[float, float]]]] = []
+    current_points: list[np.ndarray] = []
+    current_normals: list[tuple[float, float]] = []
 
-def _drop_reversals(piece: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Split a chain wherever it steps back along its own face.
+    def push(value: np.ndarray, normal: tuple[float, float]) -> None:
+        if current_points and float(np.linalg.norm(current_points[-1] - value)) <= 1e-9:
+            current_points[-1] = value
+            current_normals[-1] = normal
+            return
+        current_points.append(value)
+        current_normals.append(normal)
 
-    Trimesh can meet a triangle twice on the slice plane, which makes the chain
-    double back over a face.  On a run whose points share one face, ``radius``
-    is not monotone along any contour, so a step *back* in ``z`` on that face
-    (the top face's ``r=15 -> r=0`` tail, or the far wall's ``z=50 -> z=30``
-    leg) is that overlap, not a real second pass.  Returns the ascending runs.
-    """
+    def close() -> None:
+        nonlocal current_points, current_normals
+        if len(current_points) >= 2:
+            pieces.append((current_points, current_normals))
+        current_points, current_normals = [], []
 
-    if not piece:
-        return []
-    runs: list[list[dict[str, Any]]] = [[dict(piece[0])]]
-    for value in piece[1:]:
-        if float(value["point"][2]) < float(runs[-1][-1]["point"][2]) - 1e-9:
-            runs.append([dict(value)])
-        else:
-            runs[-1].append(dict(value))
-    return [run for run in runs if len(run) >= 2]
-
-
-def _height_in_slice(piece: list[dict[str, Any]], normal: np.ndarray) -> float:
-    """Mean in-plane ``z``: the normal's z component discriminates a cut plane."""
-
-    return float(normal[2]) * sum(float(v["point"][2]) for v in piece) / len(piece)
-
-
-def _same_contact(run: list[dict[str, Any]], runs: list[list[dict[str, Any]]]) -> bool:
-    """True when ``run`` is the same contacts as one already queued.
-
-    Every point's ``(radius, z, n_r, n_z)`` must match some earlier run, so a
-    duplicate face walk (the coplanar-face tie) is skipped while a genuinely
-    new face is kept.
-    """
-
-    signature = {
-        (
-            round(float(math.hypot(v["point"][0], v["point"][1])), 3),
-            round(float(v["point"][2]), 3),
-            round(v["n_r"], 3),
-            round(v["n_z"], 3),
-        )
-        for v in run
-    }
-    if not signature:
-        return True
-    for earlier in runs:
-        other = {
-            (
-                round(float(math.hypot(v["point"][0], v["point"][1])), 3),
-                round(float(v["point"][2]), 3),
-                round(v["n_r"], 3),
-                round(v["n_z"], 3),
-            )
-            for v in earlier
-        }
-        if signature <= other:
-            return True
-    return False
-
-
-def _monotone_runs(piece: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    """Split a chain into stretches where ``z`` never decreases.
-
-    Returns one piece when the chain is already monotone; otherwise one piece
-    per climb, each starting on the point where the previous one peaked.
-    """
-
-    pieces: list[list[dict[str, Any]]] = [[piece[0]]]
-    for value in piece[1:]:
-        if float(value["point"][2]) >= float(pieces[-1][-1]["point"][2]) - 1e-9:
-            pieces[-1].append(value)
-        else:
-            pieces.append([pieces[-1][-1], value])
-    return [run for run in pieces if len(run) >= 2]
-
-
-def _orient_bottom_to_top(piece: list[dict[str, Any]], normal: np.ndarray) -> list[dict[str, Any]]:
-    """Orient a contour so its *cut plane* runs bottom-to-top.
-
-    For a cut plane (``abs(n_z) > 0.5``, e.g. the top face) the walk direction
-    must make ``z`` non-decreasing.  Perpendicular planes contain the axial
-    direction, so their chains are reversed only if they run downward overall;
-    a contour that legitimately tops out on the far wall is left alone.
-    """
-
-    signs = [
-        float(piece[k + 1]["point"][2] - piece[k]["point"][2])
-        for k in range(len(piece) - 1)
-    ]
-    if abs(float(normal[2])) > 0.5:
-        descending = sum(1 for s in signs if s < -1e-9)
-        ascending = sum(1 for s in signs if s > 1e-9)
-        if descending > ascending:
-            piece.reverse()
-    elif float(piece[-1]["point"][2]) < float(piece[0]["point"][2]):
-        piece.reverse()
-    return piece
-
-
-def _section_records(
-    segments: np.ndarray,
-    faces: np.ndarray,
-    mesh: trimesh.Trimesh,
-    e_r: np.ndarray,
-) -> list[dict[str, Any]]:
-    """One record per ``mesh_plane`` segment: endpoints, keys and planar normal."""
-
-    face_normals = np.asarray(mesh.face_normals, dtype=np.float64)
-    records: list[dict[str, Any]] = []
-    for index in range(len(segments)):
-        point_a = segments[index, 0]
-        point_b = segments[index, 1]
-        key_a, key_b = _vkey(point_a), _vkey(point_b)
-        if key_a == key_b:
-            continue
-        if index < len(faces):
-            face_normal = face_normals[int(faces[index])]
-            raw_r = float(face_normal @ e_r)
-            raw_z = float(face_normal[2])
-            planar = math.hypot(raw_r, raw_z)
-            if planar < 1e-6:
-                # Tangential face: no planar normal, use the section tangent.
-                delta_r = float(point_b @ e_r - point_a @ e_r)
-                delta_z = float(point_b[2] - point_a[2])
-                planar = max(math.hypot(delta_r, delta_z), EPS)
-                raw_r, raw_z = -delta_z, delta_r
-            n_r, n_z = raw_r / planar, raw_z / planar
-        else:  # pragma: no cover - mesh_plane always pairs segments and faces
-            n_r, n_z = 0.0, 1.0
-        records.append(
-            {"a": point_a, "b": point_b, "ka": key_a, "kb": key_b, "n_r": n_r, "n_z": n_z}
-        )
-    return records
-
-
-def _chain_runs(records: list[dict[str, Any]], e_r: np.ndarray) -> list[list[dict[str, Any]]]:
-    """Chain records into vertex runs, falling back to a merged 2D model.
-
-    A slice that lies on a coplanar face meets itself, so plain endpoint
-    matching cannot always stitch it.  Those runs are re-chained from their 2D
-    image with vertices merged within a quantum (:func:`_chain_model`).
-    """
-
-    runs: list[list[dict[str, Any]]] = []
-    for order in _ordered_segment_ids(records):
-        if _is_proper_chain(records, order):
-            runs.append(_chain_points(records, order))
-            continue
-        flat = [
-            (
-                np.array([float(records[s]["a"] @ e_r), float(records[s]["a"][2])]),
-                np.array([float(records[s]["b"] @ e_r), float(records[s]["b"][2])]),
-            )
-            for s in order
-        ]
-        for flat_order in _chain_model(flat):
-            points: list[dict[str, Any]] = []
-            for position, entry, exit_ in flat_order:
-                record = records[order[position]]
-                # ``flat[position][0]`` is the near endpoint when entry is its
-                # stored key, otherwise it is the far endpoint.
-                near = flat[position][0]
-                far = flat[position][1]
-                entering = near if _pair_key(near) == entry else far
-                leaving = near if _pair_key(near) == exit_ else far
-                points.append(
-                    {
-                        "point": np.array(
-                            [entering[0] * e_r[0], entering[0] * e_r[1], entering[1]]
-                        ),
-                        "n_r": record["n_r"],
-                        "n_z": record["n_z"],
-                    }
-                )
-                points.append(
-                    {
-                        "point": np.array(
-                            [leaving[0] * e_r[0], leaving[0] * e_r[1], leaving[1]]
-                        ),
-                        "n_r": record["n_r"],
-                        "n_z": record["n_z"],
-                    }
-                )
-            runs.append(points)
-    return runs
-
-
-def _pair_key(point: np.ndarray, quantum: float = 1e-4) -> tuple[int, int]:
-    return (int(round(float(point[0]) / quantum)), int(round(float(point[1]) / quantum)))
-
-
-def _normal_runs(run: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    """Split a run where a new face starts after a change of normal.
-
-    A resampled sample interpolates one face's normal, so a cut never carries a
-    blended normal across a sharp edge.  The corner is snapped to the *next*
-    face exactly and re-normalised, because the next cut's Contact-Point offset
-    and ``finishing_phi`` are computed from that point's normal.
-    """
-
-    if not run:
-        return []
-    pieces: list[list[dict[str, Any]]] = [[dict(run[0])]]
-    for value in run[1:]:
-        previous = pieces[-1][-1]
-        if abs(previous["n_r"] - value["n_r"]) <= 1e-3 and abs(previous["n_z"] - value["n_z"]) <= 1e-3:
-            pieces[-1].append(dict(value))
-            continue
-        pieces[-1][-1] = dict(value)
-        pieces.append([dict(value)])
+    order = list(range(len(points)))
+    for index, next_index in zip(order, order[1:]):
+        first, second = points[index], points[next_index]
+        first_normal, second_normal = normals[index], normals[next_index]
+        parameters = crossing_parameters(first, second)
+        # Split the segment into sub-stretches at every band crossing and keep
+        # those whose midpoint is inside: each kept stretch starts and ends on
+        # an interpolated boundary point, never on an out-of-band sample.
+        stops = [0.0, *parameters, 1.0]
+        for t_start, t_end in zip(stops, stops[1:]):
+            middle = first + 0.5 * (t_start + t_end) * (second - first)
+            if not inside(middle):
+                continue
+            start_value = first + t_start * (second - first)
+            end_value = first + t_end * (second - first)
+            if not current_points:
+                push(start_value, mix_normal(first_normal, second_normal, t_start))
+            push(end_value, mix_normal(first_normal, second_normal, t_end))
+            if t_end < 1.0 or not inside(second):
+                close()
+    close()
     return pieces
 
 
-def _axially_monotone(piece: list[dict[str, Any]]) -> bool:
-    """True when ``z`` never decreases along the run (within 1e-9)."""
+def _split_closed_loop(points: list[np.ndarray]) -> list[list[int]]:
+    """Index runs for the two bottom-to-top halves of a closed loop.
 
-    return all(
-        float(second["point"][2]) >= float(first["point"][2]) - 1e-9
-        for first, second in zip(piece, piece[1:])
-    )
+    The loop is cut at a lowest and a highest vertex (outermost on ties), but
+    which tied vertex is chosen is *measured*, not assumed: both arcs are
+    walked and the pair with the fewest strict descents wins.  A flat cut plane
+    that climbs toward the axis (a top face, ``r 15 -> 0``) is a tie rather
+    than a descent, and only one arc of each flat plane remains, so the closing
+    edge is never cut twice.  Both halves share the split vertices.
+    """
+
+    if len(points) < 3:
+        return []
+    lowest = min(float(point[1]) for point in points)
+    highest = max(float(point[1]) for point in points)
+    if highest - lowest <= 1e-9:
+        return []
+    souths = [i for i, p in enumerate(points) if float(p[1]) <= lowest + 1e-9]
+    norths = [i for i, p in enumerate(points) if float(p[1]) >= highest - 1e-9]
+
+    def arc(start: int, stop: int) -> list[int]:
+        run = [start]
+        index = start
+        while index != stop:
+            index = (index + 1) % len(points)
+            run.append(index)
+        return run
+
+    def descents(run: list[int]) -> int:
+        return sum(
+            1
+            for first, second in zip(run, run[1:])
+            if float(points[second][1]) < float(points[first][1]) - 1e-9
+        )
+
+    best: tuple[int, int, list[int], list[int]] | None = None
+    for south in souths:
+        for north in norths:
+            if south == north:
+                continue
+            first, second = arc(south, north), arc(north, south)
+            # Worst-case descent count, then prefer the longer short arc so a
+            # degenerate one-vertex leg is never chosen.
+            score = (max(descents(first), descents(second)), -min(len(first), len(second)))
+            if best is None or score < (best[0], best[1]):
+                best = (score[0], score[1], first, second)
+    if best is None:
+        return []
+    return [run for run in (best[2], best[3]) if len(run) >= 2]
+
+
+def _resample(
+    points: list[np.ndarray],
+    normals: list[tuple[float, float]],
+    step: float,
+    e_r: np.ndarray,
+) -> list[dict[str, Any]]:
+    """Resample a 2D ``(r, z)`` polyline at arc-length ``step``."""
+
+    def sample(value: np.ndarray, normal: tuple[float, float]) -> dict[str, Any]:
+        radius = float(value[0])
+        return {
+            "point": radius * e_r + np.array([0.0, 0.0, float(value[1])]),
+            "radius": radius,
+            "z": float(value[1]),
+            "n_r": float(normal[0]),
+            "n_z": float(normal[1]),
+        }
+
+    out = [sample(points[0], normals[0])]
+    carry = 0.0
+    for index, (first, second) in enumerate(zip(points, points[1:])):
+        length = float(np.linalg.norm(second - first))
+        if length <= EPS:
+            continue
+        travelled = step - carry
+        while travelled < length - EPS:
+            t = travelled / length
+            normal = (
+                normals[index][0] + t * (normals[index + 1][0] - normals[index][0]),
+                normals[index][1] + t * (normals[index + 1][1] - normals[index][1]),
+            )
+            out.append(sample(first + t * (second - first), normal))
+            travelled += step
+        carry = max(0.0, length - (travelled - step))
+    out.append(sample(points[-1], normals[-1]))
+    return out
 
 
 def section_polylines(
@@ -796,26 +550,25 @@ def section_polylines(
 
     The plane normal is ``e_theta = (-sin theta, cos theta, 0)`` through the
     platter axis, so every point lies exactly on ``theta`` with its own radius
-    (multi-valued overhangs are preserved); points with ``radius < 0`` are the
-    ``theta + pi`` half and are dropped.
+    (multi-valued overhangs are preserved).
 
-    ``mesh_plane`` segments are chained by shared endpoints into connected
-    polylines and clipped to ``z in [z_min + 1.5, z_max]`` (the plinth foot is
-    seating geometry).  A polyline is a run of consecutive points that are
-    axially monotone *and* share the same intersected face, so consecutive
-    points of one polyline may always be joined by a cut.  At a sharp edge the
-    first face's run ends on the corner and the next face's run starts there
-    with its own normal - the two runs must not be bridged except through an
-    explicit link move.
+    ``mesh_plane`` segments are chained into loops by shared endpoints.  Each
+    loop becomes ``(r, z)`` with ``r = p . e_r`` and is clipped to ``r >= 0``
+    (the ``theta + pi`` half belongs to another slice) and to
+    ``z in [z_min + 1.5, z_max]`` (the plinth foot is seating geometry),
+    interpolating at every crossing.  A closed loop is split at its lowest and
+    highest points, so every returned polyline runs bottom-to-top; each is then
+    resampled at arc-length ``step``.
 
-    Returns polylines oriented bottom-to-top and resampled at arc-length
-    ``step``.  Each point carries ``point`` (wax XYZ), ``radius``, ``z`` and
+    Each point carries ``point`` (wax XYZ), ``radius``, ``z`` and
     ``n_r``/``n_z`` - the intersected triangle's outward normal expanded in
-    ``(e_r, e_z)`` and re-normalised, which feeds :func:`finishing_phi`
-    directly.
+    ``(e_r, e_z)`` and re-normalised, which feeds :func:`finishing_phi`.
+    Splitting into cut runs (and rejecting unreachable points) belongs to
+    :func:`build_finishing`, not to this helper.
     """
 
     normal = np.array([-math.sin(theta), math.cos(theta), 0.0])
+    e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
     segments, faces = trimesh_intersections.mesh_plane(
         mesh=mesh,
         plane_normal=normal,
@@ -826,73 +579,52 @@ def section_polylines(
         return []
     segments = np.asarray(segments, dtype=np.float64).reshape(-1, 2, 3)
     faces = np.asarray(faces, dtype=np.int64).reshape(-1)
-    e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
-    e_theta = np.array([-math.sin(theta), math.cos(theta), 0.0])
     step = max(float(step), 0.1)
     z_lo = float(z_min) + 1.5
-    # ``mesh_plane`` returns each segment inside its triangle, which sits a few
-    # microns off the exact plane (the face normal is not exactly e_theta), so
-    # reproject every point onto the half-plane: radius and z are unchanged and
-    # the contour lies exactly on the slice azimuth.
-    def on_plane(point: np.ndarray) -> np.ndarray:
-        point = np.asarray(point, dtype=np.float64)
-        radial = float(point[0]) * e_r[0] + float(point[1]) * e_r[1]
-        return radial * e_r + np.array([0.0, 0.0, float(point[2])])
+    z_hi = float(z_max)
 
+    face_normals = np.asarray(mesh.face_normals, dtype=np.float64)
+    planar_normals: list[tuple[float, float]] = []
     for index in range(len(segments)):
-        segments[index, 0] = on_plane(segments[index, 0])
-        segments[index, 1] = on_plane(segments[index, 1])
+        raw_r = float(face_normals[int(faces[index])] @ e_r) if index < len(faces) else 0.0
+        raw_z = float(face_normals[int(faces[index])][2]) if index < len(faces) else 1.0
+        magnitude = math.hypot(raw_r, raw_z)
+        if magnitude < 1e-6:
+            delta = segments[index, 1] - segments[index, 0]
+            radial = float(delta @ e_r)
+            axial = float(delta[2])
+            magnitude = max(math.hypot(radial, axial), EPS)
+            raw_r, raw_z = -axial, radial
+        planar_normals.append((raw_r / magnitude, raw_z / magnitude))
 
-    records = _section_records(segments, faces, mesh, e_r)
-    if not records:
-        return []
-
-    runs: list[list[dict[str, Any]]] = []
-    for raw in _chain_runs(records, e_r):
-        for piece in _clip_polyline(raw, z_lo, float(z_max)):
-            if len(piece) < 2:
-                continue
-            # A cut plane (the top face) is walked with non-decreasing z; a
-            # flank that contains the axis is oriented by its overall rise.
-            if abs(float(piece[0]["n_z"])) > 0.5:
-                piece = _orient_bottom_to_top(
-                    piece, np.array([0.0, 0.0, float(piece[0]["n_z"])])
-                )
-            elif float(piece[-1]["point"][2]) < float(piece[0]["point"][2]):
+    polylines: list[list[dict[str, Any]]] = []
+    for loop, carried, closed in _chain_loops(segments, planar_normals):
+        flat = [np.array([float(point @ e_r), float(point[2])]) for point in loop]
+        if closed:
+            halves = _split_closed_loop(flat) or [list(range(len(flat)))]
+            for half in halves:
+                if not half:
+                    continue
+                points = [flat[index] for index in half]
+                normals = [carried[index] for index in half]
+                # Clip each half after the split, so the band cut runs on a
+                # monotone (bottom-to-top) walk.
+                for piece, piece_normals in _clip_band(points, normals, z_lo, z_hi):
+                    if len(piece) < 2:
+                        continue
+                    if float(piece[-1][1]) < float(piece[0][1]):
+                        piece = list(reversed(piece))
+                        piece_normals = list(reversed(piece_normals))
+                    polylines.append(_resample(piece, piece_normals, step, e_r))
+            continue
+        for piece, piece_normals in _clip_band(flat, carried, z_lo, z_hi):
+            if float(piece[-1][1]) < float(piece[0][1]):
                 piece = list(reversed(piece))
-            if max(float(v["point"][2]) for v in piece) <= z_lo:
-                continue
-            for face_run in _normal_runs(piece):
-                for run in _drop_reversals(face_run):
-                    if len(run) < 2:
-                        continue
-                    # A run that ends where another run begins, descending
-                    # along the same face, is the same contact seen twice (the
-                    # top face re-walked toward the axis, or the far wall's
-                    # back leg).  One pass per distinct contact.
-                    start = run[0]
-                    duplicate = any(
-                        abs(earlier[-1]["point"][0] - start["point"][0]) < 1e-6
-                        and abs(earlier[-1]["point"][2] - start["point"][2]) < 1e-6
-                        and abs(earlier[-1]["n_r"] - start["n_r"]) < 1e-3
-                        and abs(earlier[-1]["n_z"] - start["n_z"]) < 1e-3
-                        for earlier in runs
-                    )
-                    if duplicate or _same_contact(run, runs):
-                        continue
-                    runs.append(run)
+                piece_normals = list(reversed(piece_normals))
+            polylines.append(_resample(piece, piece_normals, step, e_r))
 
-    finished: list[list[dict[str, Any]]] = []
-    for run in runs:
-        for value in run:
-            point = np.asarray(value["point"], dtype=np.float64)
-            value["point"] = point
-            value["radius"] = float(math.hypot(point[0], point[1]))
-            value["z"] = float(point[2])
-        finished.append(_resample_piece(run, step, z_lo))
-
-    finished.sort(key=lambda line: (line[0]["z"], line[0]["radius"]))
-    return finished
+    polylines.sort(key=lambda line: (line[0]["z"], line[0]["radius"]))
+    return polylines
 
 
 def section_contour(
