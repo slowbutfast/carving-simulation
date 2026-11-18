@@ -1102,10 +1102,14 @@ def exit_moves(
         ]
         if not _body_clear(mesh, reorient, [upright] * len(reorient), config):
             continue
+        # Wax apex poses, not joint radii: _joint would add p sin(phi).
+        at_clear = e_r * r_clear + np.array([0.0, 0.0, z_clear])
+        at_reorient = e_r * r_clear + np.array([0.0, 0.0, reorient_z])
+        at_safe = e_r * clearance_target + np.array([0.0, 0.0, safe_z])
         return [
-            _joint(r_clear, theta, z_clear, phi, config, collector),
-            _joint(r_clear, theta, reorient_z, 0.0, config, collector),
-            _joint(clearance_target, theta, safe_z, 0.0, config, collector),
+            _apex_joint(at_clear, phi, theta, config, collector),
+            _apex_joint(at_reorient, 0.0, theta, config, collector),
+            _apex_joint(at_safe, 0.0, theta, config, collector),
         ]
     collector.add(
         "UNREACHABLE_UNDERCUT_AREA",
@@ -1135,17 +1139,64 @@ def entry_moves(
     rs = float(first["rs"])
     zs = float(first["zs"])
     phi = float(first["phi"])
+    e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
+    # Build in wax coordinates, then convert to joints.  ``_joint`` adds
+    # ``p sin(phi)`` to r and ``p cos(phi)`` to h, so passing a wax radius
+    # straight in would swing the arm out by p sin(phi) (r = 120 for a 75 deg
+    # pitch at r = 46) and pitch the tool at the wrong place.
     height_stock = float(config["stock"]["H_stock_mm"])
     clearance = float(config["stock"].get("retract_clearance_mm", 6.0))
-    safe_z = height_stock + clearance
-    p = float(config["pivot_to_tip_mm"])
-    descend_z = zs + p * (1.0 - math.cos(phi))
+    apex = np.array([rs * math.cos(theta), rs * math.sin(theta), zs])
+    # Pitch outside the stock: the apex sits at the clearance radius while the
+    # wrist rotates, then the body slides along -u onto the contact point.
+    ref = e_r * clearance_target + np.array([0.0, 0.0, zs])
+    pitched = _apex_joint(ref, phi, theta, config, collector)
     return [
-        _joint(clearance_target, theta, safe_z, 0.0, config, collector),
-        _joint(clearance_target, theta, descend_z, 0.0, config, collector),
-        _joint(clearance_target, theta, descend_z, phi, config, collector),
-        _joint(rs, theta, zs, phi, config, collector),
+        _apex_joint(e_r * clearance_target + np.array([0.0, 0.0, height_stock + clearance]), 0.0, theta, config, collector),
+        _apex_joint(ref, 0.0, theta, config, collector),
+        pitched,
+        _apex_joint(apex, phi, theta, config, collector),
     ]
+
+
+def _apex_joint(
+    apex: np.ndarray,
+    phi: float,
+    theta: float,
+    config: Mapping[str, Any],
+    collector: DiagnosticCollector | None = None,
+) -> dict[str, float]:
+    """Joint for a wax-frame tip apex pose (inverse of the FK translation)."""
+
+    x = float(config["arm_radial_offset_mm"])
+    h2 = float(config["arm_to_pivot_z_mm"])
+    p = float(config["pivot_to_tip_mm"])
+    rs = float(math.hypot(apex[0], apex[1]))
+    return _joint_body(rs, theta, float(apex[2]), phi, x, h2, p, config, collector)
+
+
+def _joint_body(
+    rs: float,
+    theta: float,
+    zs: float,
+    phi: float,
+    x: float,
+    h2: float,
+    p: float,
+    config: Mapping[str, Any],
+    collector: DiagnosticCollector | None,
+) -> dict[str, float]:
+    """Raw joint from a wax apex pose (shared by _joint and _apex_joint)."""
+
+    joint = {
+        "r": rs + x + p * math.sin(phi),
+        "theta": theta,
+        "h": zs + p * math.cos(phi) + h2,
+        "phi": phi,
+    }
+    if collector is not None:
+        collector.extend(validate_joint(collector, joint, config))
+    return joint
 
 
 def build_finishing(
