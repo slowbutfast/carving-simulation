@@ -702,6 +702,80 @@ def _melt_kerf_offset(config: Mapping[str, Any]) -> float:
     return float(tool["tip_radius_mm"]) + float(tool["melt_kerf_mm"])
 
 
+def cutter_location(
+    point_xyz: Sequence[float],
+    n_r: float,
+    n_z: float,
+    theta: float,
+    config: Mapping[str, Any],
+) -> np.ndarray:
+    """Tip apex for a Contact-Point on the surface at ``theta``.
+
+    The apex sits one standoff (``tip_radius + melt_kerf``) out along the
+    *true* outward normal ``n_r e_r + n_z e_z``.  The normal is never snapped
+    to pure radial or vertical: on a slope that would place the apex off the
+    CL, and the cut would no longer follow the section contour.
+    """
+
+    e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
+    normal = n_r * e_r + n_z * np.array([0.0, 0.0, 1.0])
+    return np.asarray(point_xyz, dtype=np.float64) + normal * _melt_kerf_offset(config)
+
+
+def tool_body_penetrates(
+    mesh: trimesh.Trimesh,
+    apexes: Sequence[Sequence[float]],
+    axes: Sequence[Sequence[float]],
+    config: Mapping[str, Any],
+) -> np.ndarray:
+    """Vectorised test: does the heated tool body intersect the mesh?
+
+    Stations ``t in {0.25, 0.5, 0.75, 1.0} * engaged`` are walked back from each
+    apex along its axis.  At station ``t`` the flank point is the axis point
+    plus eight ring points at radius ``tip_radius + t * tan(alpha)`` in the
+    plane perpendicular to the axis (the melt kerf is deliberately omitted: it
+    is cut tolerance, not tool steel).
+
+    "Penetrates" is ``mesh.contains(...)`` for any of those points, which is the
+    one inside/outside authority here (``trimesh.nearest.signed_distance`` is
+    positive inside and agrees).  All points for all poses go through a single
+    ``contains`` call, so the caller can batch a whole slice.
+    """
+
+    apexes = np.atleast_2d(np.asarray(apexes, dtype=np.float64))
+    axes = np.atleast_2d(np.asarray(axes, dtype=np.float64))
+    if len(apexes) == 0:
+        return np.zeros(0, dtype=bool)
+    lengths = np.linalg.norm(axes, axis=1)
+    axes = axes / np.where(lengths == 0.0, 1.0, lengths)[:, None]
+
+    tool = config["tool"]
+    engaged = float(tool["engaged_length_mm"])
+    tip_radius = float(tool["tip_radius_mm"])
+    tan_alpha = math.tan(math.radians(float(tool["cone_half_angle_deg"])))
+    fractions = (0.25, 0.5, 0.75, 1.0)
+    angles = np.arange(8) * (math.pi / 4.0)
+
+    # A stable perpendicular basis per pose (never parallel to the axis).
+    helper = np.tile(np.array([0.0, 0.0, 1.0]), (len(axes), 1))
+    almost_parallel = np.abs(axes @ np.array([0.0, 0.0, 1.0])) > 0.9
+    helper[almost_parallel] = np.array([1.0, 0.0, 0.0])
+    e1 = np.cross(axes, helper)
+    e1 /= np.linalg.norm(e1, axis=1)[:, None]
+    e2 = np.cross(axes, e1)
+
+    points: list[np.ndarray] = [apexes]
+    for fraction in fractions:
+        station = engaged * fraction
+        radius = tip_radius + station * tan_alpha
+        base = apexes - axes * station
+        for angle in angles:
+            points.append(base + radius * (math.cos(angle) * e1 + math.sin(angle) * e2))
+    # Each block is (poses, 3); stacking gives one row per (sample, pose).
+    inside = np.asarray(mesh.contains(np.concatenate(points, axis=0)), dtype=bool)
+    return inside.reshape(len(points), len(apexes)).any(axis=0)
+
+
 def detect_gouges(
     mesh: trimesh.Trimesh,
     poses: Iterable[Mapping[str, Any]],
@@ -709,41 +783,40 @@ def detect_gouges(
 ) -> list[Diagnostic]:
     """Flag cutting poses whose heated body penetrates the target mesh.
 
-    Stations are walked along the tool axis from the apex back toward the wrist.
-    At station ``t`` the conical flank has radius
-    ``tip_radius + melt_kerf + t * tan(alpha)``; the flank is a gouge when the
-    material reaches past that radius, i.e. when the signed distance of the axis
-    point is closer to the surface than the flank radius.
-
-    ``trimesh.nearest.signed_distance`` is **positive inside** a watertight mesh
-    and negative outside, so "material reaches past the flank" is
-    ``signed_distance(axis_point) > -(tip_r + kerf + t * tan(alpha))``.
+    Delegates the geometry to :func:`tool_body_penetrates`, so the pre-filter in
+    ``build_finishing`` and the reported diagnostic cannot disagree.  The text
+    keeps the offending station and the margin by which the flank is buried.
     """
 
     tool = config["tool"]
     engaged = float(tool["engaged_length_mm"])
     tip_radius = float(tool["tip_radius_mm"])
-    kerf = float(tool["melt_kerf_mm"])
-    alpha = math.radians(float(tool["cone_half_angle_deg"]))
-    collector = DiagnosticCollector()
+    tan_alpha = math.tan(math.radians(float(tool["cone_half_angle_deg"])))
     stations = [engaged * fraction for fraction in (0.25, 0.5, 0.75, 1.0)]
+    collector = DiagnosticCollector()
     for pose in poses:
         apex = np.asarray(pose["tip_xyz_wax"], dtype=np.float64)
         axis = np.asarray(pose["tool_axis_wax"], dtype=np.float64)
-        length = float(np.linalg.norm(axis)) or 1.0
-        axis = axis / length
-        points = np.asarray([apex - axis * t for t in stations], dtype=np.float64)
-        signed = np.asarray(mesh.nearest.signed_distance(points), dtype=np.float64)
-        for station, offset, point in zip(stations, signed, points):
-            flank = tip_radius + kerf + station * math.tan(alpha)
-            if float(offset) > -flank:
-                collector.add(
-                    "GOUGE",
-                    "warning",
-                    f"tool flank penetrates the target at {np.round(point, 3).tolist()}",
-                    value=float(flank + float(offset)),
-                )
-                break
+        if not bool(tool_body_penetrates(mesh, [apex], [axis], config)[0]):
+            continue
+        # Locate the worst station for the message (signed distance is positive
+        # inside, so the deepest burial is the largest positive value).
+        lengths = float(np.linalg.norm(axis)) or 1.0
+        unit = axis / lengths
+        signed = np.asarray(
+            mesh.nearest.signed_distance(
+                np.asarray([apex - unit * t for t in stations], dtype=np.float64)
+            ),
+            dtype=np.float64,
+        )
+        index = int(np.argmax(signed))
+        flank = tip_radius + stations[index] * tan_alpha
+        collector.add(
+            "GOUGE",
+            "warning",
+            f"tool flank penetrates the target at {np.round(apex - unit * stations[index], 3).tolist()}",
+            value=float(flank + float(signed[index])),
+        )
     return collector.as_list()
 
 
@@ -906,127 +979,162 @@ def _tool_body_clearance(config: Mapping[str, Any]) -> float:
     return reach + engaged * math.tan(alpha)
 
 
-def safe_retract_moves(
-    joint: Mapping[str, float],
-    config: Mapping[str, Any],
-    clearance_target: float,
-    diagnostics: DiagnosticCollector | None = None,
-) -> list[dict[str, float]]:
-    """Pull the tool clear at constant phi, then reorient phi to vertical.
-
-    Sliding the body along ``-u`` keeps the wrist pitch fixed, so the heated
-    cone never sweeps sideways into stock it has not cut.  Only once the whole
-    body is outside ``clearance_target`` may ``phi`` rotate back to 0.
-    """
-
-    fk = _fk_frame(joint, config)
-    apex = np.asarray(fk.tip_xyz_wax, dtype=np.float64)
-    axis = np.asarray(fk.tool_axis_wax, dtype=np.float64)
-    p = float(config["pivot_to_tip_mm"])
-    engaged = float(config["tool"]["engaged_length_mm"])
-    theta = float(joint["theta"])
-    phi = float(joint["phi"])
-
-    station = 0.0
-    while station <= engaged + EPS:
-        clear = True
-        for s in (0.0, station):
-            point = apex - axis * s
-            if float(math.hypot(point[0], point[1])) + s * (1.0 - axis[2]) < clearance_target:
-                clear = False
-                break
-        if clear:
-            break
-        station += 0.5
-    if station > engaged:
-        station = float(np.linalg.norm(apex)) + _tool_body_clearance(config)
-
-    tip = apex - axis * station
-    r_clear = max(float(math.hypot(tip[0], tip[1])), clearance_target)
-    z_clear = float(tip[2])
-    out = [_joint(r_clear, theta, z_clear, phi, config, diagnostics)]
-    if abs(phi) > 1e-9:
-        # Reorient in free space: the apex rises by p(1 - cos phi).
-        out.append(
-            _joint(
-                r_clear,
-                theta,
-                z_clear + p * (1.0 - math.cos(phi)),
-                0.0,
-                config,
-                diagnostics,
-            )
-        )
-    return out
-
-
-def safe_approach_moves(
-    theta: float,
-    target_rs: float,
-    target_zs: float,
-    target_phi: float,
-    config: Mapping[str, Any],
-    clearance_target: float,
-    diagnostics: DiagnosticCollector | None = None,
-) -> list[dict[str, float]]:
-    """Three-step approach: drop to cut height clear, pitch, then slide in.
-
-    1. Descend at ``r_s = R_stock + clearance`` (outside the stock) to the cut
-       height, still vertical.
-    2. Pitch the wrist to ``target_phi`` at that height, still outside the stock
-       and still above the surface.
-    3. Slide along ``-u`` (constant ``phi``) onto the Contact-Point apex.  The
-       slide starts ``p * sin(phi)`` outboard of the apex, which is exactly the
-       pose a retract walks back to.
-    """
-
-    p = float(config["pivot_to_tip_mm"])
-    descend = _joint(clearance_target, theta, target_zs, 0.0, config, diagnostics)
-    pitched = _joint(clearance_target, theta, target_zs, target_phi, config, diagnostics)
-    # Step 3 is a *cutting* move from the clear pose onto the Contact-Point
-    # apex: the apex travels inward along -u by ``clearance_target - target_rs``
-    # and down by ``p(1 - cos phi)``.  The slide must therefore use the real
-    # apex pose, not a re-derived one that would add a further ``p sin(phi)``.
-    slide = _joint(target_rs, theta, target_zs, target_phi, config, diagnostics)
-    return [descend, pitched, slide]
-
-
-def _flank_clearance(
+def _body_clear(
     mesh: trimesh.Trimesh,
-    apex: np.ndarray,
-    normal: np.ndarray,
+    apexes: Sequence[np.ndarray],
+    axes: Sequence[np.ndarray],
     config: Mapping[str, Any],
-) -> float:
-    """How far the pitched flank clears the material (mm; <= 0 means gouge).
+) -> bool:
+    """True when every sampled pose in the batch clears the mesh."""
 
-    Walks stations back along the tool axis from the apex and returns the
-    minimum of ``signed_distance - flank_radius``.  Because
-    ``signed_distance`` is positive inside the mesh, a positive result means
-    every station sits outside the flank envelope.
+    if len(apexes) == 0:
+        return True
+    return not bool(np.asarray(tool_body_penetrates(mesh, apexes, axes, config)).any())
+
+
+def _sample_poses(
+    apexes: list[np.ndarray],
+    axis: np.ndarray,
+) -> list[np.ndarray]:
+    """Sample a list of apexes every 1 mm, keeping the pitch (axis) constant."""
+
+    samples: list[np.ndarray] = []
+    for first, second in zip(apexes, apexes[1:]):
+        steps = max(1, int(math.ceil(float(np.linalg.norm(second - first)))))
+        for index in range(steps):
+            samples.append(first + (second - first) * (index / steps))
+    if apexes:
+        samples.append(apexes[-1])
+    return samples
+
+
+def _clear_line(length: float, start: np.ndarray, direction: np.ndarray) -> list[np.ndarray]:
+    """A straight line of ``length`` mm from ``start`` along ``direction``."""
+
+    return [start + direction * s for s in np.arange(0.0, max(length, 0.0) + 1e-9, 1.0)]
+
+
+def exit_moves(
+    apex: np.ndarray | Sequence[float],
+    phi: float,
+    theta: float,
+    mesh: trimesh.Trimesh,
+    config: Mapping[str, Any],
+    clearance_target: float,
+    collector: DiagnosticCollector,
+) -> list[dict[str, float]]:
+    """Non-rapid exit from a pitched cut: clear the body, re-pitch, then rise.
+
+    With ``u = -sin(phi) e_r - cos(phi) e_z`` a slide along ``-u`` moves the
+    apex ``+s sin(phi)`` radially and ``+s cos(phi)`` upward, so candidate A
+    reaches ``clearance_target`` at ``s = (clear - r_apex) / sin(phi)`` when
+    ``sin(phi) > 0.05``.  Otherwise (or if A is still buried) candidate B lifts
+    to ``H_stock + clearance`` and pulls straight out.
+
+    The first candidate whose poses, sampled every 1 mm, all clear the mesh
+    under :func:`tool_body_penetrates` wins.  If neither is clear the point is
+    genuinely unreachable: an ``UNREACHABLE_UNDERCUT_AREA`` rejection is
+    counted and ``[]`` is returned, so ``build_finishing`` drops the point and
+    retries with the previous one.
+
+    The moves are non-rapid links (stage ``finishing_link``) ending vertical
+    at the clearance radius and then at the safe plane.
     """
 
-    tool = config["tool"]
-    engaged = float(tool["engaged_length_mm"])
-    tip_radius = float(tool["tip_radius_mm"])
-    kerf = float(tool["melt_kerf_mm"])
-    alpha = math.radians(float(tool["cone_half_angle_deg"]))
-    # The body runs from the apex back toward the wrist, i.e. along -normal.
-    axis = -np.asarray(normal, dtype=np.float64)
-    length = float(np.linalg.norm(axis)) or 1.0
-    axis = axis / length
-    clearance = math.inf
-    for station in (engaged * 0.5, engaged, engaged * 1.5, engaged * 2.0):
-        # ``apex + axis * station`` walks *forward* along -normal, which is away
-        # from the tool body, so step back instead.
-        point = apex - axis * station
-        flank = tip_radius + kerf + station * math.tan(alpha)
-        offset = float(
-            np.asarray(mesh.nearest.signed_distance([point]), dtype=np.float64)[0]
-        )
-        # Positive offset = inside the mesh.  Clearance is how far the flank
-        # radius exceeds the (negative) distance to the material.
-        clearance = min(clearance, flank + offset)
-    return clearance
+    apex = np.asarray(apex, dtype=np.float64)
+    e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
+    # Tool axis wrist -> apex.  As in kinematics.forward_kinematics (u(phi) =
+    # -sin(phi) e_r - cos(phi) e_z), +phi tilts the tip *inward*, so with a
+    # negative phi the axis leans outboard and the body runs inboard.
+    axis = -math.sin(phi) * e_r - np.array([0.0, 0.0, math.cos(phi)])
+    height_stock = float(config["stock"]["H_stock_mm"])
+    clearance = float(config["stock"].get("retract_clearance_mm", 6.0))
+    safe_z = height_stock + clearance
+    p = float(config["pivot_to_tip_mm"])
+    r_apex = float(math.hypot(apex[0], apex[1]))
+
+    # The apex of a CL pose sits ``tip_r + kerf`` off the surface, i.e. its
+    # *heater* is already in contact: a cone flank opens back towards the wrist
+    # and lies on the face by construction.  Both candidates therefore skip the
+    # first millimetre (that cut has just been made) and must clear from there.
+    candidates: list[list[np.ndarray]] = []
+    if math.sin(phi) > 0.05:
+        # Leaving the cut is -u; with u = -sin(phi) e_r - cos(phi) e_z the
+        # radius of the apex and of every body point grows by s sin(phi).
+        length = max(0.0, (clearance_target - r_apex) / math.sin(phi))
+        candidates.append(_clear_line(length, apex - axis * min(1.0, length), -axis))
+    lift = max(0.0, safe_z - float(apex[2]))
+    start = apex + np.array([0.0, 0.0, min(1.0, lift)])
+    top = apex + np.array([0.0, 0.0, lift])
+    radial = max(0.0, clearance_target - float(math.hypot(top[0], top[1])))
+    candidates.append(
+        _clear_line(max(0.0, lift - 1.0), start, np.array([0.0, 0.0, 1.0]))
+        + _clear_line(radial, top, e_r)[1:]
+    )
+
+    # Candidate A ends pitched at the clearance radius; it re-pitches to
+    # vertical there, sinking by ``p (1 - cos phi)``, so that drop must stay
+    # clear.  If it buries, candidate B (which ends on the safe plane, clear of
+    # everything) is used instead.
+    upright = np.array([0.0, 0.0, -1.0])
+    for candidate in candidates:
+        samples = _sample_poses(candidate, axis)
+        if not _body_clear(mesh, samples, [axis] * len(samples), config):
+            continue
+        clear = candidate[-1]
+        r_clear = max(float(math.hypot(clear[0], clear[1])), clearance_target)
+        z_clear = float(clear[2])
+        reorient_z = z_clear + p * (1.0 - math.cos(phi))
+        reorient = [
+            e_r * r_clear + np.array([0.0, 0.0, z])
+            for z in np.linspace(z_clear, reorient_z, 8)
+        ]
+        if not _body_clear(mesh, reorient, [upright] * len(reorient), config):
+            continue
+        return [
+            _joint(r_clear, theta, z_clear, phi, config, collector),
+            _joint(r_clear, theta, reorient_z, 0.0, config, collector),
+            _joint(clearance_target, theta, safe_z, 0.0, config, collector),
+        ]
+    collector.add(
+        "UNREACHABLE_UNDERCUT_AREA",
+        "warning",
+        f"no clear exit from the pitched cut at {np.round(apex, 3).tolist()}",
+        value=0.0,
+    )
+    return []
+
+
+def entry_moves(
+    first: Mapping[str, float],
+    mesh: trimesh.Trimesh,
+    config: Mapping[str, Any],
+    clearance_target: float,
+    collector: DiagnosticCollector,
+) -> list[dict[str, float]]:
+    """Approach a run's first cut: descend vertical, pitch in free space, plunge.
+
+    The reverse of :func:`exit_moves`: from the safe plane at the clearance
+    radius, descend, pitch to the cut's ``phi`` outside the stock, then slide
+    along ``-u`` onto the Contact-Point apex.  All non-rapid links.
+    """
+
+    _ = mesh
+    theta = float(first["theta"])
+    rs = float(first["rs"])
+    zs = float(first["zs"])
+    phi = float(first["phi"])
+    height_stock = float(config["stock"]["H_stock_mm"])
+    clearance = float(config["stock"].get("retract_clearance_mm", 6.0))
+    safe_z = height_stock + clearance
+    p = float(config["pivot_to_tip_mm"])
+    descend_z = zs + p * (1.0 - math.cos(phi))
+    return [
+        _joint(clearance_target, theta, safe_z, 0.0, config, collector),
+        _joint(clearance_target, theta, descend_z, 0.0, config, collector),
+        _joint(clearance_target, theta, descend_z, phi, config, collector),
+        _joint(rs, theta, zs, phi, config, collector),
+    ]
 
 
 def build_finishing(

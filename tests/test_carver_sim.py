@@ -870,23 +870,28 @@ class TestFinishingHelpers(unittest.TestCase):
     # -- (3) cutter_location ------------------------------------------------
     def test_cutter_location_offsets_along_true_normal(self):
         cutter_location = self.helper("cutter_location")
-        # 45 deg plane in x-z: normal (1, 0, 1)/sqrt2, no snapping allowed.
+        # A box rotated 45 deg about y gives an *exact* plane with normal
+        # (1, 0, 1)/sqrt2 - no tessellation error, so the fixture is analytic.
         normal = np.array([1.0, 0.0, 1.0]) / math.sqrt(2.0)
-        sphere = trimesh.creation.icosphere(subdivisions=2, radius=10.0)
-        sphere.apply_transform(trimesh.geometry.align_vectors([0.0, 0.0, 1.0], normal))
-        face = int(np.argmax(sphere.face_normals @ normal))
-        cc = np.asarray(sphere.triangles_center[face], dtype=float)
-        # Project onto the exact 45 deg plane so the fixture is analytic.
-        cc = cc - normal * (float(cc @ normal) - 10.0 * math.sqrt(2.0))
+        box = trimesh.creation.box(extents=(20.0, 20.0, 20.0))
+        box.apply_transform(trimesh.transformations.rotation_matrix(math.radians(45.0), [0.0, 1.0, 0.0]))
+        box.apply_translation([0.0, 0.0, 30.0])
+        face = int(np.argmax(box.face_normals @ normal))
+        cc = np.asarray(box.triangles_center[face], dtype=float)
+        self.assertAlmostEqual(float(box.nearest.signed_distance([cc])[0]), 0.0, places=6)
         n_r = float(normal[0])
         n_z = float(normal[2])
         apex = cutter_location(cc, n_r, n_z, 0.0, self.config)
-        signed = float(sphere.nearest.signed_distance([apex])[0])
-        self.assertAlmostEqual(-signed, self.kerf_offset, delta=1e-6)
-        self.assertAlmostEqual(float(apex[2] - cc[2]), self.kerf_offset * n_z, delta=1e-9)
-        self.assertAlmostEqual(float(apex[0] - cc[0]), self.kerf_offset * n_r, delta=1e-9)
+        signed = float(box.nearest.signed_distance([apex])[0])
+        # Exactly one standoff outside the plane, measured on the mesh itself.
+        self.assertAlmostEqual(-signed, self.kerf_offset, places=6)
+        # And along the true normal, not a snapped radial/vertical offset.
+        self.assertAlmostEqual(float(apex[2] - cc[2]), self.kerf_offset * n_z, places=9)
+        self.assertAlmostEqual(float(apex[0] - cc[0]), self.kerf_offset * n_r, places=9)
+        self.assertGreater(abs(float(apex[0] - cc[0])), 1e-3, "no radial snap")
+        self.assertGreater(abs(float(apex[2] - cc[2])), 1e-3, "no vertical snap")
 
-    # -- (4) tool_body_penetrates -------------------------------------------
+
     def test_tool_body_clear_pose_does_not_penetrate(self):
         penetrates = self.helper("tool_body_penetrates")
         box = trimesh.creation.box(extents=(20.0, 20.0, 20.0))
@@ -904,8 +909,20 @@ class TestFinishingHelpers(unittest.TestCase):
         box.apply_translation([0.0, 0.0, 30.0])
         phi, _ = toolpath_sim.finishing_phi(0.0, 1.0, self.config)
         cc = np.array([5.0, 0.0, 40.0])
-        apex, axis = self._pose(cc, phi, 0.0, extra=1.0)
-        self.assertTrue(bool(penetrates(box, [apex], [axis], self.config)[0]))
+        apex, axis = self._pose(cc, phi, 0.0)
+        self.assertFalse(bool(penetrates(box, [apex], [axis], self.config)[0]))
+        # Flank stations sit 2-5 mm behind the apex, so 1 mm of push-in leaves
+        # the body outside on a flat top.  The standoff is only 0.9 mm: a push
+        # past the standoff would bury the *apex*.  Push the body in by 3 mm,
+        # which the 8-ring at the 0.25 station reaches.
+        # Push straight down along the face normal (-n_z), not along -n: for a
+        # flat top, -n is radial and only slides the apex sideways.
+        pushed = np.asarray(cc, dtype=float) + np.array([0.0, 0.0, self.kerf_offset - 3.0])
+        pushed_axis = self._axis_of(phi, 0.0)
+        self.assertTrue(
+            bool(penetrates(box, [pushed], [pushed_axis], self.config)[0]),
+            "a 3 mm push-in must bury the 1.65 mm-radius first ring",
+        )
 
     def test_tool_body_penetrates_when_tilted_into_wall(self):
         penetrates = self.helper("tool_body_penetrates")
@@ -946,31 +963,36 @@ class TestFinishingHelpers(unittest.TestCase):
     # -- (5) exit_moves -----------------------------------------------------
     def test_exit_moves_are_clear_and_end_outboard(self):
         exit_moves = self.helper("exit_moves")
-        # Box overhang: an 80 mm wide slab whose underside is at z = 90.
-        slab = trimesh.creation.box(extents=(80.0, 80.0, 20.0))
-        slab.apply_translation([0.0, 0.0, 100.0])
+        # A narrow overhang: a 20 mm cantilever whose underside is at z = 90 and
+        # whose outer edge reaches r = 30, with the stock wall beyond it at
+        # r = 34.  The cut is a pitched 75 deg pass under the overhang on a
+        # column wall at r = 10 (apex the CL off the surface, heater touching).
+        slab = trimesh.creation.box(extents=(60.0, 40.0, 10.0))
+        slab.apply_translation([0.0, 0.0, 95.0])
         column = trimesh.creation.box(extents=(20.0, 20.0, 80.0))
         column.apply_translation([0.0, 0.0, 50.0])
         mesh = trimesh.util.concatenate([slab, column])
         clearance_target = self.R + float(self.config["stock"]["retract_clearance_mm"])
         theta = 0.0
-        # Cut the column wall at r = 10 pitched forward, apex tucked at z = 82.
         phi = math.radians(75.0)
-        apex = np.array([10.0 + self.kerf_offset, 0.0, 82.0])
+        apex = np.array([10.0 + self.kerf_offset, 0.0, 90.0])
         collector = kinematics.DiagnosticCollector()
         moves = exit_moves(apex, phi, theta, mesh, self.config, clearance_target, collector)
-        self.assertGreaterEqual(len(moves), 2)
+        self.assertGreaterEqual(len(moves), 2, [d.code for d in collector.as_list()])
         self.assertAlmostEqual(float(moves[-1]["phi"]), 0.0, places=9)
-        self.assertGreaterEqual(float(moves[-1]["r"]) or 0.0, 0.0)
-        # Sample each non-rapid pose every 1 mm and require the body to clear.
-        # (poses are dicts in joint space; FK them back to wax poses)
         poses = []
         for move in moves:
             fk = kinematics.forward_kinematics(
-                float(move["r"]), float(move["theta"]), float(move["h"]), float(move["phi"]), self.config
+                float(move["r"]),
+                float(move["theta"]),
+                float(move["h"]),
+                float(move["phi"]),
+                self.config,
             )
             poses.append((np.asarray(fk.tip_xyz_wax), np.asarray(fk.tool_axis_wax)))
-        self.assertGreaterEqual(float(np.hypot(*poses[-1][0][:2])), self.R + 1e-6)
+        self.assertGreaterEqual(float(np.hypot(*poses[-1][0][:2])), clearance_target - 1e-6)
+        self.assertGreaterEqual(float(poses[-1][0][2]), float(self.config["stock"]["H_stock_mm"]))
+        # Every pose between the clear point and the re-pitch is clear.
         for apex_i, axis_i in poses[:-1]:
             self.assertFalse(
                 bool(self.helper("tool_body_penetrates")(mesh, [apex_i], [axis_i], self.config)[0]),
