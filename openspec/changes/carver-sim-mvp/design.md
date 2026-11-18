@@ -71,9 +71,10 @@ Clean dark technical CAD/CAM studio layout prioritizing high contrast for the tr
 ### Component: Simulation Transport Bar & Telemetry Readout
 - **Placement**: Docked along the bottom of the 3D viewport.
 - **States**:
-  - **Idle / Ready**: `Play` enabled, timeline scrubber at `0%`, live coordinates at home pose.
+  - **Idle / Ready**: `Play` and `Carve to End` enabled, preset selector (`Demo` / `Standard`), timeline scrubber at `0%`, live coordinates at home pose.
   - **Playing**: `Pause` active, scrubber advancing smoothly, speed selector (`1x`, `5x`, `10x`, `20x`), real-time joint + tip readout updating.
-  - **Collision / Limit Fault**: Transport pauses automatically, status badge highlights `#ef4444` (`RAPID_COLLISION` or `SOFT_LIMIT_EXCEEDED`), and the offending cutter segment renders red.
+  - **Scrubbing**: Rig updates immediately to scrubbed frame while Web Worker restores nearest preceding SDF snapshot and replays intervening subtractions asynchronously.
+  - **Collision / Limit Fault**: Transport pauses automatically, status badge highlights `#ef4444` (`RAPID_COLLISION`, `SHANK_COLLISION`, or `SOFT_LIMIT_EXCEEDED`), and the offending cutter/shank segment renders red (`#f59e0b` badge for non-fatal warnings like `SINGULARITY_HIGH_THETA_DOT` or `UNREACHABLE_UNDERCUT_AREA`).
 
 ---
 
