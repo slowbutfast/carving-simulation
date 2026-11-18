@@ -25,7 +25,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import face_sculpt
 import kinematics
@@ -40,11 +40,52 @@ VERSION = "0.1.0"
 app = FastAPI(title="Carving Studio API", version=VERSION)
 
 
+class StockCfg(BaseModel):
+    """Optional stock overrides; every length must be positive."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    R_stock_mm: float | None = Field(default=None, gt=0.0)
+    H_stock_mm: float | None = Field(default=None, gt=0.0)
+    z_plinth_mm: float | None = Field(default=None, ge=0.0)
+    finish_allowance_mm: float | None = Field(default=None, ge=0.0)
+    retract_clearance_mm: float | None = Field(default=None, ge=0.0)
+
+
+class ToolCfg(BaseModel):
+    """Optional tool overrides; the melt kerf may be zero, nothing else."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tip_radius_mm: float | None = Field(default=None, gt=0.0)
+    cone_half_angle_deg: float | None = Field(default=None, gt=0.0, lt=90.0)
+    engaged_length_mm: float | None = Field(default=None, gt=0.0)
+    tip_width_mm: float | None = Field(default=None, gt=0.0)
+    melt_kerf_mm: float | None = Field(default=None, ge=0.0)
+    shank_radius_mm: float | None = Field(default=None, gt=0.0)
+    shank_length_mm: float | None = Field(default=None, gt=0.0)
+
+
 class SimulationRequest(BaseModel):
     sliders: dict[str, float] = Field(default_factory=dict)
-    stock_cfg: dict[str, float] | None = None
-    tool_cfg: dict[str, float] | None = None
+    stock_cfg: StockCfg | None = None
+    tool_cfg: ToolCfg | None = None
     preset: Literal["demo", "standard"] = "demo"
+
+
+def _overrides(model: BaseModel | None) -> dict[str, Any]:
+    """Only the fields the client actually sent (``None`` means unchanged)."""
+
+    if model is None:
+        return {}
+    return {key: value for key, value in model.model_dump().items() if value is not None}
+
+
+def _validation_error(diagnostics: list[dict[str, Any]]) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"status": "error", "diagnostics": diagnostics},
+    )
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -126,10 +167,12 @@ def health() -> dict[str, Any]:
 def sculpt_and_sim(request: SimulationRequest) -> dict[str, Any]:
     started = time.perf_counter()
     config = kinematics.load_config()
-    if request.stock_cfg:
-        _deep_merge(config, {"stock": dict(request.stock_cfg)})
-    if request.tool_cfg:
-        _deep_merge(config, {"tool": dict(request.tool_cfg)})
+    stock_overrides = _overrides(request.stock_cfg)
+    tool_overrides = _overrides(request.tool_cfg)
+    if stock_overrides:
+        _deep_merge(config, {"stock": stock_overrides})
+    if tool_overrides:
+        _deep_merge(config, {"tool": tool_overrides})
 
     base_mesh = face_sculpt.load_base_head(config)
     sculpt = face_sculpt.apply_facial_modifications(base_mesh, request.sliders, config)
@@ -144,9 +187,17 @@ def sculpt_and_sim(request: SimulationRequest) -> dict[str, Any]:
         )
 
     assert sculpt.mesh is not None
-    path = toolpath_sim.generate_synthetic_carve_path(
-        sculpt.mesh, config, preset=request.preset
-    )
+    try:
+        path = toolpath_sim.generate_synthetic_carve_path(
+            sculpt.mesh, config, preset=request.preset
+        )
+    except toolpath_sim.FrameCapExceededError as error:
+        raise _validation_error([error.diagnostic().as_dict()]) from error
+
+    errors = [d for d in path.diagnostics if d.severity == "error"]
+    if errors:
+        # SOFT_LIMIT_EXCEEDED and friends: the trajectory is not producible.
+        raise _validation_error([d.as_dict() for d in path.diagnostics])
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     return {

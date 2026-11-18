@@ -114,18 +114,14 @@ function carveForward(target) {
         return index;
       }
     } else {
-      // The unheated shank is checked on every cutting frame. Vertical roughing
-      // plunges sit inside the roughing allowance shell by design, so only
-      // tilted (finishing) poses can physically reach an overhang.
-      const tilted = Math.abs(pose.axis[2]) < 0.98;
-      if (tilted) {
-        const shank = core.checkShank(pose, workerTool);
-        if (shank.collision) {
-          post({ type: 'collision', code: 'SHANK_COLLISION', index, sdf: shank.sdf });
-          faulted = true;
-          current = index;
-          return index;
-        }
+      // The unheated shank is checked on every cutting frame: a vertical
+      // plunge can bury it in uncarved stock just as a tilted pass can.
+      const shank = core.checkShank(pose, workerTool);
+      if (shank.collision) {
+        post({ type: 'collision', code: 'SHANK_COLLISION', index, sdf: shank.sdf });
+        faulted = true;
+        current = index;
+        return index;
       }
       core.subtractTool(pose, workerTool, { includeShank: false });
       if (index % snapshotEvery === 0) snapshotAt(index);

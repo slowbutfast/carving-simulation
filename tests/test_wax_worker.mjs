@@ -157,3 +157,26 @@ test('worker checks the shank on every cutting frame (no skipping)', { skip: !ha
   assert.equal(collision.code, 'SHANK_COLLISION');
   assert.equal(collision.index, 3, 'the single offending frame is not skipped');
 });
+
+test('vertical cutting pose with the shank buried in uncarved stock posts SHANK_COLLISION', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
+  const worker = await bootWorker();
+  // The shank, not the tip, is the risk.  The engaged cone plus shank covers
+  // exactly half the stock height, so a tip at mid-height puts the shank rings
+  // inside the uncarved column above it.
+  const tool = { engaged_length_mm: 4, shank_radius_mm: 4, shank_length_mm: 40 };
+  const config = initConfig(tool);
+  config.stock = { R_stock_mm: 20, H_stock_mm: 40 };
+  worker.send({ type: 'init', config, gridN: 48, chunkSize: 16 });
+
+  const count = 6;
+  // Vertical (axis = -z, |axis.z| = 1) - exactly the pose the old `tilted`
+  // gate skipped.  Tip at z = 20, so the shank spans z 24..60 and its lower
+  // rings sit inside stock that reaches z = 40.
+  const { poses, rapid } = verticalPath(count, { x: 0, y: 0, z: 20, step: 0.01 });
+  worker.send({ type: 'path', poses: Float32Array.from(poses), rapid: Uint8Array.from(rapid), count });
+  worker.send({ type: 'seek', index: count - 1 });
+
+  const collision = worker.ofType('collision')[0];
+  assert.ok(collision, 'vertical shank collision reported');
+  assert.equal(collision.code, 'SHANK_COLLISION');
+});

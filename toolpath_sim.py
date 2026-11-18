@@ -841,9 +841,24 @@ def build_roughing(
     allowance = float(stock["finish_allowance_mm"])
     clearance = float(params["rapid_clearance_mm"])
     engaged = float(config["tool"]["engaged_length_mm"])
+    tool = config["tool"]
     # The cone only removes material over the engaged length above the apex, so
-    # clamp the stepdown and start one cone-length below the top to face it off.
-    stepdown = min(float(params["rough_stepdown_mm"]), max(1.0, engaged * 0.75))
+    # clamp the stepdown there.  It must also keep the unheated shank clear of
+    # the terrace left by the previous level: on a vertical wall the previous
+    # cone's flank cuts r_prev - (shank_r - tip_r - kerf) at this level's apex,
+    # so a stepdown above
+    #   engaged - (shank_r - tip_r - kerf) / tan(alpha)
+    # leaves a sliver of wax inside the shank.  With the shipped tool that is
+    # 8 - (3.0 - 0.5 - 0.4) / tan(30 deg) = 4.36 mm, floor 1.0 mm.
+    alpha = math.radians(float(tool["cone_half_angle_deg"]))
+    shank_safe = engaged - (
+        float(tool["shank_radius_mm"]) - float(tool["tip_radius_mm"]) - float(tool["melt_kerf_mm"])
+    ) / math.tan(alpha)
+    stepdown = min(
+        float(params["rough_stepdown_mm"]),
+        max(1.0, engaged * 0.75),
+        max(1.0, shank_safe),
+    )
     stepover = max(float(params["rough_stepover_mm"]), 0.25)
     theta_grid = _theta_grid(float(params["theta_step_deg"]))
 
@@ -1394,6 +1409,16 @@ def generate_synthetic_carve_path(
     joints = rough_joints + finish_joints
     rapid_flags = rough_rapid + finish_rapid
     stages = rough_stage + finish_stage
+
+    if any(diag.severity == "error" for diag in collector.as_list()):
+        # An out-of-bounds joint or stock already makes the path unproducible;
+        # don't spend minutes resampling (and trip the frame cap) to say so.
+        return ToolpathResult(
+            frames=[],
+            diagnostics=collector.as_list(),
+            preset=preset,
+            unreachable_percent=unreachable_percent,
+        )
 
     joints, rapid_flags, stages = resample_path(joints, rapid_flags, stages, cfg)
 

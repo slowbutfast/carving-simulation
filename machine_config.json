@@ -64,21 +64,19 @@
   },
   "presets": {
     "demo": {
-      "theta_step_deg": 15.0,
+      "theta_step_deg": 7.5,
       "rough_stepdown_mm": 10.0,
       "rough_stepover_mm": 2.0,
-      "finish_z_step_mm": 4.0,
-      "finish_standoff_mm": 4.0
+      "finish_z_step_mm": 4.0
     },
     "standard": {
-      "theta_step_deg": 10.0,
+      "theta_step_deg": 5.0,
       "rough_stepdown_mm": 5.0,
       "rough_stepover_mm": 1.5,
-      "finish_z_step_mm": 2.5,
-      "finish_standoff_mm": 3.0
+      "finish_z_step_mm": 2.5
     }
   },
   "api": {
-    "max_frames": 400000
+    "max_frames": 250000
   }
 }
