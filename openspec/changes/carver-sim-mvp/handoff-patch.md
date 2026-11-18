@@ -1,55 +1,52 @@
-# Surgical Patch Handoff: OpenSpec Change 'carver-sim-mvp' [PATCH-10d]
+# Surgical Patch Handoff: OpenSpec Change 'carver-sim-mvp' [PATCH-10e]
 
 ## 1. Executive Objective & Diagnostic Feedback
 - **Change Name**: `carver-sim-mvp`
-- **Patch ID**: `PATCH-10d` (continues PATCH-10c on PR #1, branch `feat/carver-sim-mvp`, head `72c9d5e`)
-- **Objective**: (A) Fix the two remaining helper-1 bugs in `section_polylines`, get its 4 tests green and freeze it; then (B) complete PATCH-10c helpers 2-5 and the rest of its checklist as specified in `handoff-patch-10c.md`.
-- **Worktree**: `/home/node/.local/share/opencode/worktree/e2bca1842f570b9a1bfc074160409febdbcc36fa/focal-toucan`. Python: `.venv/bin/python`. Node 22. The tree is clean at `72c9d5e`; no checkpoint needed.
+- **Patch ID**: `PATCH-10e` (resumes from `fb60eaf`, keeping frozen helpers 1–4)
+- **Objective**: Apply the 3 test rulings on `TestFinishingHelpers`, fix helper 5 (`exit_moves` + `entry_moves`) with a horizontal `+e_r` pullout candidate, compose `build_finishing` from helpers 1–5 (eliminating the 8 `_flank_clearance` `NameError`s), finish the remaining PATCH-10c items (`server.py` 422s, `machine_config.json` revert, `wax_worker.js` `tilted` gate removal, roughing shank-safe stepdown), and update `verification.md`.
 - **Feedback & Diagnostic Trace**:
   ```
-  section_polylines(mesh, theta=0, z_min=10, z_max=120, step=2) @ 72c9d5e
-  box:          2 polylines  (15,11.5)->...->(11.5,50)  and  (0,50)->(11.5,50)
-                expected 1:  (15,11.5) -> (15,50) -> (0,50)
-  needle-only:  2 polylines  (20.8,40)->(19.2,56) x2      <- correct
-  body+needle:  4 polylines                               expected 3
-  FAIL test_section_polylines_continuous_clipped_and_ordered
-  FAIL test_section_polylines_split_islands
+  Head fb60eaf: 43 tests, 2 failures, 8 errors, 1 skipped
+  - 8x NameError: name '_flank_clearance' is not defined at toolpath_sim.py:1214
+  - FAIL test_tool_body_penetrates_when_tilted_into_wall (L952 checked x - r < 0.0 instead of x - r < 15.0)
+  - FAIL test_exit_moves_are_clear_and_end_outboard: 0 not >= 2 : ['UNREACHABLE_UNDERCUT_AREA']
   ```
-- **Root Cause Analysis**: This is NOT a "which split rule" design question. Do not implement either proposed tie-break (`(15,10)/(-15,50)` or "cut plane ends at the axis"). There are two bugs:
-  1. **Split before clip** (`section_polylines` L602-617). Closed loops are split at low/high *before* clipping, so the box rectangle is split using its discarded `r < 0` half. The correct order: clip first, and split only a closed loop that lies *entirely* inside `r >= 0` and `[z_lo, z_hi]` (an untouched island such as the needle). A loop that touches any boundary becomes open polylines, which are never split. "Ends at the axis" falls out of this automatically.
-  2. **Axis-mixed crossings** (`_clip_band.crossing_parameters` L393-403). It intersects BOTH axes with ALL bounds `(0.0, z_lo, z_hi)`, so the r axis gets a spurious crossing at r = z_lo = 11.5. That is exactly where the box's top face was broken.
-  Also: when a crossing closed loop is clipped, the walk must start at an outside vertex, or the in-band arc is split at the loop's arbitrary chain start.
+- **Root Cause Analysis**:
+  - `test_tool_body_penetrates_when_tilted_into_wall` L952 checked `x - r < 0.0` instead of the wall face at `x = 15.0`.
+  - `exit_moves` only tried `-u` (which rises into a horizontal overhang at `z = 90`) and vertical lift (which rises into the slab), missing a horizontal `+e_r` pullout candidate at constant `phi`.
+  - `build_finishing` (`toolpath_sim.py:1191-1274`) still calls deleted `_flank_clearance`, `safe_approach_moves`, and `safe_retract_moves`.
 
 ## 2. Strict Target Context Map
-| File Path | Target Lines | Modification Summary |
+| File Path (relative to repo root) | Target Lines | Modification Summary |
 |---|---|---|
-| `toolpath_sim.py` | L393-403 `crossing_parameters` | r axis (index 0) crosses only `0.0`; z axis (index 1) crosses only `z_lo`, `z_hi`. Nothing else in `_clip_band` changes unless the reproduction shows it must. |
-| `toolpath_sim.py` | L602-623 loop body of `section_polylines` | Per loop: `flat = [(p·e_r, p_z)]`; `inside = [r >= 0 and z_lo <= z <= z_hi]`. **If `closed and all(inside)`**: pieces = the halves from `_split_closed_loop(flat)`. **Else**: if closed, rotate to start at the first outside vertex and close it (`flat[k:] + flat[:k+1]`, normals likewise); pieces = `_clip_band(...)` with NO split. Then for every piece with len >= 2: reverse if `last.z < first.z`, `_resample`, append. Keep the final sort. |
-| `tests/test_carver_sim.py` | L812-819 comment in `test_section_polylines_split_islands` | Rewrite the comment only: body = 1 open polyline (it crosses the axis, so it is clipped, not split): wall from z 11.5, then top face inward to r = 0. Needle = untouched closed island split into 2 bottom-to-top halves. Total 3. Drop all "far wall" wording. **Do not change any assertion.** |
-| everything in `handoff-patch-10c.md` §2 | | Part B, unchanged, after helper 1 is frozen. |
+| `tests/test_carver_sim.py` | `L906-L1000` | **Test Rulings**: Keep `test_cutter_location_offsets_along_true_normal` (accepted). Fix `test_tool_body_penetrates_when_tilted_into_wall` L952 (`< 15.0` instead of `< 0.0`). Revert `test_exit_moves_are_clear_and_end_outboard` fixture to `fb0c145` (`slab` `80×80×20` at `z=100`, `apex` at `z=82`, `phi=75°`, retaining `H_stock` check). |
+| `toolpath_sim.py` | `L1017-L1140` | In `exit_moves`, add a horizontal `+e_r` radial pullout candidate at constant `phi` (to `clearance_target`, then re-pitch `phi -> 0`, then lift to `safe_z`) so wide overhangs (`z=90` above `z=82`) clear without hitting `-u` or vertical lift; mirror in `entry_moves`. |
+| `toolpath_sim.py` | `L1185-L1275` | Compose `build_finishing` from frozen helpers 1–4 + helper 5 (`section_polylines`, `finishing_phi`, `cutter_location`, `tool_body_penetrates`, `entry_moves`, `exit_moves`), removing all calls to deleted `_flank_clearance`, `safe_approach_moves`, and `safe_retract_moves`. |
+| `toolpath_sim.py` | `L531-L674, L907-L980` | Clamp roughing stepdown to the shank-safe bound (`<= engaged - (shank_r - tip_r - kerf) / tan(alpha)`), short-circuit on `SOFT_LIMIT_EXCEEDED` before resampling, and raise `FrameCapExceededError` when `len(joints) > max_frames`. |
+| `server.py` | `L43-L48, L125-L155` | Add Pydantic constraints (`gt=0`, valid ranges) on `stock_cfg` / `tool_cfg` and map `FrameCapExceededError` / error-severity diagnostics to HTTP 422. |
+| `machine_config.json` | `L65-L83` | Revert `presets.demo.theta_step_deg` to `7.5`, `presets.standard.theta_step_deg` to `5.0`, and `api.max_frames` to `250000`. |
+| `static/wax_worker.js` & `tests/test_wax_worker.mjs` | `wax_worker.js:L118-L132` | Remove the `tilted` gate so `core.checkShank(pose, workerTool)` runs on every cutting frame, and add a vertical (`phi=0`) shank-collision worker test. |
+| `openspec/changes/carver-sim-mvp/verification.md`, `patch.md`, `tasks.md` | `[UPDATE]` | Update `verification.md` with fresh passing logs + `128³` sweep results, tick `P10.*`–`P10e.*` in `tasks.md`, and mark `PATCH-10`..`PATCH-10e` `VERIFIED` in `patch.md`. |
 
 ## 3. Blast Radius & Invariant Guardrails
-- **Part A blast radius**: only the three rows above. `_chain_loops`, `_split_closed_loop`, `_resample` and the normal handling stay as they are unless the reproduction proves one of them wrong. In that case, stop and report rather than patch around it.
-- **Helper 1 is FROZEN once its 4 tests pass.** Part B must not modify `section_polylines` or its private helpers. If a later helper seems to need a change there, stop and report.
-- **Debug rule (this is what went wrong last time)**: before writing any tie-break, fallback or special case, print the intermediate data (post-clip / pre-split pieces as `(r, z)` lists) and compare the pipeline's step order with this spec. No new helper functions in Part A.
-- **FORBIDDEN**: no new dependencies (no networkx); do not revert to `d268090`; do not edit spec-encoding tests (`TestSyntheticToolpaths`, kinematics, especially `test_finishing_uses_phi_and_reports_unreachable_undercuts`); do not change `finishing_phi` table rows (they are consistent with the formula: beta 0 -> (0, True), beta 179 -> (75, False)); no `.env`/credential edits.
-- **Fact reminder**: `trimesh.nearest.signed_distance` is POSITIVE INSIDE; `mesh.contains` agrees. `mesh_plane` segments are exact (measured max |y| = 0.0 on the box fixture).
-- **INVARIANTS TO PRESERVE**: everything currently green, including `test_planar_section_keeps_off_centerline_radii` (theta = 0, radius > 20.5), `test_section_contour_flattens_polylines`, the step-zero sign test, Node 9/9 + 2/2.
+- **FROZEN**: Do **NOT** modify helpers 1–4 (`section_polylines`, `finishing_phi`, `cutter_location`, `tool_body_penetrates`) or their unit tests (except L952 `< 15.0` wall-face fix).
+- **STRICT BLAST RADIUS**: Modify ONLY the files and line ranges in the Target Context Map.
+- **FORBIDDEN**: Do NOT modify `.env`, credential files, `kinematics.py`, `face_sculpt.py`, `static/machine_rig.js`, `static/wax_sdf_core.js`, or `static/app.js`.
 
 ## 4. Visual & UI Impact
-- Status: Non-visual patch. No styling or layout modifications permitted.
+- Status: Non-visual patch. No styling, CSS, or HTML layout modifications permitted.
 
 ## 5. Reproduction & Verification Protocol
-1. **Reproduce**: `.venv/bin/python -m unittest discover -s tests -k test_section_polylines -k test_planar_section -k test_section_contour` -> exactly the 2 failures above, 2 passes.
-2. **Inspect before editing**: print the box loop's `flat`, its `inside` flags, and the `_clip_band` output pieces. Confirm the spurious r = 11.5 crossing, and that the split currently runs on the unclipped loop.
-3. **Apply Part A** (crossings, then ordering, then comment). Expected: box -> 1 polyline `(15,11.5) -> (15,50) -> (0,50)`; needle -> 2; body+needle -> 3.
-4. **Verify**: re-run step 1 -> 4/4 green. Commit `wip(carver-sim): P10c helper 1 green`.
-5. **Part B**: follow `handoff-patch-10c.md` §5 from step 2 onward, starting at helper 2 (`finishing_phi`), then `cutter_location`, `tool_body_penetrates`, `exit_moves`. Commit each helper as it goes green, then compose `build_finishing`, server 422s, config revert, worker gate + test. The 10c stop rule still applies (two genuine attempts per helper, then stop and report).
-6. **Full regression**: `.venv/bin/python -m unittest discover -s tests -v` and `node --test tests/test_wax_sdf.mjs tests/test_wax_worker.mjs`, then the 128^3 sweep (`tests/sweep_path.mjs` / `scripts/sweep_path.py`, shank checked on every cutting frame) and `openspec validate carver-sim-mvp --strict`.
+1. **Reproduce First**: Run `.venv/bin/python -m unittest tests.test_carver_sim.TestFinishingHelpers -v` after applying the test rulings; confirm `test_tool_body_penetrates_when_tilted_into_wall` passes and `test_exit_moves_are_clear_and_end_outboard` fails.
+2. **Apply Fixes**: Update `exit_moves`/`entry_moves`, compose `build_finishing`, and complete `server.py` / `machine_config.json` / `static/wax_worker.js`.
+3. **Full Regression Suite**:
+   - `.venv/bin/python -m unittest discover -s tests -v` (0 failures, 0 errors, 1 expected hardware skip)
+   - `node --test tests/test_wax_sdf.mjs tests/test_wax_worker.mjs` (100% pass)
+   - `openspec validate carver-sim-mvp --strict --json` (`valid: true`)
 
 ## 6. Surgical Patch Checklist
-- [ ] P10d.1 Reproduce the 2 red section tests; print post-clip/pre-split pieces for the box.
-- [ ] P10d.2 Fix `crossing_parameters` per-axis bounds; reorder `section_polylines` (clip first, split only untouched islands, rotate crossing loops to an outside vertex); fix the islands-test comment.
-- [ ] P10d.3 Re-run the section tests -> 4/4 PASS; commit; helper 1 frozen.
-- [ ] P10d.4 Complete PATCH-10c P10c.2-P10c.5 per `handoff-patch-10c.md`; full suites, sweep and validate clean.
-- [ ] P10d.5 Tick P10*/P10b*/P10c*/P10d* in `tasks.md`; mark PATCH-10, 10b, 10c, 10d `VERIFIED` in `patch.md`; update `verification.md`; final commit `fix(carver-sim): PATCH-10c structured undercut finishing`, pushed to `feat/carver-sim-mvp` (do not merge).
+- [ ] P10e.1 Apply test rulings in `tests/test_carver_sim.py` (`test_exit_moves` reverted to `fb0c145`, L952 `< 15.0` fixed).
+- [ ] P10e.2 Fix `exit_moves` (`+e_r` horizontal pullout candidate) & `entry_moves`; compose `build_finishing` from frozen helpers 1–4 + helper 5.
+- [ ] P10e.3 Complete `toolpath_sim.py` (shank-safe roughing stepdown, `SOFT_LIMIT` short-circuit), `server.py` 422s, `machine_config.json` revert, and `static/wax_worker.js` `tilted` gate removal + test.
+- [ ] P10e.4 Run full Python + Node suites, `128³` sweep, and `openspec validate carver-sim-mvp --strict --json`.
+- [ ] P10e.5 Update `verification.md`, tick `P10.*`–`P10e.*` in `tasks.md`, and mark `PATCH-10`..`PATCH-10e` `VERIFIED` in `patch.md`.

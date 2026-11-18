@@ -322,5 +322,33 @@
 - **Root Cause**: The pipeline order is inverted relative to the design (split -> clip instead of clip -> split-if-untouched), and `crossing_parameters` mixes the r and z bounds. The tie-break search in the last session was trying to fix symptoms of these two bugs.
 - **Target Files**: `toolpath_sim.py`, `tests/test_carver_sim.py`, plus all PATCH-10c remaining targets (`server.py`, `machine_config.json`, `static/wax_worker.js`, `tests/test_wax_worker.mjs`, `verification.md`, `patch.md`, `tasks.md`)
 - **Resolution Strategy**: Fix `crossing_parameters` per-axis bounds; reorder `section_polylines` to classify each loop (untouched closed island -> `_split_closed_loop`; otherwise rotate to an outside vertex and `_clip_band`, no split); correct the test comment. Freeze helper 1 once its 4 tests pass, then continue PATCH-10c helpers 2-5 and the remaining checklist exactly as specified in `handoff-patch.md`.
+- **Status**: SUPERSEDED by PATCH-10e (helpers 1-4 green at `fb60eaf`; helper 5 red, `build_finishing` still calls deleted `_flank_clearance`)
+
+### [PATCH-10e] Test Rulings, Helper 5 (`exit_moves`) Radial Pullout, `build_finishing` Composition & PATCH-10c Closeout
+
+- **Date**: 2026-11-18 19:25:00 UTC
+- **Feedback Source**: Code Review of `fb60eaf` (Agent 1 & Agent 2) + Empirical Probe
+- **Feedback Summary**:
+  - Helpers 1–4 (`section_polylines`, `finishing_phi`, `cutter_location`, `tool_body_penetrates`) are green and **frozen** at `fb60eaf`.
+  - **Test Edit Rulings** (the agent edited 3 tests in `TestFinishingHelpers`):
+    1. `test_cutter_location_offsets_along_true_normal`: **ACCEPT** (exact 45° rotated box is stricter and cleaner).
+    2. `test_tool_body_penetrates_when_pushed_in`: **PROBE RESULT** — `tool_body_penetrates` includes `apexes`, so a `1 mm` push past the `0.9 mm` standoff *does* return `True` (`signed_distance = +1.0`). Keep or restore `1 mm` push; also fix `test_tool_body_penetrates_when_tilted_into_wall` L952 (`x - r < 15.0` instead of `< 0.0`, since the wall face is at `x = 15`).
+    3. `test_exit_moves_are_clear_and_end_outboard`: **REVERT** fixture to `fb0c145` (`slab` `80×80×20` at `z=100`, underside `z=90`, `apex` tucked at `z=82`, `phi=75°`, keeping the stronger `H_stock` check).
+  - **Helper 5 (`exit_moves`)**: Under an `80 mm`-wide overhang (`z=90`), neither `-u` (rises into `z=90`) nor vertical lift clears; add a **horizontal radial pullout (`+e_r` at constant `phi`)** candidate before re-pitching `phi -> 0` and lifting to `safe_z`.
+  - **Composition & Collateral Errors**: `build_finishing` (`toolpath_sim.py:1191-1274`) still calls deleted `_flank_clearance`, `safe_approach_moves`, and `safe_retract_moves` (causing 8 `NameError`s). Wire `build_finishing` to `section_polylines`, `finishing_phi`, `cutter_location`, `tool_body_penetrates`, `entry_moves`, and `exit_moves`, then complete remaining PATCH-10c items (`server.py` 422s, `machine_config.json` revert, `wax_worker.js` `tilted` gate removal, roughing shank-safe stepdown, `SOFT_LIMIT` short-circuit) and update `verification.md` / `tasks.md`.
+- **Reported Issue / Raw Trace**:
+  ```
+  fb60eaf: 43 tests, 2 failures, 8 errors, 1 skipped
+  - 8x NameError: name '_flank_clearance' is not defined (toolpath_sim.py:1214)
+  - FAIL test_tool_body_penetrates_when_tilted_into_wall: "fixture did not lean the body into the wall" (L952 checked < 0.0 instead of < 15.0)
+  - FAIL test_exit_moves_are_clear_and_end_outboard: 0 not >= 2 : ['UNREACHABLE_UNDERCUT_AREA']
+  ```
+- **Root Cause**:
+  - `test_tool_body_penetrates_when_tilted_into_wall` compared `x - r < 0.0` against the box center instead of the `x = 15.0` wall face.
+  - `exit_moves` lacked a horizontal radial pullout (`+e_r`) candidate to clear wide overhangs before pitching to `0`.
+  - `build_finishing` was left mid-refactor calling removed `_flank_clearance` / `safe_approach_moves` / `safe_retract_moves`.
+- **Target Files**: `tests/test_carver_sim.py`, `toolpath_sim.py`, `server.py`, `machine_config.json`, `static/wax_worker.js`, `tests/test_wax_worker.mjs`, `openspec/changes/carver-sim-mvp/verification.md`, `openspec/changes/carver-sim-mvp/patch.md`, `openspec/changes/carver-sim-mvp/tasks.md`
+- **Resolution Strategy**:
+  - Apply the 3 test rulings, add `+e_r` radial pullout candidate to `exit_moves` (and mirror in `entry_moves`), compose `build_finishing` from frozen helpers 1–4 + helper 5, finish PATCH-10c server/config/worker items, run full suites + `128³` sweep + `openspec validate --strict`, and update `verification.md` & `tasks.md`.
 - **Status**: PENDING
 

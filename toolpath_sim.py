@@ -1058,6 +1058,17 @@ def exit_moves(
     # and lies on the face by construction.  Both candidates therefore skip the
     # first millimetre (that cut has just been made) and must clear from there.
     candidates: list[list[np.ndarray]] = []
+    # Candidate 0: horizontal +e_r at constant phi.  Under a wide overhang
+    # both the -u slide and a vertical lift rise into the slab, but pulling
+    # straight out at the cut height stays under it.  This is tried first.
+    if clearance_target > r_apex:
+        candidates.append(
+            _clear_line(
+                clearance_target - r_apex,
+                apex + e_r * min(1.0, clearance_target - r_apex),
+                e_r,
+            )
+        )
     if math.sin(phi) > 0.05:
         # Leaving the cut is -u; with u = -sin(phi) e_r - cos(phi) e_z the
         # radius of the apex and of every body point grows by s sin(phi).

@@ -60,3 +60,11 @@
 - [ ] P10d.3 All 4 section tests green; commit `wip(carver-sim): P10c helper 1 green`; helper 1 frozen
 - [ ] P10d.4 Complete P10c.2-P10c.5 (helpers 2-5, `build_finishing`, server 422s, config revert, worker gate, suites, 128^3 sweep, validate, docs)
 
+## Patch 10e: Test Rulings, Helper 5 (`exit_moves`) Radial Pullout & `build_finishing` Composition
+
+- [ ] P10e.1 Apply test rulings in `tests/test_carver_sim.py`: revert `test_exit_moves_are_clear_and_end_outboard` fixture to `fb0c145` (`80×80×20` slab, `apex` at `z=82`), fix `test_tool_body_penetrates_when_tilted_into_wall` L952 (`< 15.0`), and confirm both helper tests fail/pass as expected (helpers 1–4 frozen)
+- [ ] P10e.2 Fix `exit_moves` (add horizontal `+e_r` pullout candidate at constant `phi` before re-pitching) and `entry_moves`; compose `build_finishing` from `section_polylines`, `finishing_phi`, `cutter_location`, `tool_body_penetrates`, `entry_moves`, and `exit_moves` (removing all calls to `_flank_clearance`, `safe_approach_moves`, `safe_retract_moves`)
+- [ ] P10e.3 Complete remaining PATCH-10c items: `SOFT_LIMIT` short-circuit + roughing shank-safe stepdown in `toolpath_sim.py`, `server.py` 422s, `machine_config.json` revert (`7.5°`/`5.0°`, `max_frames: 250000`), and `static/wax_worker.js` `tilted` gate removal + vertical shank worker test
+- [ ] P10e.4 Run full Python (`python3 -m unittest discover -s tests -v`), Node (`node --test tests/test_wax_sdf.mjs tests/test_wax_worker.mjs`), `128³` sweep, and `openspec validate carver-sim-mvp --strict --json`
+- [ ] P10e.5 Update `verification.md` with fresh logs, tick `P10.*`–`P10e.*` in `tasks.md`, and mark `PATCH-10`..`PATCH-10e` `VERIFIED` in `patch.md`
+

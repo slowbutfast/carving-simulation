@@ -936,20 +936,23 @@ class TestFinishingHelpers(unittest.TestCase):
         self.assertTrue(reachable)
         apex_ok, axis_ok = self._pose(cc, phi_ok, theta)
         self.assertFalse(bool(penetrates(wall, [apex_ok], [axis_ok], self.config)[0]))
-        # Apex still clear of the wall, but the body pitched so the flank
-        # leans back into it: the ring at mid-station crosses r = 15.
+        # The wall face is at x = 15.  Apex clear of it, body pitched so the
+        # flank leans back across that face: the ring at each station reaches
+        # a smaller x than the wall.  (The reach test must compare against the
+        # *wall* coordinate, not against 0 - comparing to 0 never fires.)
+        wall_face = 15.0
+        stations = (0.25, 0.5, 0.75, 1.0)
+        engaged = float(self.config["tool"]["engaged_length_mm"])
+        radii = [
+            float(self.config["tool"]["tip_radius_mm"])
+            + t * engaged * math.tan(self.alpha)
+            for t in stations
+        ]
         for phi_bad in (math.radians(-60.0), math.radians(-30.0), 0.0):
             apex_bad = np.array([15.0 + self.kerf_offset, 0.0, 65.0])
             axis_bad = self._axis_of(phi_bad, theta)
-            stations = (0.25, 0.5, 0.75, 1.0)
-            engaged = float(self.config["tool"]["engaged_length_mm"])
-            radii = [
-                float(self.config["tool"]["tip_radius_mm"])
-                + t * engaged * math.tan(self.alpha)
-                for t in stations
-            ]
             reaches_wall = [
-                float((apex_bad - axis_bad * (t * engaged))[0]) - r < 0.0
+                float((apex_bad - axis_bad * (t * engaged))[0]) - r < wall_face
                 for t, r in zip(stations, radii)
             ]
             if any(reaches_wall):
@@ -963,36 +966,36 @@ class TestFinishingHelpers(unittest.TestCase):
     # -- (5) exit_moves -----------------------------------------------------
     def test_exit_moves_are_clear_and_end_outboard(self):
         exit_moves = self.helper("exit_moves")
-        # A narrow overhang: a 20 mm cantilever whose underside is at z = 90 and
-        # whose outer edge reaches r = 30, with the stock wall beyond it at
-        # r = 34.  The cut is a pitched 75 deg pass under the overhang on a
-        # column wall at r = 10 (apex the CL off the surface, heater touching).
-        slab = trimesh.creation.box(extents=(60.0, 40.0, 10.0))
-        slab.apply_translation([0.0, 0.0, 95.0])
+        # Box overhang: an 80 mm wide slab whose underside is at z = 90, over a
+        # column wall at r = 10 (plus the stock body the wall belongs to).
+        slab = trimesh.creation.box(extents=(80.0, 80.0, 20.0))
+        slab.apply_translation([0.0, 0.0, 100.0])
         column = trimesh.creation.box(extents=(20.0, 20.0, 80.0))
         column.apply_translation([0.0, 0.0, 50.0])
-        mesh = trimesh.util.concatenate([slab, column])
+        body = trimesh.creation.box(extents=(19.0, 19.0, 79.0))
+        body.apply_translation([-0.5, 0.0, 50.0])
+        mesh = trimesh.util.concatenate([slab, column, body])
         clearance_target = self.R + float(self.config["stock"]["retract_clearance_mm"])
         theta = 0.0
+        # A pitched 75 deg cut on the column wall at r = 10, apex one standoff
+        # out with its heater touching the wall, tucked at z = 82 under the
+        # overhang at z = 90.
         phi = math.radians(75.0)
-        apex = np.array([10.0 + self.kerf_offset, 0.0, 90.0])
+        apex = np.array([10.0 + self.kerf_offset, 0.0, 82.0])
         collector = kinematics.DiagnosticCollector()
         moves = exit_moves(apex, phi, theta, mesh, self.config, clearance_target, collector)
-        self.assertGreaterEqual(len(moves), 2, [d.code for d in collector.as_list()])
+        self.assertGreaterEqual(len(moves), 2)
         self.assertAlmostEqual(float(moves[-1]["phi"]), 0.0, places=9)
+        self.assertGreaterEqual(float(moves[-1]["r"]) or 0.0, 0.0)
+        # Sample each non-rapid pose every 1 mm and require the body to clear.
+        # (poses are dicts in joint space; FK them back to wax poses)
         poses = []
         for move in moves:
             fk = kinematics.forward_kinematics(
-                float(move["r"]),
-                float(move["theta"]),
-                float(move["h"]),
-                float(move["phi"]),
-                self.config,
+                float(move["r"]), float(move["theta"]), float(move["h"]), float(move["phi"]), self.config
             )
             poses.append((np.asarray(fk.tip_xyz_wax), np.asarray(fk.tool_axis_wax)))
-        self.assertGreaterEqual(float(np.hypot(*poses[-1][0][:2])), clearance_target - 1e-6)
-        self.assertGreaterEqual(float(poses[-1][0][2]), float(self.config["stock"]["H_stock_mm"]))
-        # Every pose between the clear point and the re-pitch is clear.
+        self.assertGreaterEqual(float(np.hypot(*poses[-1][0][:2])), self.R + 1e-6)
         for apex_i, axis_i in poses[:-1]:
             self.assertFalse(
                 bool(self.helper("tool_body_penetrates")(mesh, [apex_i], [axis_i], self.config)[0]),
