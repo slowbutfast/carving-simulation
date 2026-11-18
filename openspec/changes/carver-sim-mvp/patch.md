@@ -218,9 +218,7 @@
     and passed to `checkRapid`, `checkShank` and `subtractTool`; `checkShank` runs
     on every tilted cutting frame (no `>= 4` skip); snapshots are thinned evenly
     instead of `splice(1, 1)`. Verified by `tests/test_wax_worker.mjs` (2/2).
-  - `static/wax_sdf_core.js`: **new defect found while writing the worker tests** —
-    `_sampleBody` walked the shank along `+axis` (in front of the tip) so every
-    tilted pose reported a phantom `SHANK_COLLISION`. Now walks `apex - axis * t`.
+  - `static/wax_sdf_core.js`: *(Correction: `902b8b8` already computed `apex - axis * t` in `_sampleBody`; `d268090` only updated comments in this file.)*
   - `toolpath_sim.py`: finished the planar section slicing (`mesh_plane` +
     face normals, no `networkx` dependency), the 3-step constant-`phi`
     approach/retract, `|beta - phi| <= 90° - alpha` reachability,
@@ -240,3 +238,63 @@
     (5 are the intended `phi = 0` contract change needing updated assertions, 3 are
     genuine gaps: shadow fixture, approach-height, planar-contour assertions, and the
     two API 422 tests with no implementation).
+
+### [PATCH-10b] Restore Wrist-Pitched Undercut Finishing, Transition/Gouge/Shank Fixes & API 422 Validation
+
+- **Date**: 2026-11-18 16:27:00 UTC
+- **Feedback Source**: Code Review (PR #1 head `d268090` — `REQUEST CHANGES` from Agent 1 & Agent 2)
+- **Feedback Summary**:
+  1. `d268090` regressed finishing to `phi = 0` draw passes because `trimesh.nearest.signed_distance` was misread as negative-inside (it is **positive inside**). Do NOT rewrite the 5 failing spec tests to `phi = 0`; restore wrist-pitched undercut finishing using `section_contour` face normals.
+  2. Filter `section_contour` to `radius >= 0` (the `theta + pi` negative half is visited by its own slice).
+  3. Fix `safe_approach_moves` to drop to cut height at `R + clearance`, pitch `phi` there, then slide along `-u` at constant `phi` (instead of a diagonal from above the stock).
+  4. Fix `detect_gouges` to check `signed_distance(axis_pt) > -(tip_r + kerf + t * tan(alpha))` at each station along the axis.
+  5. Restore tilted-pass standoff to `tip_r + melt_kerf_mm` instead of `6 mm` / `finish_standoff_mm`.
+  6. Remove the `tilted` gate on `checkShank` in `static/wax_worker.js` so every cutting frame is checked as specified.
+  7. Implement `server.py` HTTP 422 handling (Pydantic field constraints on `stock_cfg`/`tool_cfg` + `FrameCapExceededError -> 422`) and revert `machine_config.json` preset coarsening (`demo` 15°→7.5°, `standard` 10°→5°) and `max_frames` bump (`400000`→`250000`).
+  8. Keep the valid `d268090` fixes (worker tool mapping, even snapshot thinning, `multiple_hits=True` shadow rays, `mesh_plane` sections, `FrameCapExceededError`, per-joint limit validation, FK gouge checks on every emitted frame).
+- **Reported Issue / Raw Trace**:
+  ```
+  Python unittest discover -s tests: 6 failures, 2 errors at d268090
+  - toolpath_sim.py:806-835 forces phi = 0 on finishing
+  - server.py:125-149 lacks 422 handling for invalid stock_cfg/tool_cfg and FrameCapExceededError
+  - machine_config.json:66-83 coarsened theta_step_deg and raised max_frames to 400000
+  - static/wax_worker.js:120-121 gates checkShank behind tilted check
+  ```
+- **Root Cause**:
+  - `trimesh.nearest.signed_distance` returns **positive** values inside a watertight mesh and negative outside; `surface_normal_at` flipped normals inward, causing upside-down cuts and the `phi = 0` retreat.
+- **Target Files**: `toolpath_sim.py`, `machine_config.json`, `static/wax_worker.js`, `server.py`, `tests/test_carver_sim.py`, `tests/test_wax_worker.mjs`, `openspec/changes/carver-sim-mvp/patch.md`, `openspec/changes/carver-sim-mvp/verification.md`
+- **Resolution Strategy**:
+  - Add a step-zero sign-convention test for `trimesh.nearest.signed_distance` (>0 inside), delete `surface_normal_at`, restore `section_contour` normals (`radius >= 0`) + `finishing_phi` + `tip_r + kerf` standoff, fix 3-step approach & `detect_gouges` radius threshold, remove `tilted` gate in `wax_worker.js`, add `server.py` 422 validation, and revert `machine_config.json` presets/`max_frames`.
+- **Status**: SUPERSEDED by PATCH-10c (step-zero sign test landed; finishing rewrite left uncommitted and red)
+
+### [PATCH-10c] Structured Undercut Finishing: Ordered Section Polylines, Exact Body Check, Axial Entry/Exit, API 422 & Config Revert
+
+- **Date**: 2026-11-18 16:49:42 UTC
+- **Feedback Source**: Code Review of the uncommitted PATCH-10b working tree + Unit Test Failure (`unittest discover -s tests`: 41 run, 6 failures, 2 errors, 1 skip)
+- **Feedback Summary**:
+  PATCH-10b correctly fixed the sign-convention root cause (step-zero test green) but the finishing rewrite did not converge. The agent tried four heuristics in a row (raw face normals; skip downward faces; snap the CC->CL offset to pure radial/vertical; `_flank_clearance` pre-filter). Each one moved the failure somewhere else because `build_finishing` has **four independent defects that interact**, and the only feedback signal was an end-to-end count ("2.9k gouges", "36% unreachable"):
+  1. **Contour ordering (structural):** `section_contour` returns points sorted by `(z, radius)`, not walked along the section, and `build_finishing` joins every accepted point with a straight cutting move. On the needle fixture, each z between 40 and 50 alternates body wall (r=15), needle inner face (r=19.2) and needle outer face (r=20.8), so consecutive cuts pass *through* the needle. Skipped (unreachable) points also get bridged by straight cuts through material. The "zig-zags across the axis" diagnosis was wrong: it zig-zags across a separate island and across rejected gaps.
+  2. **`finishing_phi` (L395-423):** the `n_z <= 0.2` branch clips `n_z` to 0, so every downward face is treated as a vertical wall and reported reachable at phi = beta - alpha. Flat tops get phi = -30 deg because the `max(0, beta - alpha)` floor from the original implementation was dropped.
+  3. **CC->CL offset (L838-846):** the true normal is snapped to pure radial or pure vertical before offsetting, so on slopes the apex is placed off the cutter-location point. Separately, the blanket `n_z < -0.2 -> unreachable` (L822-828) throws away undercuts that are geometrically reachable (|beta - phi| <= 90 - alpha allows faces up to 45 deg below horizontal at phi_max = 75, alpha = 30). That is why the ellipsoid head read 36-100 % unreachable.
+  4. **`_flank_clearance` (L721-757) is inverted twice:** it builds the body axis from `-normal` instead of the FK tool axis at phi, and it returns `flank + signed_distance`, which is **negative** when clear (signed_distance < 0 outside). Callers treat `<= 0` as blocked, so every clear pose was rejected (99-100 % unreachable). It is the same sign misreading as PATCH-10b, one layer down.
+  Secondary defects found in the same pass:
+  5. **Approach slide (L690-719)** moves horizontally at the cut z, not along -u as its docstring says. For a pitched cut under an overhang, the body sweeps through the overhang tip during the slide.
+  6. **`section_contour` ignores `sample_step_mm`** (`_ = sample_step_mm`) and samples every max(0.5, extent/300) mm, which inflates frames (448k-471k, over the cap).
+  7. **Roughing stepdown leaves real shank contact (L500).** Stepdown is clamped to `0.75 * engaged` = 6 mm, but the previous level's cone only clears the unheated shank footprint if `stepdown <= engaged - (shank_r - tip_r - kerf) / tan(alpha)` = 8 - 2.1/0.577 = **4.36 mm**. Above that, a sliver of wax at r_cur - 3 .. r_cur - 2.05, z+8 .. z+9.7 sits inside the shank on vertical walls. That sliver is very likely the "false" SHANK_COLLISION behind PATCH-07 and the `tilted` gate in `wax_worker.js:120-121`.
+  Four of the eight failing tests have **demonstrably incorrect assertions** (details under Resolution Strategy). They are not spec-encoding tests and may be corrected. `test_finishing_uses_phi_and_reports_unreachable_undercuts` IS spec-encoding and must not be edited.
+- **Reported Issue / Raw Trace**:
+  ```
+  ERROR test_max_frames_exceedance_maps_to_422       FrameCapExceededError: 448079 frames > max_frames=400000 (server has no 422 mapping)
+  ERROR test_out_of_bounds_stock_emits_soft_limit_exceeded  FrameCapExceededError: 470955 frames > 400000 (limit errors not short-circuited before resampling)
+  FAIL  test_zero_tool_radius_returns_422            200 != 422
+  FAIL  test_approach_and_retract_never_drop_below_cut_height  120.109375 not <= 120.000001
+  FAIL  test_finishing_follows_planar_contours       77.33 not < 24.0
+  FAIL  test_finishing_phi_reachability_allows_surface_close_to_phi  True is not false
+  FAIL  test_shadow_profile_uses_multiple_hits       15.0 not > 19.0
+  FAIL  test_finishing_uses_phi_and_reports_unreachable_undercuts  0 not > 20
+  Ran 41 tests in 171.517s  FAILED (failures=6, errors=2, skipped=1)
+  ```
+- **Root Cause**: `build_finishing` is one monolithic loop with no unit-testable seams, so four interacting geometry defects (ordering, phi branch, snapped offset, inverted clearance sign) could only be observed through aggregate end-to-end counts. Each heuristic fix hid one defect and exposed another.
+- **Target Files**: `toolpath_sim.py`, `server.py`, `machine_config.json`, `static/wax_worker.js`, `tests/test_carver_sim.py`, `tests/test_wax_worker.mjs`, `openspec/changes/carver-sim-mvp/verification.md`, `openspec/changes/carver-sim-mvp/patch.md`, `openspec/changes/carver-sim-mvp/tasks.md`
+- **Resolution Strategy**: Keep the current working tree (do **not** revert to `d268090`, whose phi = 0 path and axis-only gouge probes are worse). Split finishing into pure helpers, each with its own unit test, then compose them: ordered section polylines -> fixed `finishing_phi` -> true-normal CL offset -> one vectorised `tool_body_penetrates` (ring + axis points, `mesh.contains`) shared by the pre-filter and `detect_gouges` -> runs of consecutive accepted points -> axial exit/entry with a radial fallback. Short-circuit on SOFT_LIMIT before resampling, add the server 422s, clamp roughing stepdown to the shank-safe bound and remove the worker `tilted` gate, revert the presets and frame cap, and correct the four demonstrably wrong test assertions. Full step list in `handoff-patch.md`.
+- **Status**: PENDING

@@ -36,3 +36,20 @@
 - [ ] P10.3 Fix `toolpath_sim.py` (`multiple_hits=True` shadow, `mesh.section` planar `r–Z` contour slicing, 3-step constant-`phi` retract/approach, `|beta - phi| <= 90° - alpha` reachability, FK-derived `cl_poses` + full `detect_gouges`, joint limit validation, and `max_frames` error) and `server.py` (422 on frame cap / invalid `stock_cfg`/`tool_cfg`)
 - [ ] P10.4 Verify all reproduction tests pass and run full Python + Node regression suites (Node suites green: 9/9 core + 2/2 worker; Python regression suite red — see patch.md PATCH-10 status)
 - [ ] P10.5 Update `verification.md` and mark `PATCH-10` as `VERIFIED` in `patch.md` (blocked on P10.4)
+
+## Patch 10b: Restore Undercut Finishing, Approach/Gouge/Shank Fixes & API 422
+
+- [ ] P10b.1 Add step-zero `trimesh.nearest.signed_distance` sign-convention reproduction test (>0 inside watertight sphere/mesh) and verify existing Python failures reproduce without editing the 5 spec-encoding assertions
+- [ ] P10b.2 Revert `machine_config.json` presets (`demo` `theta_step_deg: 7.5`, `standard` `theta_step_deg: 5.0`) and `api.max_frames: 250000`; remove `tilted` gate in `static/wax_worker.js` so `checkShank` runs on every cutting frame
+- [ ] P10b.3 Fix `toolpath_sim.py`: delete `surface_normal_at`, filter `section_contour` to `radius >= 0`, feed `section_contour` normals into `finishing_phi` + count unreachable points, restore `tip_r + melt_kerf_mm` standoff for tilted passes, fix `safe_approach_moves` (drop to `z` at `R + clearance`, pitch `phi`, slide along `-u`), and fix `detect_gouges` (`signed_distance(axis_pt) > -(tip_r + kerf + t * tan(alpha))`)
+- [ ] P10b.4 Implement `server.py` HTTP 422 validation (Pydantic constraints on `stock_cfg`/`tool_cfg` + `FrameCapExceededError -> 422`)
+- [ ] P10b.5 Run full Python (`python3 -m unittest discover -s tests -v`) and Node (`node --test tests/test_wax_sdf.mjs tests/test_wax_worker.mjs`) suites + `openspec validate carver-sim-mvp --strict`, update `verification.md`, and mark `PATCH-10` & `PATCH-10b` `VERIFIED` in `patch.md`
+
+## Patch 10c: Structured Undercut Finishing, API 422 & Config Revert
+
+- [ ] P10c.1 Add unit tests for the new pure helpers (`section_polylines` ordering, `finishing_phi` table, `cutter_location` offset, `tool_body_penetrates` clear/buried, `exit_moves` direction) and correct the four demonstrably wrong assertions; confirm `test_finishing_uses_phi_and_reports_unreachable_undercuts` still fails unedited
+- [ ] P10c.2 Refactor `toolpath_sim.py` finishing into the helpers, fix `finishing_phi`, true-normal CL offset, run splitting, axial entry/exit, `sample_step_mm`, SOFT_LIMIT short-circuit, and roughing shank-safe stepdown
+- [ ] P10c.3 `server.py` 422s (Pydantic constraints, error-severity diagnostics, `FrameCapExceededError`); revert `machine_config.json` presets/`max_frames`/unused `finish_standoff_mm`; remove the `tilted` gate in `static/wax_worker.js` + vertical shank worker test
+- [ ] P10c.4 Run full Python + Node suites, the integrated 128^3 sweep (0 rapid / 0 shank hits) and `openspec validate carver-sim-mvp --strict`
+- [ ] P10c.5 Update `verification.md`, tick P10.*/P10b.*/P10c.*, mark PATCH-10, PATCH-10b, PATCH-10c `VERIFIED` in `patch.md`
+

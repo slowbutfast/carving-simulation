@@ -730,5 +730,26 @@ class TestPatch10APIRegressions(unittest.TestCase):
         )
 
 
+class TestSignedDistanceConvention(unittest.TestCase):
+    """Locks trimesh's sign convention: POSITIVE inside, NEGATIVE outside.
+
+    Inverting this was the root cause of the PATCH-10 `phi = 0` workaround, so it
+    is asserted explicitly rather than assumed.
+    """
+
+    def test_signed_distance_is_positive_inside_watertight_mesh(self):
+        sphere = trimesh.creation.icosphere(radius=10.0, subdivisions=3)
+        self.assertTrue(sphere.is_watertight)
+        inside = sphere.nearest.signed_distance([[0.0, 0.0, 0.0]])[0]
+        outside = sphere.nearest.signed_distance([[30.0, 0.0, 0.0]])[0]
+        self.assertGreater(inside, 0.0, "signed_distance is positive inside")
+        self.assertLess(outside, 0.0, "signed_distance is negative outside")
+        self.assertAlmostEqual(float(inside), 10.0, delta=0.2)
+        self.assertAlmostEqual(float(outside), -20.0, delta=1e-6)
+        # contains() agrees with the sign convention.
+        self.assertTrue(bool(sphere.contains([[0.0, 0.0, 0.0]])[0]))
+        self.assertFalse(bool(sphere.contains([[30.0, 0.0, 0.0]])[0]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
