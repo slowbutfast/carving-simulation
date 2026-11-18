@@ -393,10 +393,13 @@ def _clip_band(
     def crossing_parameters(first: np.ndarray, second: np.ndarray) -> list[float]:
         delta = second - first
         parameters = []
-        for axis in (0, 1):
+        # Radius (axis 0) can only be bounded by r = 0; z (axis 1) only by the
+        # band.  Crossing every axis with every bound is wrong: it fabricates a
+        # crossing at r = z_lo on any horizontal segment (e.g. a top face).
+        for axis, bounds in ((0, (0.0,)), (1, (z_lo, z_hi))):
             if abs(float(delta[axis])) <= EPS:
                 continue
-            for bound in (0.0, z_lo, z_hi):
+            for bound in bounds:
                 t = (bound - float(first[axis])) / float(delta[axis])
                 if 0.0 < t < 1.0:
                     parameters.append(t)
@@ -532,7 +535,12 @@ def _resample(
                 normals[index][0] + t * (normals[index + 1][0] - normals[index][0]),
                 normals[index][1] + t * (normals[index + 1][1] - normals[index][1]),
             )
-            out.append(sample(first + t * (second - first), normal))
+            # A linear blend between two face normals shortens the vector; keep
+            # every emitted normal unit length.
+            magnitude = math.hypot(normal[0], normal[1]) or 1.0
+            out.append(
+                sample(first + t * (second - first), (normal[0] / magnitude, normal[1] / magnitude))
+            )
             travelled += step
         carry = max(0.0, length - (travelled - step))
     out.append(sample(points[-1], normals[-1]))
@@ -600,24 +608,34 @@ def section_polylines(
     polylines: list[list[dict[str, Any]]] = []
     for loop, carried, closed in _chain_loops(segments, planar_normals):
         flat = [np.array([float(point @ e_r), float(point[2])]) for point in loop]
-        if closed:
-            halves = _split_closed_loop(flat) or [list(range(len(flat)))]
-            for half in halves:
-                if not half:
-                    continue
-                points = [flat[index] for index in half]
-                normals = [carried[index] for index in half]
-                # Clip each half after the split, so the band cut runs on a
-                # monotone (bottom-to-top) walk.
-                for piece, piece_normals in _clip_band(points, normals, z_lo, z_hi):
-                    if len(piece) < 2:
-                        continue
-                    if float(piece[-1][1]) < float(piece[0][1]):
-                        piece = list(reversed(piece))
-                        piece_normals = list(reversed(piece_normals))
-                    polylines.append(_resample(piece, piece_normals, step, e_r))
-            continue
-        for piece, piece_normals in _clip_band(flat, carried, z_lo, z_hi):
+        inside = [
+            float(value[0]) >= 0.0 and z_lo - 1e-9 <= float(value[1]) <= z_hi + 1e-9
+            for value in flat
+        ]
+        pieces: list[tuple[list[np.ndarray], list[tuple[float, float]]]] = []
+        if closed and all(inside):
+            # An untouched island (e.g. the needle): both halves run
+            # bottom-to-top, so split it at its low and high points.
+            for half in _split_closed_loop(flat) or [list(range(len(flat)))]:
+                if len(half) >= 2:
+                    pieces.append(
+                        ([flat[index] for index in half], [carried[index] for index in half])
+                    )
+        elif closed:
+            # A loop that crosses a boundary is clipped, never split, so the
+            # discarded r < 0 / z < z_lo half cannot influence the result.
+            # Start the walk at an outside vertex so the in-band arc is kept
+            # whole instead of being cut at the chain's arbitrary start.
+            first_outside = inside.index(False)
+            rotated = list(range(first_outside, len(flat))) + list(range(0, first_outside + 1))
+            points = [flat[index] for index in rotated]
+            normals = [carried[index] for index in rotated]
+            pieces = _clip_band(points, normals, z_lo, z_hi)
+        else:
+            pieces = _clip_band(flat, carried, z_lo, z_hi)
+        for piece, piece_normals in pieces:
+            if len(piece) < 2:
+                continue
             if float(piece[-1][1]) < float(piece[0][1]):
                 piece = list(reversed(piece))
                 piece_normals = list(reversed(piece_normals))
@@ -662,17 +680,16 @@ def finishing_phi(n_r: float, n_z: float, config: Mapping[str, Any]) -> tuple[fl
 
     alpha = math.radians(float(config["tool"]["cone_half_angle_deg"]))
     phi_lo, phi_hi = (math.radians(float(v)) for v in config["limits"]["phi_limits_deg"])
-    if n_z <= 0.2:
-        # Nearly tangential / steeply overhanging faces: the wrist sweeps from
-        # vertical all the way to the far limit, which also covers surfaces
-        # the +phi side cannot reach.
-        beta_positive = math.atan2(n_r, max(n_z, 0.0))
-        phi_forward = min(max(beta_positive - alpha, phi_lo), phi_hi)
-        if abs(beta_positive - phi_forward) <= (math.pi / 2 - alpha) + EPS:
-            return phi_forward, True
-        return phi_hi, False
     beta = math.atan2(n_r, n_z)
-    preferred = beta - alpha
+    # A face whose outward normal turns away from the cut (+n_r) wants the flank
+    # leaning forward; one that faces the other way (an undercut) wants it
+    # leaning back, and is never clamped across zero.  There is no separate
+    # branch for downward faces: beta < 0 covers them and is judged by the same
+    # clearance band, so a reachable overhang is not thrown away.
+    if beta >= 0.0:
+        preferred = max(0.0, beta - alpha)
+    else:
+        preferred = min(0.0, beta + alpha)
     phi = min(max(preferred, phi_lo), phi_hi)
     reachable = abs(beta - phi) <= (math.pi / 2 - alpha) + EPS
     return phi, reachable

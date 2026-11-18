@@ -809,14 +809,16 @@ class TestFinishingHelpers(unittest.TestCase):
         needle.apply_translation([20.0, 0.0, 48.0])
         mesh = trimesh.util.concatenate([body, needle])
         lines = polylines(mesh, 0.0, 10.0, self.H, 2.0)
-        # A closed loop is split at its lowest and highest points so both halves
-        # run bottom-to-top, so each component contributes two halves: body
-        # (wall + far wall, and wall + top face) plus the needle (two flanks).
+        # The body crosses the axis, so it is clipped into one open polyline:
+        # the wall from z = 11.5, then the top face inward to r = 0.  The needle
+        # is an untouched closed island, split into two bottom-to-top halves.
+        # Total 3; a loop that touches a boundary is never split.
         self.assertEqual(len(lines), 3, [len(line) for line in lines])
         self.assertTrue(any(p["radius"] > 20.8 - 1e-6 for line in lines for p in line))
         self.assertTrue(any(p["radius"] < 15.01 for line in lines for p in line))
-        # The axis-containing far wall repeats r=15 but descends, so it belongs
-        # to its own piece for a different reason than the needle flanks.
+        # The r = 0 end of the body polyline is the top face reaching the axis
+        # (the needle's own points are at r >= 19.2, so this is unambiguously
+        # the body).
         self.assertTrue(any(p["radius"] < 15.01 and p["z"] > 40.0 for line in lines for p in line))
         self.assertGreater(max(p["z"] for line in lines for p in line), 50.0)
         for line in lines:

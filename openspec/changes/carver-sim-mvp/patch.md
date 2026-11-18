@@ -298,3 +298,29 @@
 - **Target Files**: `toolpath_sim.py`, `server.py`, `machine_config.json`, `static/wax_worker.js`, `tests/test_carver_sim.py`, `tests/test_wax_worker.mjs`, `openspec/changes/carver-sim-mvp/verification.md`, `openspec/changes/carver-sim-mvp/patch.md`, `openspec/changes/carver-sim-mvp/tasks.md`
 - **Resolution Strategy**: Keep the current working tree (do **not** revert to `d268090`, whose phi = 0 path and axis-only gouge probes are worse). Split finishing into pure helpers, each with its own unit test, then compose them: ordered section polylines -> fixed `finishing_phi` -> true-normal CL offset -> one vectorised `tool_body_penetrates` (ring + axis points, `mesh.contains`) shared by the pre-filter and `detect_gouges` -> runs of consecutive accepted points -> axial exit/entry with a radial fallback. Short-circuit on SOFT_LIMIT before resampling, add the server 422s, clamp roughing stepdown to the shank-safe bound and remove the worker `tilted` gate, revert the presets and frame cap, and correct the four demonstrably wrong test assertions. Full step list in `handoff-patch.md`.
 - **Status**: PENDING
+
+### [PATCH-10d] Helper 1 Clip-Before-Split Ordering + Axis-Mixed Crossings; Continue PATCH-10c Helpers 2-5
+
+- **Date**: 2026-11-18 19:05:14 UTC
+- **Feedback Source**: Code Review of `72c9d5e` (fixture runs of `section_polylines`) + Unit Test Failure
+- **Feedback Summary**:
+  `72c9d5e` correctly fixed the two bugs from the previous review (the signed-radius clip, and interpolated band crossings) and deleted the compensation stack. Two defects remain in helper 1. The agent framed them as an open "split rule" design question; they are implementation bugs against the stated design:
+  1. **Split-before-clip ordering (`section_polylines` L602-617, Critical).** Closed loops are split at low/high *before* clipping, so the box rectangle is split using its `r < 0` half (ties land at `(-15, 50)`). The design is: clip first; only a closed loop that lies **entirely** inside `r >= 0` and the z band is split at low/high. A loop that touches a boundary becomes open polylines, which are never split.
+  2. **Axis-mixed crossings (`_clip_band.crossing_parameters` L393-403, Critical).** Each axis is intersected with all three bounds `(0, z_lo, z_hi)`, so the r axis is cut at r = z_lo (11.5) and z at 0. This spurious crossing is exactly where the box's top face was broken at r = 11.5. The r axis must only cross `0`, and z only `z_lo`/`z_hi`.
+  3. **Closed-loop seam (Important).** When a closed loop that crosses a boundary is clipped, the walk must start at an outside vertex, or the in-band arc gets split in two at the loop's arbitrary chain start.
+  4. **Test comment (Minor).** `test_section_polylines_split_islands` L812-819 describes a "far wall" and two body halves. The assertions are correct (count 3 = body 1 open polyline + needle 2 island halves); the comment is wrong.
+  None of the agent's proposed split rules (`(15,10)/(-15,50)` monotone pair, "cut plane ends at the axis") should be implemented. The first works on discarded geometry; the second is the natural result of clipping first.
+- **Reported Issue / Raw Trace**:
+  ```
+  section_polylines at theta=0, z_min=10, z_max=120, step=2 (72c9d5e):
+  box:          2 polylines  (15,11.5)->...->(11.5,50)  and  (0,50)->(11.5,50)   expected 1: (15,11.5)->(15,50)->(0,50)
+  needle-only:  2 polylines  (20.8,40)->(19.2,56) x2                            correct
+  body+needle:  4 polylines                                                     expected 3
+  FAIL test_section_polylines_continuous_clipped_and_ordered
+  FAIL test_section_polylines_split_islands
+  ```
+- **Root Cause**: The pipeline order is inverted relative to the design (split -> clip instead of clip -> split-if-untouched), and `crossing_parameters` mixes the r and z bounds. The tie-break search in the last session was trying to fix symptoms of these two bugs.
+- **Target Files**: `toolpath_sim.py`, `tests/test_carver_sim.py`, plus all PATCH-10c remaining targets (`server.py`, `machine_config.json`, `static/wax_worker.js`, `tests/test_wax_worker.mjs`, `verification.md`, `patch.md`, `tasks.md`)
+- **Resolution Strategy**: Fix `crossing_parameters` per-axis bounds; reorder `section_polylines` to classify each loop (untouched closed island -> `_split_closed_loop`; otherwise rotate to an outside vertex and `_clip_band`, no split); correct the test comment. Freeze helper 1 once its 4 tests pass, then continue PATCH-10c helpers 2-5 and the remaining checklist exactly as specified in `handoff-patch.md`.
+- **Status**: PENDING
+

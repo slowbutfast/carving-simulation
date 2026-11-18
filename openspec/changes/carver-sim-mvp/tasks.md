@@ -53,3 +53,10 @@
 - [ ] P10c.4 Run full Python + Node suites, the integrated 128^3 sweep (0 rapid / 0 shank hits) and `openspec validate carver-sim-mvp --strict`
 - [ ] P10c.5 Update `verification.md`, tick P10.*/P10b.*/P10c.*, mark PATCH-10, PATCH-10b, PATCH-10c `VERIFIED` in `patch.md`
 
+## Patch 10d: Helper 1 Ordering Fix + Continue PATCH-10c
+
+- [ ] P10d.1 Reproduce the 2 red section-polyline tests and print the post-clip, pre-split pieces for the box fixture
+- [ ] P10d.2 Fix `_clip_band.crossing_parameters` per-axis bounds and reorder `section_polylines` (clip first; split only untouched closed islands; rotate crossing loops to an outside vertex); fix the islands-test comment
+- [ ] P10d.3 All 4 section tests green; commit `wip(carver-sim): P10c helper 1 green`; helper 1 frozen
+- [ ] P10d.4 Complete P10c.2-P10c.5 (helpers 2-5, `build_finishing`, server 422s, config revert, worker gate, suites, 128^3 sweep, validate, docs)
+
