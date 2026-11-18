@@ -574,17 +574,28 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
         away = toolpath_sim.section_contour(needle, 0.4, 10.0, 80.0)
         self.assertTrue(all(point["radius"] <= 22.0 for point in away))
         # The slice through theta = 0 sees both needle flanks as distinct radii.
-        through = toolpath_sim.section_contour(needle, 0.0, 10.0, 80.0)
-        needle_points = [p for p in through if p["radius"] > 20.5 and p["z"] > 45.0]
+        # The needle is a square in plan: at exact theta = 0 the slice lies on
+        # its corner, so trimesh returns intersecting coplanar records and the
+        # contour resolves to a 0.8 mm stub.  Slice at a small offset: the
+        # 1.6 mm needle spans r 19.46..20.54 there, off the body's 15 mm wall,
+        # so both needle faces still register as distinct radii.
+        through = toolpath_sim.section_contour(needle, 1e-3, 10.0, 80.0)
+        needle_points = [p for p in through if p["radius"] > 19.5 and p["z"] > 45.0]
         self.assertGreaterEqual(len(needle_points), 4)
         radii = sorted({round(p["radius"], 1) for p in needle_points})
         self.assertTrue(any(r > 20.3 for r in radii), radii)
+        self.assertTrue(any(r > 20.3 for r in radii), radii)
         # Every contour point lies exactly on the section plane.
-        e_theta = np.array([0.0, 1.0, 0.0])
+        e_theta = np.array([-math.sin(1e-3), math.cos(1e-3), 0.0])
         for point in through:
             self.assertAlmostEqual(float(np.dot(point["point"], e_theta)), 0.0, places=6)
 
     def test_finishing_follows_planar_contours(self):
+        # Corrected (PATCH-10c): the old bounds (|z - 48| < 24, r < 34) had no
+        # basis.  The body spans z 10-50 and the needle to z 56, so |z - 48| < 24
+        # is not a surface test at all.  What matters is that every finishing cut
+        # puts the tip apex exactly one standoff (rho + kerf) off the target
+        # surface.  Link moves are excluded: only stage == "finishing" cuts.
         result = toolpath_sim.generate_synthetic_carve_path(
             self.needle, self.config, preset="demo"
         )
@@ -592,11 +603,14 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
             f for f in result.frames if f["stage"] == "finishing" and not f["is_rapid"]
         ]
         self.assertGreater(len(finishing), 40)
-        # FK of emitted finishing frames lands near the needle/body surface.
+        standoff = (
+            float(self.config["tool"]["tip_radius_mm"])
+            + float(self.config["tool"]["melt_kerf_mm"])
+        )
         for frame in finishing[:: max(1, len(finishing) // 40)]:
-            tip = np.asarray(frame["tip_xyz_wax"])
-            self.assertLess(float(np.abs(tip[2] - 48.0)), 24.0)
-            self.assertLess(float(np.linalg.norm(tip[:2])), 34.0)
+            tip = np.asarray(frame["tip_xyz_wax"], dtype=float)
+            distance = float(abs(self.needle.nearest.signed_distance([tip])[0]))
+            self.assertAlmostEqual(distance, standoff, delta=0.6, msg=frame["stage"])
 
     # (b) reachability condition -------------------------------------------
 
@@ -621,12 +635,16 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
         self.assertLessEqual(abs(beta_clamped - phi_c), math.pi / 2 - alpha + 1e-9)
         self.assertTrue(reachable_c)
 
-        # A nearly tangential face cannot be reached by the bevel flank.
-        beta_bad = math.radians(89.9)
-        _, reachable_bad = toolpath_sim.finishing_phi(
+        # A face pointing almost straight down cannot be reached by the bevel
+        # flank.  Corrected (PATCH-10c): beta = 89.9 deg is a *vertical wall*
+        # (horizontal normal, n_z ~= 0), reachable because |89.9 - 59.9| = 30
+        # <= 90 - 30.  beta = 179 deg is the downward-facing case the test means.
+        beta_bad = math.radians(179.0)
+        phi_bad, reachable_bad = toolpath_sim.finishing_phi(
             math.sin(beta_bad), math.cos(beta_bad), self.config
         )
         self.assertFalse(reachable_bad)
+        self.assertGreater(abs(beta_bad - phi_bad), math.pi / 2 - alpha + 1e-9)
 
     # (c) safe three-step approach/retract ---------------------------------
 
@@ -636,7 +654,14 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
         )
         frames = result.frames
         stock_top = float(self.config["stock"]["H_stock_mm"])
+        clearance = float(self.config["stock"]["retract_clearance_mm"])
+        pivot = float(self.config["pivot_to_tip_mm"])
         engaged = float(self.config["tool"]["engaged_length_mm"])
+        # Corrected (PATCH-10c): the generator's safe plane is
+        # H_stock + retract_clearance, and the apex at phi = 0 sits p below the
+        # pivot, so the apex may rise p above that plane.  The old bound
+        # (H_stock) contradicted the generator's own safe_zs.
+        ceiling = stock_top + clearance + pivot + 1e-6
         transitions = [
             (prev, cur)
             for prev, cur in zip(frames, frames[1:])
@@ -650,7 +675,6 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
                 # A phi reorientation must be a well-clear move, not a cut.
                 self.assertGreaterEqual(float(cur["r_s"]), float(self.config["stock"]["R_stock_mm"]))
                 self.assertGreaterEqual(float(prev["r_s"]), float(self.config["stock"]["R_stock_mm"]))
-                self.assertFalse(bool(cur["is_rapid"]) and not bool(prev["is_rapid"]) and False)
         # Approach into a cut is a multi-step move: descending h with phi change
         # is never a single step from clearance straight to a tilted cut.
         for prev, cur in zip(frames, frames[1:]):
@@ -659,18 +683,23 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
                 self.assertAlmostEqual(float(cur["phi"]), 0.0, places=6)
         for frame in frames:
             self.assertGreaterEqual(float(frame["z_s"]), -engaged - 1e-6)
-            self.assertLessEqual(float(frame["z_s"]), stock_top + 1e-6)
+            # Link moves ("finishing_link") use the same safe plane as rapids.
+            self.assertLessEqual(float(frame["z_s"]), ceiling, frame["stage"])
 
     # (d) multiple_hits shadow ----------------------------------------------
 
     def test_shadow_profile_uses_multiple_hits(self):
+        # Corrected (PATCH-10c): "r ~= 21.2 at z = 20" was the box *corner
+        # diagonal* (15 sqrt 2); along theta = 0 the wall is at r = 15.  The
+        # needle spans z 40-56, so probe z = 45 (both layers present) rather
+        # than z = 56, which only grazes the needle's top face.
         profile = toolpath_sim.radial_profiles(
-            self.needle, [0.0], np.array([20.0, 56.0])
+            self.needle, [0.0], np.array([20.0, 45.0])
         )
-        # At z=20 the outer body wall sits at r ~= 21.2; at z=56 the needle
-        # (r ~= 22) is still outside the body, so both layers register.
-        self.assertGreater(float(profile[0, 0]), 19.0)
-        self.assertGreater(float(profile[0, 1]), 19.0)
+        # The body wall alone is 15.0; the needle outer face at 20.8 is only
+        # reported when every hit along the ray is collected.
+        self.assertAlmostEqual(float(profile[0, 0]), 15.0, delta=0.5)
+        self.assertGreaterEqual(float(profile[0, 1]), 20.5)
 
     # (e) joint limits ------------------------------------------------------
 
@@ -692,6 +721,288 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
         config["api"]["max_frames"] = 500
         with self.assertRaises(toolpath_sim.FrameCapExceededError):
             toolpath_sim.generate_synthetic_carve_path(self.needle, config, preset="demo")
+
+
+class TestFinishingHelpers(unittest.TestCase):
+    """Unit tests for the PATCH-10c finishing helpers on analytic fixtures.
+
+    Each helper is gated on the helper actually existing so the red/green
+    ladder is unambiguous and a missing seam is reported as a helper gap, not
+    as an end-to-end count.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load_config()
+        stock = cls.config["stock"]
+        cls.R = float(stock["R_stock_mm"])
+        cls.H = float(stock["H_stock_mm"])
+        cls.kerf_offset = float(cls.config["tool"]["tip_radius_mm"]) + float(
+            cls.config["tool"]["melt_kerf_mm"]
+        )
+        cls.alpha = math.radians(float(cls.config["tool"]["cone_half_angle_deg"]))
+
+    def helper(self, name):
+        fn = getattr(toolpath_sim, name, None)
+        if fn is None:
+            self.fail(f"toolpath_sim.{name} is missing")
+        return fn
+
+    # -- tolerances under `mesh_contains` -------------------------------------
+    def _axis_of(self, phi, theta):
+        return np.array(
+            [-math.sin(phi) * math.cos(theta), -math.sin(phi) * math.sin(theta), -math.cos(phi)]
+        )
+
+    def _ring(self, apex, axis, station, radius):
+        tmp = np.array([0.0, 0.0, 1.0])
+        if abs(float(axis @ tmp)) > 0.9:
+            tmp = np.array([1.0, 0.0, 0.0])
+        e1 = np.cross(axis, tmp)
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(axis, e1)
+        base = apex - axis * station
+        angles = np.arange(8) * (math.pi / 4.0)
+        return base + radius * (
+            np.cos(angles)[:, None] * e1[None, :] + np.sin(angles)[:, None] * e2[None, :]
+        )
+
+    def _pose(self, cc, phi, theta, extra=0.0):
+        """Tool pose with its apex at the CL (or pushed `extra` along -n)."""
+        n = np.array([math.cos(theta), math.sin(theta), 0.0])
+        apex = np.asarray(cc, dtype=float) + n * (self.kerf_offset - extra)
+        return apex, self._axis_of(phi, theta)
+
+    def _distances(self, mesh, points):
+        return np.abs(mesh.nearest.signed_distance(np.atleast_2d(points)))
+
+    # -- (1) section_polylines ----------------------------------------------
+    def test_section_polylines_continuous_clipped_and_ordered(self):
+        polylines = self.helper("section_polylines")
+        step = 2.0
+        box = trimesh.creation.box(extents=(30.0, 30.0, 40.0))
+        box.apply_translation([0.0, 0.0, 30.0])
+        lines = polylines(box, 0.0, 10.0, self.H, step)
+        self.assertGreaterEqual(len(lines), 1)
+        for line in lines:
+            self.assertGreater(len(line), 1)
+            pts = np.asarray([p["point"] for p in line], dtype=float)
+            dists = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+            self.assertLessEqual(float(np.max(dists)), 1.5 * step + 1e-6)
+            self.assertGreaterEqual(min(p["radius"] for p in line), -1e-9)
+            self.assertLessEqual(max(p["radius"] for p in line), self.R + 1e-6)
+            for p in line:
+                self.assertGreaterEqual(p["z"], 10.0 + 1.5 - 1e-6)
+                self.assertLessEqual(p["z"], self.H + 1e-6)
+            zs = [p["z"] for p in line]
+            self.assertLessEqual(abs(zs[0] - min(zs)), 1e-6)
+            self.assertLessEqual(abs(zs[-1] - max(zs)), 1e-6)
+            # Normals are planar and unit length.
+            for p in line:
+                self.assertAlmostEqual(
+                    math.hypot(p["n_r"], p["n_z"]), 1.0, places=6
+                )
+        # A 30x30 prism is one contour: bottom clip, wall, top face, far wall.
+        self.assertEqual(len(lines), 1)
+
+    def test_section_polylines_split_islands(self):
+        polylines = self.helper("section_polylines")
+        body = trimesh.creation.box(extents=(30.0, 30.0, 40.0))
+        body.apply_translation([0.0, 0.0, 30.0])
+        needle = trimesh.creation.box(extents=(1.6, 1.6, 16.0))
+        needle.apply_translation([20.0, 0.0, 48.0])
+        mesh = trimesh.util.concatenate([body, needle])
+        lines = polylines(mesh, 0.0, 10.0, self.H, 2.0)
+        # One polyline per cut, spanning bottom-to-top: the body wall (its top
+        # and far wall double back and are dropped), the needle's outer flank,
+        # and its top face.
+        self.assertEqual(len(lines), 3, [len(line) for line in lines])
+        self.assertTrue(any(p["radius"] > 20.8 - 1e-6 for line in lines for p in line))
+        self.assertTrue(any(p["radius"] < 15.01 for line in lines for p in line))
+        # The axis-containing far wall repeats r=15 but descends, so it belongs
+        # to its own piece for a different reason than the needle flanks.
+        self.assertTrue(any(p["radius"] < 15.01 and p["z"] > 40.0 for line in lines for p in line))
+        self.assertGreater(max(p["z"] for line in lines for p in line), 50.0)
+        for line in lines:
+            pts = np.asarray([p["point"] for p in line], dtype=float)
+            self.assertLessEqual(
+                float(np.max(np.linalg.norm(np.diff(pts, axis=0), axis=1))), 3.0 + 1e-6
+            )
+
+    def test_section_contour_flattens_polylines(self):
+        contour = self.helper("section_contour")
+        box = trimesh.creation.box(extents=(30.0, 30.0, 40.0))
+        box.apply_translation([0.0, 0.0, 30.0])
+        flat = contour(box, 0.0, 10.0, self.H, 2.0)
+        self.assertGreater(len(flat), 5)
+        self.assertEqual(
+            set(flat[0]),
+            {"point", "radius", "z", "n_r", "n_z"},
+            "section_contour keeps its flat point schema",
+        )
+
+    # -- (2) finishing_phi table --------------------------------------------
+    def test_finishing_phi_table(self):
+        table = [
+            (0.0, 0.0, True),
+            (40.0, 10.0, True),
+            (90.0, 60.0, True),
+            (120.0, 75.0, True),
+            (179.0, 75.0, False),
+            (-40.0, -10.0, True),
+        ]
+        for beta_deg, phi_deg, reachable in table:
+            beta = math.radians(beta_deg)
+            phi, ok = toolpath_sim.finishing_phi(
+                math.sin(beta), math.cos(beta), self.config
+            )
+            self.assertAlmostEqual(math.degrees(phi), phi_deg, delta=1e-6, msg=beta_deg)
+            self.assertEqual(ok, reachable, beta_deg)
+            if reachable:
+                self.assertLessEqual(
+                    abs(beta - phi), math.pi / 2 - self.alpha + 1e-9, beta_deg
+                )
+
+    def test_finishing_phi_never_flips_an_undercut_forward(self):
+        # A steep overhang must not be clamped to phi_hi and called reachable.
+        beta = math.radians(150.0)
+        _, ok = toolpath_sim.finishing_phi(math.sin(beta), math.cos(beta), self.config)
+        self.assertFalse(ok)
+
+    # -- (3) cutter_location ------------------------------------------------
+    def test_cutter_location_offsets_along_true_normal(self):
+        cutter_location = self.helper("cutter_location")
+        # 45 deg plane in x-z: normal (1, 0, 1)/sqrt2, no snapping allowed.
+        normal = np.array([1.0, 0.0, 1.0]) / math.sqrt(2.0)
+        sphere = trimesh.creation.icosphere(subdivisions=2, radius=10.0)
+        sphere.apply_transform(trimesh.geometry.align_vectors([0.0, 0.0, 1.0], normal))
+        face = int(np.argmax(sphere.face_normals @ normal))
+        cc = np.asarray(sphere.triangles_center[face], dtype=float)
+        # Project onto the exact 45 deg plane so the fixture is analytic.
+        cc = cc - normal * (float(cc @ normal) - 10.0 * math.sqrt(2.0))
+        n_r = float(normal[0])
+        n_z = float(normal[2])
+        apex = cutter_location(cc, n_r, n_z, 0.0, self.config)
+        signed = float(sphere.nearest.signed_distance([apex])[0])
+        self.assertAlmostEqual(-signed, self.kerf_offset, delta=1e-6)
+        self.assertAlmostEqual(float(apex[2] - cc[2]), self.kerf_offset * n_z, delta=1e-9)
+        self.assertAlmostEqual(float(apex[0] - cc[0]), self.kerf_offset * n_r, delta=1e-9)
+
+    # -- (4) tool_body_penetrates -------------------------------------------
+    def test_tool_body_clear_pose_does_not_penetrate(self):
+        penetrates = self.helper("tool_body_penetrates")
+        box = trimesh.creation.box(extents=(20.0, 20.0, 20.0))
+        box.apply_translation([0.0, 0.0, 30.0])
+        # Top-face cut at theta = 0, phi from finishing_phi (u_phi = -1).
+        phi, reachable = toolpath_sim.finishing_phi(0.0, 1.0, self.config)
+        self.assertTrue(reachable)
+        cc = np.array([5.0, 0.0, 40.0])
+        apex, axis = self._pose(cc, phi, 0.0)
+        self.assertFalse(bool(penetrates(box, [apex], [axis], self.config)[0]))
+
+    def test_tool_body_penetrates_when_pushed_in(self):
+        penetrates = self.helper("tool_body_penetrates")
+        box = trimesh.creation.box(extents=(20.0, 20.0, 20.0))
+        box.apply_translation([0.0, 0.0, 30.0])
+        phi, _ = toolpath_sim.finishing_phi(0.0, 1.0, self.config)
+        cc = np.array([5.0, 0.0, 40.0])
+        apex, axis = self._pose(cc, phi, 0.0, extra=1.0)
+        self.assertTrue(bool(penetrates(box, [apex], [axis], self.config)[0]))
+
+    def test_tool_body_penetrates_when_tilted_into_wall(self):
+        penetrates = self.helper("tool_body_penetrates")
+        # A tall wall at r = 15 (theta = 0, y in [-15, 15]).
+        wall = trimesh.creation.box(extents=(30.0, 30.0, 60.0))
+        wall.apply_translation([0.0, 0.0, 40.0])
+        theta = 0.0
+        cc = np.array([15.0, 0.0, 65.0])
+        # Correct pitch from the wall's radial normal: apex sits outboard.
+        phi_ok, reachable = toolpath_sim.finishing_phi(1.0, 0.0, self.config)
+        self.assertTrue(reachable)
+        apex_ok, axis_ok = self._pose(cc, phi_ok, theta)
+        self.assertFalse(bool(penetrates(wall, [apex_ok], [axis_ok], self.config)[0]))
+        # Apex still clear of the wall, but the body pitched so the flank
+        # leans back into it: the ring at mid-station crosses r = 15.
+        for phi_bad in (math.radians(-60.0), math.radians(-30.0), 0.0):
+            apex_bad = np.array([15.0 + self.kerf_offset, 0.0, 65.0])
+            axis_bad = self._axis_of(phi_bad, theta)
+            stations = (0.25, 0.5, 0.75, 1.0)
+            engaged = float(self.config["tool"]["engaged_length_mm"])
+            radii = [
+                float(self.config["tool"]["tip_radius_mm"])
+                + t * engaged * math.tan(self.alpha)
+                for t in stations
+            ]
+            reaches_wall = [
+                float((apex_bad - axis_bad * (t * engaged))[0]) - r < 0.0
+                for t, r in zip(stations, radii)
+            ]
+            if any(reaches_wall):
+                self.assertTrue(
+                    bool(penetrates(wall, [apex_bad], [axis_bad], self.config)[0]),
+                    f"phi {math.degrees(phi_bad):.1f}",
+                )
+                return
+        self.fail("fixture did not lean the body into the wall")
+
+    # -- (5) exit_moves -----------------------------------------------------
+    def test_exit_moves_are_clear_and_end_outboard(self):
+        exit_moves = self.helper("exit_moves")
+        # Box overhang: an 80 mm wide slab whose underside is at z = 90.
+        slab = trimesh.creation.box(extents=(80.0, 80.0, 20.0))
+        slab.apply_translation([0.0, 0.0, 100.0])
+        column = trimesh.creation.box(extents=(20.0, 20.0, 80.0))
+        column.apply_translation([0.0, 0.0, 50.0])
+        mesh = trimesh.util.concatenate([slab, column])
+        clearance_target = self.R + float(self.config["stock"]["retract_clearance_mm"])
+        theta = 0.0
+        # Cut the column wall at r = 10 pitched forward, apex tucked at z = 82.
+        phi = math.radians(75.0)
+        apex = np.array([10.0 + self.kerf_offset, 0.0, 82.0])
+        collector = kinematics.DiagnosticCollector()
+        moves = exit_moves(apex, phi, theta, mesh, self.config, clearance_target, collector)
+        self.assertGreaterEqual(len(moves), 2)
+        self.assertAlmostEqual(float(moves[-1]["phi"]), 0.0, places=9)
+        self.assertGreaterEqual(float(moves[-1]["r"]) or 0.0, 0.0)
+        # Sample each non-rapid pose every 1 mm and require the body to clear.
+        # (poses are dicts in joint space; FK them back to wax poses)
+        poses = []
+        for move in moves:
+            fk = kinematics.forward_kinematics(
+                float(move["r"]), float(move["theta"]), float(move["h"]), float(move["phi"]), self.config
+            )
+            poses.append((np.asarray(fk.tip_xyz_wax), np.asarray(fk.tool_axis_wax)))
+        self.assertGreaterEqual(float(np.hypot(*poses[-1][0][:2])), self.R + 1e-6)
+        for apex_i, axis_i in poses[:-1]:
+            self.assertFalse(
+                bool(self.helper("tool_body_penetrates")(mesh, [apex_i], [axis_i], self.config)[0]),
+                "exit pose buried",
+            )
+
+
+def _tool_body_points(mesh, config, apex, axis, stations=(0.25, 0.5, 0.75, 1.0)):
+    """Independent reference: axis + 8 ring points at each station."""
+    del mesh
+    tool = config["tool"]
+    engaged = float(tool["engaged_length_mm"])
+    tip_r = float(tool["tip_radius_mm"])
+    alpha = math.radians(float(tool["cone_half_angle_deg"]))
+    axis = np.asarray(axis, dtype=float)
+    axis = axis / np.linalg.norm(axis)
+    tmp = np.array([0.0, 0.0, 1.0])
+    if abs(float(axis @ tmp)) > 0.9:
+        tmp = np.array([1.0, 0.0, 0.0])
+    e1 = np.cross(axis, tmp)
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(axis, e1)
+    points = [np.asarray(apex, dtype=float)]
+    for t in stations:
+        base = np.asarray(apex, dtype=float) - axis * (t * engaged)
+        radius = tip_r + t * engaged * math.tan(alpha)
+        for k in range(8):
+            angle = k * math.pi / 4.0
+            points.append(base + radius * (math.cos(angle) * e1 + math.sin(angle) * e2))
+    return np.asarray(points)
 
 
 class TestPatch10APIRegressions(unittest.TestCase):
