@@ -851,9 +851,13 @@ def build_roughing(
     # leaves a sliver of wax inside the shank.  With the shipped tool that is
     # 8 - (3.0 - 0.5 - 0.4) / tan(30 deg) = 4.36 mm, floor 1.0 mm.
     alpha = math.radians(float(tool["cone_half_angle_deg"]))
-    shank_safe = engaged - (
+    radial_overhang = (
         float(tool["shank_radius_mm"]) - float(tool["tip_radius_mm"]) - float(tool["melt_kerf_mm"])
-    ) / math.tan(alpha)
+    )
+    # This bounds the sliver left *below* a vertical wall's terrace.  The
+    # separate case "uncut stock in front of a terrace at the same level" is
+    # controlled by the finish allowance, not by the stepdown.
+    shank_safe = engaged - radial_overhang / math.tan(alpha)
     stepdown = min(
         float(params["rough_stepdown_mm"]),
         max(1.0, engaged * 0.75),
