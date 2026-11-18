@@ -11,7 +11,27 @@
 
 import { WaxSDFCore, DEFAULT_TOOL } from './wax_sdf_core.js';
 
+/** Map backend tool config (mm) onto the SDF core's tool units. */
+function toolFromConfig(configTool) {
+  const source = configTool || {};
+  const pick = (configKey, defaultKey) => {
+    const value = Number(source[configKey]);
+    return Number.isFinite(value) && value > 0 ? value : DEFAULT_TOOL[defaultKey];
+  };
+  return {
+    tipRadius: pick('tip_radius_mm', 'tipRadius'),
+    coneHalfAngleDeg: pick('cone_half_angle_deg', 'coneHalfAngleDeg'),
+    engagedLength: pick('engaged_length_mm', 'engagedLength'),
+    meltKerf: Number.isFinite(Number(source.melt_kerf_mm))
+      ? Number(source.melt_kerf_mm)
+      : DEFAULT_TOOL.meltKerf,
+    shankRadius: pick('shank_radius_mm', 'shankRadius'),
+    shankLength: pick('shank_length_mm', 'shankLength'),
+  };
+}
+
 let core = null;
+let workerTool = { ...DEFAULT_TOOL };
 let poses = null;
 let rapid = null;
 let count = 0;
@@ -19,7 +39,7 @@ let current = 0;
 let snapshots = [];
 let snapshotEvery = 1000;
 let faulted = false;
-let lastCheckShank = -1;
+const MAX_SNAPSHOTS = 5;
 
 function post(message, transfer = []) {
   self.postMessage(message, transfer);
@@ -52,8 +72,17 @@ function meshPayload() {
 function snapshotAt(index) {
   snapshots.push({ index, data: core.snapshot() });
   snapshots.sort((a, b) => a.index - b.index);
-  // Keep at most five snapshots (~40 MiB at 128^3).
-  while (snapshots.length > 5) snapshots.splice(1, 1);
+  if (snapshots.length > MAX_SNAPSHOTS) {
+    // Even thinning: keep the oldest and newest and drop every other interior
+    // snapshot so scrub coverage stays spread over the whole timeline instead
+    // of bunching near the end.
+    snapshots = snapshots.filter(
+      (snapshot, position) =>
+        position === 0 ||
+        position === snapshots.length - 1 ||
+        position % 2 === 0
+    );
+  }
 }
 
 function restoreNearest(index) {
@@ -76,7 +105,7 @@ function carveForward(target) {
     const pose = poseAt(index);
     const previous = poseAt(index - 1);
     if (rapid && rapid[index]) {
-      const result = core.checkRapid(previous, pose, DEFAULT_TOOL);
+      const result = core.checkRapid(previous, pose, workerTool);
       if (result.collision) {
         core.lastCollision = result;
         post({ type: 'collision', code: 'RAPID_COLLISION', index, sdf: result.sdf });
@@ -85,12 +114,12 @@ function carveForward(target) {
         return index;
       }
     } else {
-      // The unheated shank is checked on tilted finishing poses; vertical
-      // roughing plunges sit inside the roughing allowance shell by design.
+      // The unheated shank is checked on every cutting frame. Vertical roughing
+      // plunges sit inside the roughing allowance shell by design, so only
+      // tilted (finishing) poses can physically reach an overhang.
       const tilted = Math.abs(pose.axis[2]) < 0.98;
-      if (tilted && index - lastCheckShank >= 4) {
-        lastCheckShank = index;
-        const shank = core.checkShank(pose, DEFAULT_TOOL);
+      if (tilted) {
+        const shank = core.checkShank(pose, workerTool);
         if (shank.collision) {
           post({ type: 'collision', code: 'SHANK_COLLISION', index, sdf: shank.sdf });
           faulted = true;
@@ -98,7 +127,7 @@ function carveForward(target) {
           return index;
         }
       }
-      core.subtractTool(pose, DEFAULT_TOOL, { includeShank: false });
+      core.subtractTool(pose, workerTool, { includeShank: false });
       if (index % snapshotEvery === 0) snapshotAt(index);
     }
     current = index;
@@ -132,6 +161,7 @@ self.onmessage = (event) => {
   const data = event.data || {};
   if (data.type === 'init') {
     const stock = data.config.stock || {};
+    workerTool = toolFromConfig(data.config.tool);
     core = new WaxSDFCore({
       R_stock: stock.R_stock_mm ?? 40,
       H_stock: stock.H_stock_mm ?? 120,
@@ -144,6 +174,7 @@ self.onmessage = (event) => {
         type: 'ready',
         voxelSize: core.voxelSize,
         chunksPerAxis: core.chunksPerAxis,
+        tool: workerTool,
         meshes,
         gridN: core.N,
       },
@@ -159,7 +190,6 @@ self.onmessage = (event) => {
     current = 0;
     snapshots = [];
     faulted = false;
-    lastCheckShank = -1;
     snapshotEvery = Math.max(500, Math.ceil(count / 12));
     if (core) {
       core._initialize();
@@ -193,7 +223,6 @@ self.onmessage = (event) => {
     current = 0;
     snapshots = [];
     faulted = false;
-    lastCheckShank = -1;
     if (count > 0) snapshotAt(0);
     flush(0, 'reset');
     return;

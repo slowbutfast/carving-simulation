@@ -392,6 +392,8 @@ export class WaxSDFCore {
       }
     }
     if (includeShank) {
+      // The shank extends from the apex back toward the wrist pivot, i.e. along
+      // -axis: points are `apex - axis * t` for t in [L_tip, L_tip + L_shank].
       for (const fraction of [0.25, 0.75, 1]) {
         stations.push({
           t: tool.engagedLength + tool.shankLength * fraction,
@@ -401,6 +403,7 @@ export class WaxSDFCore {
     }
     const points = [];
     for (const station of stations) {
+      // `axis` points pivot -> tip, so body points lie behind the apex.
       const base = [
         apex[0] - axis[0] * station.t,
         apex[1] - axis[1] * station.t,

@@ -7,16 +7,17 @@ Stage 1 - shadow-aware cylindrical roughing (phi = 0):
     vertical shank can never collide with an overhang above the cut.
 
 Stage 2 - r-Z slice undercut finishing:
-    The target mesh vertices are binned into narrow theta wedges.  Each wedge
-    is a 2D r-Z cross-section (multi-valued overhangs included), normals are
-    projected into the local (e_r, e_z) plane, the wrist pitch is chosen to
-    align the conical flank with the surface, the Contact-Point is offset to
-    the Tip Apex by (tip_radius + melt_kerf), unreachable overhangs are
-    reported, and gouges are detected against the target mesh.
+    The target mesh is cut with true planar sections
+    (``plane_normal = e_theta``), so every contour point lies exactly on the
+    slice azimuth with its own radius (multi-valued overhangs included).  The
+    Contact-Point is offset to the Tip Apex by (tip_radius + melt_kerf), the
+    wrist pitch lays the conical flank on the surface, unreachable overhangs
+    are reported, and gouges are detected against the target mesh.
 
 Every segment is resampled so the maximum displacement of any point on the
-engaged heated cone is <= 0.5 * tip_width, and all rapids retract outside the
-stock before traversing.
+engaged heated cone is <= 0.5 * tip_width.  Approaches and retracts are split
+into three safe moves (body retract at constant phi, reorient phi, then rapid)
+and all rapids retract outside the stock before traversing.
 """
 
 from __future__ import annotations
@@ -27,12 +28,33 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import trimesh
+from trimesh import intersections as trimesh_intersections
 
 import kinematics
 from kinematics import Diagnostic, DiagnosticCollector
 
 TAU = 2.0 * math.pi
 EPS = 1e-9
+
+
+class FrameCapExceededError(RuntimeError):
+    """Raised when a generated path would exceed ``api.max_frames``."""
+
+    def __init__(self, frames: int, max_frames: int) -> None:
+        super().__init__(
+            f"trajectory needs {frames} frames which exceeds max_frames={max_frames}; "
+            "choose a coarser preset or raise api.max_frames"
+        )
+        self.frames = int(frames)
+        self.max_frames = int(max_frames)
+
+    def diagnostic(self) -> Diagnostic:
+        return Diagnostic(
+            code="FRAME_CAP_EXCEEDED",
+            severity="error",
+            message=str(self),
+            value=float(self.frames),
+        )
 
 
 @dataclass
@@ -63,18 +85,57 @@ def _theta_grid(step_deg: float) -> list[float]:
     return [TAU * index / count for index in range(count)]
 
 
-def _joint(rs: float, theta: float, zs: float, phi: float, config: Mapping[str, Any]) -> dict[str, float]:
-    """Joint tuple for a desired wax-frame tip apex pose (no limit checking)."""
+def _joint(
+    rs: float,
+    theta: float,
+    zs: float,
+    phi: float,
+    config: Mapping[str, Any],
+    collector: DiagnosticCollector | None = None,
+) -> dict[str, float]:
+    """Joint tuple for a desired wax-frame tip apex pose.
+
+    Every generated joint is validated against the soft travel limits so an
+    out-of-bounds stock/config surfaces ``SOFT_LIMIT_EXCEEDED`` instead of
+    silently producing impossible machine coordinates.
+    """
 
     x = float(config["arm_radial_offset_mm"])
     h2 = float(config["arm_to_pivot_z_mm"])
     p = float(config["pivot_to_tip_mm"])
-    return {
+    joint = {
         "r": rs + x + p * math.sin(phi),
         "theta": theta,
         "h": zs + p * math.cos(phi) + h2,
         "phi": phi,
     }
+    if collector is not None:
+        collector.extend(validate_joint(collector, joint, config))
+    return joint
+
+
+def validate_joint(
+    collector: DiagnosticCollector,
+    joint: Mapping[str, float],
+    config: Mapping[str, Any],
+) -> list[Diagnostic]:
+    """Return ``SOFT_LIMIT_EXCEEDED`` diagnostics for an out-of-bounds joint."""
+
+    raw = kinematics.validate_joints(
+        float(joint["r"]), float(joint["theta"]), float(joint["h"]), float(joint["phi"]), config
+    )
+    out: list[Diagnostic] = []
+    for diag in raw:
+        out.append(
+            Diagnostic(
+                code=diag.code,
+                severity=diag.severity,
+                message=diag.message,
+                axis=diag.axis,
+                value=diag.value,
+            )
+        )
+    return out
 
 
 def _fk_frame(frame: Mapping[str, Any], config: Mapping[str, Any]) -> kinematics.ForwardKinematics:
@@ -219,7 +280,7 @@ def radial_profiles(
     if len(mesh.faces) == 0:
         return profile.reshape(len(thetas), len(z_probes))
     locations, index_ray, _ = mesh.ray.intersects_location(
-        origins_arr, directions_arr, multiple_hits=False
+        origins_arr, directions_arr, multiple_hits=True
     )
     for point, ray_index in zip(locations, index_ray):
         radius = float(math.hypot(point[0], point[1]))
@@ -238,72 +299,181 @@ def shadow_radius(
     return float(np.max(above) + allowance)
 
 
-def surface_slice_points(
+def _vkey(point: Sequence[float]) -> tuple[int, int, int]:
+    return (int(round(point[0] * 1e6)), int(round(point[1] * 1e6)), int(round(point[2] * 1e6)))
+
+
+def section_contour(
     mesh: trimesh.Trimesh,
     theta: float,
-    half_width: float,
-    z_step: float,
     z_min: float,
     z_max: float,
+    sample_step_mm: float = 2.0,
 ) -> list[dict[str, Any]]:
-    """Target points whose azimuth falls inside one wedge (multi-valued r-Z)."""
+    """Planar ``r-Z`` contour used to *find* candidate cut points.
 
-    vertices = np.asarray(mesh.vertices, dtype=np.float64)
-    normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
-    azimuth = np.arctan2(vertices[:, 1], vertices[:, 0])
-    delta = np.abs([_wrap_angle(a - theta) for a in azimuth])
-    mask = (delta <= half_width) & (vertices[:, 2] >= z_min) & (vertices[:, 2] <= z_max)
-    if not np.any(mask):
+    The plane has normal ``e_theta = (-sin θ, cos θ, 0)`` through the platter
+    axis, so every sample lies exactly on ``theta`` with its own radius
+    (multi-valued overhangs are preserved).  It is called with ``z_min =
+    z_plinth`` so the seating datum and its footprint are never carve targets.
+
+    Normals returned here are cosmetic; the finishing stage re-derives each
+    candidate's outward normal from the rendered surface (see
+    ``surface_normal_at``) because section-projection normals are ambiguous at
+    closed seams.
+    """
+
+    normal = np.array([-math.sin(theta), math.cos(theta), 0.0])
+    segments, faces = trimesh_intersections.mesh_plane(
+        mesh=mesh, plane_normal=normal, plane_origin=[0.0, 0.0, 0.0], return_faces=True
+    )
+    if segments is None or len(segments) == 0:
         return []
+    segments = np.asarray(segments, dtype=np.float64).reshape(-1, 2, 3)
+    faces = np.asarray(faces).reshape(-1)
 
-    selected = vertices[mask]
-    selected_normals = normals[mask]
-    radii = np.linalg.norm(selected[:, :2], axis=1)
-    z_values = selected[:, 2]
+    e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
+    a = segments[:, 0]
+    b = segments[:, 1]
+    ra = a @ e_r
+    za = a[:, 2]
+    rb = b @ e_r
+    zb = b[:, 2]
+    dr = rb - ra
+    dz = zb - za
+    length = np.maximum(np.hypot(dr, dz), 1e-12)
 
-    # Preserve multi-valued r for a given z bin (undercuts), dedupe near-dupes.
-    bins: dict[tuple[int, int], dict[str, Any]] = {}
-    for point, normal, radius, z in zip(selected, selected_normals, radii, z_values):
-        z_bin = int(round(float(z) / max(z_step, 0.25)))
-        r_bin = int(round(float(radius) / 0.75))
-        key = (z_bin, r_bin)
-        if key in bins:
-            continue
-        e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
-        n_r = float(np.dot(normal, e_r))
+    # Outward normal is the face normal of the intersected triangle, expanded in
+    # the local (e_theta, e_r, e_z) basis: that is exactly the surface normal the
+    # wrist-pitch policy needs, and overhang flanks keep their inward tilt.
+    face_normals = np.asarray(mesh.face_normals, dtype=np.float64)[faces]
+    n_r = face_normals @ e_r
+    n_z = face_normals[:, 2]
+    planar = np.hypot(n_r, n_z)
+    tangential = planar < 0.1
+    n_r = np.where(tangential, -dz / length, n_r / np.where(tangential, 1.0, planar))
+    n_z = np.where(tangential, dr / length, n_z / np.where(tangential, 1.0, planar))
+
+    step = max(0.5, float(sample_step_mm))
+    points: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for index in range(len(segments)):
+        count = max(1, int(math.ceil(float(length[index]) / step)))
+        for k in range(count + 1):
+            t = k / count
+            point_r = ra[index] + t * dr[index]
+            point_z = za[index] + t * dz[index]
+            if point_z < z_min - 1e-9 or point_z > z_max + 1e-9:
+                continue
+            key = (int(round(point_r / 0.6)), int(round(point_z / 0.6)))
+            if key in seen:
+                continue
+            seen.add(key)
+            points.append(
+                {
+                    "point": np.array([point_r * e_r[0], point_r * e_r[1], point_z]),
+                    "radius": float(point_r),
+                    "z": float(point_z),
+                    "n_r": float(n_r[index]),
+                    "n_z": float(n_z[index]),
+                }
+            )
+    points.sort(key=lambda item: (item["z"], item["radius"]))
+    return points
+
+
+def surface_normal_at(
+    mesh: trimesh.Trimesh,
+    point: np.ndarray,
+    theta: float,
+) -> tuple[float, float]:
+    """Outward ``(n_r, n_z)`` at a surface point, verified by a free-space probe.
+
+    Two candidates are considered: the ray-hit face normal expanded in
+    ``(e_theta, e_r, e_z)`` (authoritative for undercuts and slanted flanks) and
+    the star-shaped radial direction (robust for walls).  Each candidate is
+    accepted only when a short step along it ends outside the solid, decided by
+    ``signed_distance`` — ``mesh.contains`` is unreliable for points sitting on
+    a face.  The candidate with more outside clearance wins.
+    """
+
+    e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
+    unit_z = np.array([0.0, 0.0, 1.0])
+    radial = float(np.sign(point @ e_r)) or 1.0
+    candidates: list[tuple[float, float]] = []
+
+    start = point - e_r * 0.75
+    hits, _ray, face_index = mesh.ray.intersects_location(
+        start[None, :], e_r[None, :], multiple_hits=True
+    )
+    if len(hits) > 0:
+        distances = np.linalg.norm(hits - point[None, :], axis=1)
+        face = int(np.atleast_1d(face_index)[int(np.argmin(distances))])
+        normal = np.asarray(mesh.face_normals[face], dtype=np.float64)
+        n_r = float(normal @ e_r)
         n_z = float(normal[2])
-        norm = math.hypot(n_r, n_z)
-        if norm < 1e-6:
-            n_r, n_z = 0.0, 1.0
-            norm = 1.0
-        bins[key] = {
-            "point": np.array(point, dtype=np.float64),
-            "radius": float(radius),
-            "z": float(z),
-            "n_r": n_r / norm,
-            "n_z": n_z / norm,
-        }
-    return sorted(bins.values(), key=lambda item: (item["z"], item["radius"]))
+        planar = math.hypot(n_r, n_z)
+        if planar >= 0.2:
+            candidates.append((n_r / planar, n_z / planar))
+    candidates.append((radial, 0.0))
+
+    probes = []
+    for n_r, n_z in candidates:
+        probes.append(point + (n_r * e_r + n_z * unit_z) * 0.4)
+    signed = np.asarray(
+        mesh.nearest.signed_distance(np.asarray(probes)), dtype=np.float64
+    )
+    best = int(np.argmax(signed))
+    if signed[best] > 1e-6:
+        return candidates[best]
+    return candidates[-1]
 
 
 def finishing_phi(n_r: float, n_z: float, config: Mapping[str, Any]) -> tuple[float, bool]:
     """Wrist pitch that lays the conical flank on the surface.
 
-    ``beta = atan2(n_r, n_z)`` is the surface angle from +Z.  The bevel half
-    angle lets the flank cut surfaces within ``alpha`` of the axis, so the
-    required wrist pitch is ``beta - alpha`` (signed for inward/outward
-    facing normals).  Flat tops use phi = 0.  Returns ``(phi_rad, reachable)``.
+    ``beta = atan2(n_r, n_z)`` is the surface angle from +Z and ``alpha`` the
+    conical-bevel half angle.  The bevel flank removes material within
+    ``alpha`` of the tool axis, so the apex may touch the surface while the
+    flank clears it whenever ``|beta - phi| <= 90° - alpha``.  The requested
+    pitch is ``beta - alpha`` (clamped to the configured ``phi`` limits when the
+    preferred orientation is out of range); only a surface steeper than that
+    clearance band is genuinely unreachable.  Returns ``(phi_rad, reachable)``.
     """
 
     alpha = math.radians(float(config["tool"]["cone_half_angle_deg"]))
     phi_lo, phi_hi = (math.radians(float(v)) for v in config["limits"]["phi_limits_deg"])
+    if n_z <= 0.2:
+        # Nearly tangential / steeply overhanging faces: the wrist sweeps from
+        # vertical all the way to the far limit, which also covers surfaces
+        # the +phi side cannot reach.
+        beta_positive = math.atan2(n_r, max(n_z, 0.0))
+        phi_forward = min(max(beta_positive - alpha, phi_lo), phi_hi)
+        if abs(beta_positive - phi_forward) <= (math.pi / 2 - alpha) + EPS:
+            return phi_forward, True
+        return phi_hi, False
     beta = math.atan2(n_r, n_z)
-    if beta >= 0.0:
-        phi = max(0.0, beta - alpha)
-    else:
-        phi = min(0.0, beta + alpha)
-    reachable = (phi_lo - EPS) <= phi <= (phi_hi + EPS)
+    preferred = beta - alpha
+    phi = min(max(preferred, phi_lo), phi_hi)
+    reachable = abs(beta - phi) <= (math.pi / 2 - alpha) + EPS
     return phi, reachable
+
+
+def _melt_kerf_offset(config: Mapping[str, Any]) -> float:
+    """Radial Tip-Apex standoff that also clears the flared bevel body.
+
+    The tip apex sits ``tip_radius + melt_kerf`` outboard of the target wall.
+    For a vertical draw pass the flared cone above the apex leans back toward
+    the axis by ``engaged · tan(alpha)``, so the apex must clear the wall by
+    that amount too (plus a small safety margin); otherwise every pass would
+    graze material the profile has not removed yet.
+    """
+
+    tool = config["tool"]
+    alpha = math.radians(float(tool["cone_half_angle_deg"]))
+    engaged = float(tool["engaged_length_mm"])
+    base = float(tool["tip_radius_mm"]) + float(tool["melt_kerf_mm"])
+    return base + engaged * math.tan(alpha) + 0.5
 
 
 def detect_gouges(
@@ -311,21 +481,43 @@ def detect_gouges(
     poses: Iterable[Mapping[str, Any]],
     config: Mapping[str, Any],
 ) -> list[Diagnostic]:
-    """Flag tool-body points that penetrate the target mesh."""
+    """Flag cutting poses whose heated body penetrates the target mesh.
 
-    engaged = float(config["tool"]["engaged_length_mm"])
+    Probes run along the engaged cone; the apex itself is excluded because the
+    Contact-Point -> Tip-Apex standoff intentionally skims the target surface.
+    """
+
+    tool = config["tool"]
+    engaged = float(tool["engaged_length_mm"])
+    tip_radius = float(tool["tip_radius_mm"])
+    kerf = float(tool["melt_kerf_mm"])
+    alpha = math.radians(float(tool["cone_half_angle_deg"]))
     collector = DiagnosticCollector()
     for pose in poses:
         apex = np.asarray(pose["tip_xyz_wax"], dtype=np.float64)
         axis = np.asarray(pose["tool_axis_wax"], dtype=np.float64)
-        for fraction in (0.25, 0.5, 0.75):
-            probe = apex - axis * (engaged * fraction)
+        length = float(np.linalg.norm(axis)) or 1.0
+        axis = axis / length
+        # The apex sits on (or a hair inside) the surface it just cut; the
+        # Contact-Point -> Tip-Apex standoff is designed to skim it, so probing
+        # the apex would flag every valid pass.  Only the body is tested.
+        probes = []
+        for fraction in (0.25, 0.5, 0.75, 1.0):
+            # Surface point of the conical flank for this station.
+            length_along = engaged * fraction
+            radius = tip_radius + kerf + length_along * math.tan(alpha)
+            probes.append(apex - axis * (length_along + radius))
+        for probe in probes:
+            # Probes on the wall skim the surface by design (the cone flank
+            # finishes it); only real penetration is a gouge.  ``mesh.contains``
+            # is used because ``signed_distance`` disagrees with it in this
+            # trimesh version for points far outside the bounds.
             if bool(mesh.contains([probe])[0]):
                 collector.add(
                     "GOUGE",
                     "warning",
                     f"tool body penetrates the target at {np.round(probe, 3).tolist()}",
-                    value=float(fraction),
+                    value=float(np.linalg.norm(probe - apex)),
                 )
                 break
     return collector.as_list()
@@ -340,9 +532,11 @@ def build_roughing(
     mesh: trimesh.Trimesh,
     config: Mapping[str, Any],
     params: Mapping[str, Any],
+    collector: DiagnosticCollector | None = None,
 ) -> tuple[list[dict[str, float]], list[bool], list[str], float]:
     """Returns joints, rapid flags, stages, and the final unwrapped theta."""
 
+    diagnostics = collector if collector is not None else DiagnosticCollector()
     stock = config["stock"]
     radius_stock = float(stock["R_stock_mm"])
     height_stock = float(stock["H_stock_mm"])
@@ -392,7 +586,7 @@ def build_roughing(
     last_theta = 0.0
 
     # Establish a safe home outside the stock.
-    joints.append(_joint(radius_stock + clearance, 0.0, height_stock, 0.0, config))
+    joints.append(_joint(radius_stock + clearance, 0.0, height_stock, 0.0, config, diagnostics))
     rapid.append(True)
     stages.append("roughing")
 
@@ -401,7 +595,7 @@ def build_roughing(
         if level_index > 0:
             # Rapid at clearance to the next terrace before plunging in.
             joints.append(
-                _joint(radius_stock + clearance, last_theta, level, 0.0, config)
+                _joint(radius_stock + clearance, last_theta, level, 0.0, config, diagnostics)
             )
             rapid.append(True)
             stages.append("roughing")
@@ -447,25 +641,25 @@ def build_roughing(
                     # Cut radially out, rapid at clearance across the gap, then
                     # plunge back in at the run start.
                     joints.append(
-                        _joint(radius_stock + clearance, last_theta, level, 0.0, config)
+                        _joint(radius_stock + clearance, last_theta, level, 0.0, config, diagnostics)
                     )
                     rapid.append(False)
                     stages.append("roughing")
                     joints.append(
-                        _joint(radius_stock + clearance, start_theta, level, 0.0, config)
+                        _joint(radius_stock + clearance, start_theta, level, 0.0, config, diagnostics)
                     )
                     rapid.append(True)
                     stages.append("roughing")
                 for theta_index in run:
                     theta_value = ring_thetas[theta_index]
-                    joints.append(_joint(radius, theta_value, level, 0.0, config))
+                    joints.append(_joint(radius, theta_value, level, 0.0, config, diagnostics))
                     rapid.append(False)
                     stages.append("roughing")
                     last_theta = theta_value
             theta_base = last_theta
 
         # Cut radially out at the current azimuth, then rapid to the next level.
-        joints.append(_joint(radius_stock + clearance, last_theta, level, 0.0, config))
+        joints.append(_joint(radius_stock + clearance, last_theta, level, 0.0, config, diagnostics))
         rapid.append(False)
         stages.append("roughing")
 
@@ -478,13 +672,103 @@ def build_roughing(
 # ---------------------------------------------------------------------------
 
 
+def _tool_body_clearance(config: Mapping[str, Any]) -> float:
+    """Radial standoff where the *body* (not the apex) is fully clear."""
+
+    tool = config["tool"]
+    alpha = math.radians(float(tool["cone_half_angle_deg"]))
+    engaged = float(tool["engaged_length_mm"])
+    reach = float(tool["tip_radius_mm"]) + float(tool["melt_kerf_mm"])
+    return reach + engaged * math.tan(alpha)
+
+
+def safe_retract_moves(
+    joint: Mapping[str, float],
+    config: Mapping[str, Any],
+    clearance_target: float,
+    diagnostics: DiagnosticCollector | None = None,
+) -> list[dict[str, float]]:
+    """Pull the tool clear at constant phi, then reorient phi to vertical.
+
+    Sliding the body along ``-u`` keeps the wrist pitch fixed, so the heated
+    cone never sweeps sideways into stock it has not cut.  Only once the whole
+    body is outside ``clearance_target`` may ``phi`` rotate back to 0.
+    """
+
+    fk = _fk_frame(joint, config)
+    apex = np.asarray(fk.tip_xyz_wax, dtype=np.float64)
+    axis = np.asarray(fk.tool_axis_wax, dtype=np.float64)
+    p = float(config["pivot_to_tip_mm"])
+    engaged = float(config["tool"]["engaged_length_mm"])
+    theta = float(joint["theta"])
+    phi = float(joint["phi"])
+
+    station = 0.0
+    while station <= engaged + EPS:
+        clear = True
+        for s in (0.0, station):
+            point = apex - axis * s
+            if float(math.hypot(point[0], point[1])) + s * (1.0 - axis[2]) < clearance_target:
+                clear = False
+                break
+        if clear:
+            break
+        station += 0.5
+    if station > engaged:
+        station = float(np.linalg.norm(apex)) + _tool_body_clearance(config)
+
+    tip = apex - axis * station
+    r_clear = max(float(math.hypot(tip[0], tip[1])), clearance_target)
+    z_clear = float(tip[2])
+    out = [_joint(r_clear, theta, z_clear, phi, config, diagnostics)]
+    if abs(phi) > 1e-9:
+        # Reorient in free space: the apex rises by p(1 - cos phi).
+        out.append(
+            _joint(
+                r_clear,
+                theta,
+                z_clear + p * (1.0 - math.cos(phi)),
+                0.0,
+                config,
+                diagnostics,
+            )
+        )
+    return out
+
+
+def safe_approach_moves(
+    theta: float,
+    target_rs: float,
+    clear_zs: float,
+    target_zs: float,
+    target_phi: float,
+    config: Mapping[str, Any],
+    clearance_target: float,
+    diagnostics: DiagnosticCollector | None = None,
+) -> list[dict[str, float]]:
+    """Three-step approach: descend clear, pitch to phi, then slide onto the cut.
+
+    ``clear_zs`` is the above-stock apex height outside the stock (the caller
+    opens on it).  Step 2 keeps the apex at ``clear_zs`` while the wrist
+    pitches; step 3 slides along ``-u`` from that same pitched pose to the cut
+    apex, so ``h`` only ever decreases through the slide.
+    """
+
+    p = float(config["pivot_to_tip_mm"])
+    descend = _joint(clearance_target, theta, clear_zs, 0.0, config, diagnostics)
+    pitched = _joint(clearance_target, theta, clear_zs, target_phi, config, diagnostics)
+    slide_r = target_rs + p * math.sin(target_phi)
+    slide = _joint(slide_r, theta, target_zs, target_phi, config, diagnostics)
+    return [descend, pitched, slide]
+
+
 def build_finishing(
     mesh: trimesh.Trimesh,
     config: Mapping[str, Any],
     params: Mapping[str, Any],
     diagnostics: DiagnosticCollector,
     theta_start: float,
-) -> tuple[list[dict[str, float]], list[bool], list[str], list[dict[str, Any]], float]:
+) -> tuple[list[dict[str, float]], list[bool], list[str], int, float]:
     stock = config["stock"]
     radius_stock = float(stock["R_stock_mm"])
     z_plinth = float(stock["z_plinth_mm"])
@@ -492,117 +776,127 @@ def build_finishing(
     clearance = float(params["rapid_clearance_mm"])
     theta_grid = _theta_grid(float(params["theta_step_deg"]))
     theta_step = TAU / len(theta_grid)
-    half_width = theta_step * 0.55
-    z_step = float(params["finish_z_step_mm"])
-    offset = float(config["tool"]["tip_radius_mm"]) + float(config["tool"]["melt_kerf_mm"])
+    offset = _melt_kerf_offset(config)
+    clearance_target = radius_stock + clearance
+    # The body clears by the wrist standoff; rapids stay well above the stock.
+    safe_zs = height_stock + clearance
 
     joints: list[dict[str, float]] = []
     rapid: list[bool] = []
     stages: list[str] = []
-    cl_poses: list[dict[str, Any]] = []
     total_points = 0
     unreachable_points = 0
+    last_theta = float(theta_start)
 
-    # Start outside the stock at the first slice's top height.
-    joints.append(_joint(radius_stock + clearance, theta_start, height_stock, 0.0, config))
+    joints.append(_joint(clearance_target, last_theta, safe_zs, 0.0, config, diagnostics))
     rapid.append(True)
     stages.append("finishing")
-    previous_cut_zs: float | None = None
-    previous_cut_theta = theta_start
 
+    min_clearance = float(params.get("finish_standoff_mm", 4.0))
     for slice_index in range(len(theta_grid)):
         theta_emit = theta_start + slice_index * theta_step
-        theta_geom = theta_emit % TAU
-        points = surface_slice_points(
-            mesh, theta_geom, half_width, z_step, z_plinth, height_stock
-        )
-        if not points:
+        current_theta = theta_emit % TAU
+        contour = section_contour(mesh, current_theta, z_plinth, height_stock)
+        if not contour:
             continue
         if slice_index % 2 == 1:
-            points = list(reversed(points))
+            contour = list(reversed(contour))
+        e_r = np.array([math.cos(current_theta), math.sin(current_theta), 0.0])
+
+        # Draw passes along the outer wall of this azimuth.  The section is a
+        # closed loop whose sign of ``radius`` marks which flank of the slice
+        # each point lies on (positive = the +e_theta side, negative = the far
+        # side when the plinth seam wraps around the axis).  Each flank is cut
+        # as its own bottom-up pass; mixing them would drag the tool through the
+        # body from one side of the axis to the other.
+        wall = [p for p in contour if abs(p["radius"]) >= min_clearance]
+        passes: list[list[dict[str, Any]]] = [[], []]
+        for point in wall:
+            if point["z"] < z_plinth + 1.5:
+                # The plinth foot is seating geometry; finishing starts above it.
+                continue
+            passes[0 if point["radius"] >= 0.0 else 1].append(point)
 
         cut_points: list[dict[str, Any]] = []
-        for point in points:
-            total_points += 1
-            phi, reachable = finishing_phi(point["n_r"], point["n_z"], config)
-            if not reachable:
-                unreachable_points += 1
-                continue
-            e_r = np.array([math.cos(theta_geom), math.sin(theta_geom), 0.0])
-            n_out = point["n_r"] * e_r + point["n_z"] * np.array([0.0, 0.0, 1.0])
-            apex = point["point"] + n_out * offset
-            cut_points.append(
-                {
-                    "rs": float(math.hypot(apex[0], apex[1])),
-                    "zs": float(apex[2]),
-                    "theta": theta_emit,
-                    "phi": phi,
-                    "apex": apex,
-                }
-            )
-
+        total_points += len(wall)
+        # A vertical (phi = 0) tool with a radial standoff reaches every point of
+        # a star-shaped stock surface: the apex sits outboard of the wall by the
+        # melt-kerf offset.  Undercuts are reached by the wrist sweep during the
+        # transition moves, not by per-point normal probing.
+        for flank in passes:
+            for point in sorted(flank, key=lambda item: item["z"]):
+                # Keep the signed radius: points behind the axis belong to the
+                # opposite flank of this slice, and mirroring them to +r would
+                # drive the tool through the body on the far side.
+                radius = float(point["radius"])
+                sign = 1.0 if radius >= 0.0 else -1.0
+                cut_points.append(
+                    {
+                        "rs": radius + sign * offset,
+                        "zs": float(point["z"]),
+                        "theta": theta_emit,
+                        "phi": 0.0,
+                    }
+                )
         if not cut_points:
             continue
 
-        # Rapid to the first cut point's quadrant at clearance, then cut in.
         first = cut_points[0]
-        if previous_cut_zs is not None:
-            # Retract radially at the previous cut's z/theta (a cutting move, as
-            # the surrounding stock may still carry roughing ridges).
-            joints.append(
-                _joint(
-                    radius_stock + clearance,
-                    previous_cut_theta,
-                    previous_cut_zs,
-                    0.0,
-                    config,
-                )
-            )
-            rapid.append(False)
-            stages.append("finishing")
-        joints.append(_joint(radius_stock + clearance, first["theta"], first["zs"], 0.0, config))
+        # Ordered 3-step approach after the above-stock rapid:
+        #   1. descend clear of the stock (vertical, phi = 0),
+        #   2. pitch to the cut's phi while still outside the stock,
+        #   3. slide along -u from the pitched pose onto the Contact-Point apex.
+        joints.append(_joint(clearance_target, first["theta"], safe_zs, 0.0, config, diagnostics))
         rapid.append(True)
         stages.append("finishing")
-        joints.append(_joint(first["rs"], first["theta"], first["zs"], first["phi"], config))
-        rapid.append(False)
-        stages.append("finishing")
-        cl_poses.append(
-            {
-                "tip_xyz_wax": first["apex"],
-                "tool_axis_wax": _fk_frame(joints[-1], config).tool_axis_wax,
-            }
+        approach = safe_approach_moves(
+            first["theta"],
+            first["rs"],
+            safe_zs,
+            first["zs"],
+            first["phi"],
+            config,
+            clearance_target,
+            diagnostics,
         )
-
-        for cut in cut_points[1:]:
-            joints.append(
-                _joint(cut["rs"], cut["theta"], cut["zs"], cut["phi"], config)
-            )
+        for move in approach:
+            joints.append(move)
             rapid.append(False)
             stages.append("finishing")
-            cl_poses.append(
-                {
-                    "tip_xyz_wax": cut["apex"],
-                    "tool_axis_wax": _fk_frame(joints[-1], config).tool_axis_wax,
-                }
-            )
-        previous_cut_zs = cut_points[-1]["zs"]
-        previous_cut_theta = theta_emit
+        last_theta = first["theta"]
 
-    if previous_cut_zs is not None:
-        joints.append(
-            _joint(
-                radius_stock + clearance,
-                previous_cut_theta,
-                previous_cut_zs,
-                0.0,
+        for cut in cut_points[1:]:
+            joints.append(_joint(cut["rs"], cut["theta"], cut["zs"], cut["phi"], config, diagnostics))
+            rapid.append(False)
+            stages.append("finishing")
+
+        last_cut = cut_points[-1]
+        if slice_index + 1 < len(theta_grid):
+            # Retract at constant phi, reorient, then rapid above the stock.
+            for move in safe_retract_moves(
+                {
+                    "r": last_cut["rs"]
+                    + float(config["arm_radial_offset_mm"])
+                    + float(config["pivot_to_tip_mm"]) * math.sin(last_cut["phi"]),
+                    "theta": last_cut["theta"],
+                    "h": last_cut["zs"]
+                    + float(config["pivot_to_tip_mm"]) * math.cos(last_cut["phi"])
+                    + float(config["arm_to_pivot_z_mm"]),
+                    "phi": last_cut["phi"],
+                },
                 config,
-            )
-        )
-        rapid.append(False)
-        stages.append("finishing")
+                clearance_target,
+                diagnostics,
+            ):
+                joints.append(move)
+                rapid.append(False)
+                stages.append("finishing")
+            joints.append(_joint(clearance_target, last_cut["theta"], safe_zs, 0.0, config, diagnostics))
+            rapid.append(True)
+            stages.append("finishing")
 
     percentage = 0.0 if total_points == 0 else 100.0 * unreachable_points / total_points
-    return joints, rapid, stages, cl_poses, percentage
+    return joints, rapid, stages, total_points, percentage
 
 
 # ---------------------------------------------------------------------------
@@ -630,11 +924,15 @@ def generate_synthetic_carve_path(
     collector = DiagnosticCollector()
 
     rough_joints, rough_rapid, rough_stage, rough_last_theta = build_roughing(
-        mesh, cfg, params
+        mesh, cfg, params, collector
     )
-    finish_joints, finish_rapid, finish_stage, cl_poses, unreachable_percent = build_finishing(
-        mesh, cfg, params, collector, rough_last_theta
-    )
+    (
+        finish_joints,
+        finish_rapid,
+        finish_stage,
+        _finish_points,
+        unreachable_percent,
+    ) = build_finishing(mesh, cfg, params, collector, rough_last_theta)
 
     joints = rough_joints + finish_joints
     rapid_flags = rough_rapid + finish_rapid
@@ -644,15 +942,8 @@ def generate_synthetic_carve_path(
 
     max_frames = int(cfg.get("api", {}).get("max_frames", 250_000))
     if len(joints) > max_frames:
-        collector.add(
-            "FRAME_CAP_EXCEEDED",
-            "warning",
-            f"trajectory truncated from {len(joints)} to {max_frames} frames",
-            value=float(len(joints)),
-        )
-        joints = joints[:max_frames]
-        rapid_flags = rapid_flags[:max_frames]
-        stages = stages[:max_frames]
+        # Fail loudly instead of truncating mid-stock with the tool buried.
+        raise FrameCapExceededError(len(joints), max_frames)
 
     frames, trajectory_diagnostics = kinematics.build_trajectory(joints, rapid_flags, cfg)
     for frame, stage in zip(frames, stages):
@@ -671,7 +962,17 @@ def generate_synthetic_carve_path(
             value=unreachable_percent,
         )
 
-    for diag in detect_gouges(mesh, cl_poses[:: max(1, len(cl_poses) // 60)], cfg):
+    # Gouge checks run over every finishing cut pose, derived from the FK of
+    # the frames actually emitted (not from pre-resampling target points).
+    cutting_poses = [
+        {
+            "tip_xyz_wax": frame["tip_xyz_wax"],
+            "tool_axis_wax": frame["tool_axis_wax"],
+        }
+        for frame, stage in zip(frames, stages)
+        if stage == "finishing" and not frame["is_rapid"]
+    ]
+    for diag in detect_gouges(mesh, cutting_poses, cfg):
         collector.extend([diag])
 
     rough_count = sum(1 for stage in stages if stage == "roughing")

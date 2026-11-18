@@ -28,3 +28,11 @@
 - [x] 4.1 Run full Python (`python -m unittest discover -s tests -v`) and Node (`node --test tests/test_wax_sdf.mjs`) test suites and verify clean passes
 - [x] 4.2 Strictly validate OpenSpec artifacts (`openspec validate carver-sim-mvp --strict`)
 - [x] 4.3 Populate `verification.md` with Requirement Adherence Matrix, resolved assumptions, hardware calibration fixture status, and verbatim execution logs
+
+## Patch 10: PR #1 Review Fixes (Worker Tool Config, Finishing Sections/Transitions, Reachability, Limits & Shank Checks)
+
+- [ ] P10.1 Scaffold failing Node & Python tests (Node cases written and passing; Python reproductions written but not yet green) for non-default `config.tool` volume difference, every-cut-frame shank check, even snapshot retention, planar section finishing + FK gouge check, 3-step safe approach/retract, `|beta - phi| <= 90° - alpha` reachability, `multiple_hits=True` shadow, `SOFT_LIMIT_EXCEEDED` on out-of-bounds stock, and `max_frames` 422 error
+- [x] P10.2 Fix `static/wax_worker.js` (`init` tool mapping, pass `tool` to `checkRapid`/`checkShank`/`subtractTool`, check shank on every cutting frame, even snapshot thinning)
+- [ ] P10.3 Fix `toolpath_sim.py` (`multiple_hits=True` shadow, `mesh.section` planar `r–Z` contour slicing, 3-step constant-`phi` retract/approach, `|beta - phi| <= 90° - alpha` reachability, FK-derived `cl_poses` + full `detect_gouges`, joint limit validation, and `max_frames` error) and `server.py` (422 on frame cap / invalid `stock_cfg`/`tool_cfg`)
+- [ ] P10.4 Verify all reproduction tests pass and run full Python + Node regression suites (Node suites green: 9/9 core + 2/2 worker; Python regression suite red — see patch.md PATCH-10 status)
+- [ ] P10.5 Update `verification.md` and mark `PATCH-10` as `VERIFIED` in `patch.md` (blocked on P10.4)

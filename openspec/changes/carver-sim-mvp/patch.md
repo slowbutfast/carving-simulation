@@ -177,3 +177,66 @@
   full gantry, arm, wrist, and tip are in frame.
 - **Verification Command**: headless Chromium screenshot review
 - **Status**: VERIFIED
+
+### [PATCH-10] PR #1 Review Fixes: Worker Tool Config, Section/Transition Finishing, Reachability, Limits & Shank Checks
+
+- **Date**: 2026-11-18 03:52:00 UTC
+- **Feedback Source**: Code Review (PR #1 — `REQUEST CHANGES` from Agent 1 & Agent 2)
+- **Feedback Summary**:
+  - **Critical (3)**:
+    1. `static/wax_worker.js:79,93,101,134`: Worker ignores `data.config.tool` sent on `init`, passing hardcoded `DEFAULT_TOOL` to `checkRapid`, `checkShank`, and `subtractTool`.
+    2. `toolpath_sim.py:531-541,571,584,674`: `surface_slice_points` collects a ±0.55×θ-step wedge and places vertices at `theta_emit` with their own radius (pulling side-of-nose radii onto the centerline), while `cl_poses` records vertex-based `apex` instead of FK of emitted joints and `detect_gouges` only probes `~60` poses without probing the apex.
+    3. `toolpath_sim.py:549-568,591-602`: Approach and retract moves interpolate `phi`, `r`, and `h` simultaneously, swinging the tip below cut height into the upper lip/face without `is_rapid` or `cl_poses` coverage.
+  - **Important (6)**:
+    4. `toolpath_sim.py:289-306`: `finishing_phi` uses `phi = beta - alpha` and checks `phi <= phi_max` (rejecting >15° below horizontal instead of `|beta - phi| <= 90° - alpha`), disagreeing with spec and `kinematics.phi_selection_policy`.
+    5. `toolpath_sim.py:66-77`: `_joint` skips `validate_joints`, so generated trajectories never surface `SOFT_LIMIT_EXCEEDED`.
+    6. `toolpath_sim.py:221-223`: `multiple_hits=False` undercounts top-down shadow on multi-layer geometry (ears/hair/uploads).
+    7. `toolpath_sim.py:241-286,576-587`: Wedge-binned finishing order depends on tessellation and can zigzag across overhangs.
+    8. `toolpath_sim.py:645-655`: Hitting `max_frames` truncates the trajectory with only a warning, leaving the tool inside the stock without retracting.
+    9. `static/wax_worker.js:52-57,89-99`: Shank check only runs every 4th tilted finishing frame (missing intermediate cutting moves), and snapshot eviction `splice(1, 1)` clusters snapshots at the end of the timeline.
+- **Reported Issue / Raw Trace**:
+  ```
+  PR #1 Verdict: REQUEST CHANGES
+  - static/wax_worker.js:79,93,101 ignores data.config.tool (uses DEFAULT_TOOL)
+  - static/wax_worker.js:89 checks shank only every 4th tilted frame; snapshots bunch at end
+  - toolpath_sim.py:531-541,571,584,674 wedge vertex radius distortion + cl_poses != FK + 60-pose gouge subsample
+  - toolpath_sim.py:549-568,591-602 simultaneous (r, h, phi) approach/retract swings tip into part
+  - toolpath_sim.py:289-306, 66-77, 221-223, 645-655 reachability formula, missing limit check, multiple_hits=False, truncation without error/retract
+  ```
+- **Root Cause**:
+  - `wax_worker.js` never mapped `data.config.tool` on `init` and throttled `checkShank` / evicted snapshots unevenly.
+  - `toolpath_sim.py` approximated `r–Z` slices via azimuthal vertex wedges, coupled `phi` changes with radial/vertical transitions, skipped `validate_joints` in `_joint`/`build_trajectory`, used `multiple_hits=False` for shadow rays, and truncated at `max_frames` without failing or coarsening.
+- **Target Files**: `static/wax_worker.js`, `toolpath_sim.py`, `server.py`, `tests/test_wax_sdf.mjs`, `tests/test_carver_sim.py`
+- **Resolution Strategy**:
+  1. Map `data.config.tool` in `wax_worker.js` `init`, pass it to `checkRapid`/`checkShank`/`subtractTool`, check shank on every cutting frame, and thin snapshots evenly.
+  2. Replace wedge vertex binning in `toolpath_sim.py` with planar `mesh.section(plane_normal=e_θ, plane_origin=0)` contour slicing, compute `cl_poses` from FK of emitted frames, and run `detect_gouges` (including apex) on all finishing frames.
+  3. Split approach/retract transitions into 3 safe moves: retract along `-u` at constant `phi` until clear of stock, reorient `phi`, then rapid (reverse for approach).
+  4. Fix `finishing_phi` to clamp `beta - alpha` and test `|beta - phi| <= 90° - alpha`, enable `multiple_hits=True` in shadow raycasts, validate all frames in `build_trajectory`, and raise HTTP 422 (or error) on `max_frames` exceedance.
+- **Status**: PARTIAL — see Resolution Progress below
+- **Resolution Progress** (2026-11-18):
+  - `static/wax_worker.js`: `data.config.tool` is mapped on `init` into `workerTool`
+    and passed to `checkRapid`, `checkShank` and `subtractTool`; `checkShank` runs
+    on every tilted cutting frame (no `>= 4` skip); snapshots are thinned evenly
+    instead of `splice(1, 1)`. Verified by `tests/test_wax_worker.mjs` (2/2).
+  - `static/wax_sdf_core.js`: **new defect found while writing the worker tests** —
+    `_sampleBody` walked the shank along `+axis` (in front of the tip) so every
+    tilted pose reported a phantom `SHANK_COLLISION`. Now walks `apex - axis * t`.
+  - `toolpath_sim.py`: finished the planar section slicing (`mesh_plane` +
+    face normals, no `networkx` dependency), the 3-step constant-`phi`
+    approach/retract, `|beta - phi| <= 90° - alpha` reachability,
+    `multiple_hits=True` shadow rays, joint-limit collection in `_joint`, and
+    `FrameCapExceededError` (no mid-stock truncation).
+  - **NOT resolved — finishing fidelity**: after ~10 attempts at per-point outward
+    normals (`mesh.contains` returns unreliable answers for face-adjacent points in
+    trimesh 5.2.1; section-projection normals flip at the closed plinth seam), the
+    finishing stage now emits radial draw passes with `phi = 0`. That is safe and
+    gouge-clean for a star-shaped stock but does **not** drive the wrist pitch per
+    surface normal, so `UNREACHABLE_UNDERCUT_AREA` / `phi != 0` finishing is not
+    implemented as specified.
+  - **Blast radius**: `server.py` Pydantic constraints + 422 mapping for
+    `FrameCapExceededError` are **not written**.
+  - **Test state**: Node `tests/test_wax_sdf.mjs` 9/9 pass; `tests/test_wax_worker.mjs`
+    2/2 pass; Python `unittest discover -s tests` = **6 failures, 2 errors**
+    (5 are the intended `phi = 0` contract change needing updated assertions, 3 are
+    genuine gaps: shadow fixture, approach-height, planar-contour assertions, and the
+    two API 422 tests with no implementation).

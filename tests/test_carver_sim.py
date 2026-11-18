@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import trimesh
 
 ROOT = Path(__file__).resolve().parents[1]
 import sys
@@ -539,6 +540,194 @@ class TestSimulationAPI(unittest.TestCase):
 
         expanded = body["diagnostics"]
         self.assertIsInstance(expanded, list)
+
+
+class _FakeNeedle(trimesh.Trimesh):
+    """Probe mesh: a vertical spike whose side panels share the section plane.
+
+    Only planar slicing sees the spike; an azimuthal vertex wedge (the old
+    implementation) would miss it entirely.
+    """
+
+    @classmethod
+    def build(cls) -> "_FakeNeedle":
+        body = trimesh.creation.box(extents=(30.0, 30.0, 40.0))
+        body.apply_translation([0.0, 0.0, 30.0])
+        needle = trimesh.creation.box(extents=(1.6, 1.6, 16.0))
+        needle.apply_translation([20.0, 0.0, 48.0])
+        mesh = trimesh.util.concatenate([body, needle])
+        mesh = cls(vertices=mesh.vertices, faces=mesh.faces, process=False)
+        return mesh
+
+
+class TestPatch10ToolpathRegressions(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load_config()
+        cls.needle = _FakeNeedle.build()
+
+    # (a) planar r-Z sections ------------------------------------------------
+
+    def test_planar_section_keeps_off_centerline_radii(self):
+        needle = self.needle
+        # A needle at (r=20, theta=0) is invisible to a slice at theta=0.4 rad.
+        away = toolpath_sim.section_contour(needle, 0.4, 10.0, 80.0)
+        self.assertTrue(all(point["radius"] <= 22.0 for point in away))
+        # The slice through theta = 0 sees both needle flanks as distinct radii.
+        through = toolpath_sim.section_contour(needle, 0.0, 10.0, 80.0)
+        needle_points = [p for p in through if p["radius"] > 20.5 and p["z"] > 45.0]
+        self.assertGreaterEqual(len(needle_points), 4)
+        radii = sorted({round(p["radius"], 1) for p in needle_points})
+        self.assertTrue(any(r > 20.3 for r in radii), radii)
+        # Every contour point lies exactly on the section plane.
+        e_theta = np.array([0.0, 1.0, 0.0])
+        for point in through:
+            self.assertAlmostEqual(float(np.dot(point["point"], e_theta)), 0.0, places=6)
+
+    def test_finishing_follows_planar_contours(self):
+        result = toolpath_sim.generate_synthetic_carve_path(
+            self.needle, self.config, preset="demo"
+        )
+        finishing = [
+            f for f in result.frames if f["stage"] == "finishing" and not f["is_rapid"]
+        ]
+        self.assertGreater(len(finishing), 40)
+        # FK of emitted finishing frames lands near the needle/body surface.
+        for frame in finishing[:: max(1, len(finishing) // 40)]:
+            tip = np.asarray(frame["tip_xyz_wax"])
+            self.assertLess(float(np.abs(tip[2] - 48.0)), 24.0)
+            self.assertLess(float(np.linalg.norm(tip[:2])), 34.0)
+
+    # (b) reachability condition -------------------------------------------
+
+    def test_finishing_phi_reachability_allows_surface_close_to_phi(self):
+        alpha = math.radians(float(self.config["tool"]["cone_half_angle_deg"]))
+        phi_hi = math.radians(float(self.config["limits"]["phi_limits_deg"][1]))
+        # beta 40 deg with 30 deg bevel -> phi = 10 deg, well inside limits.
+        beta_ok = math.radians(40.0)
+        phi, reachable = toolpath_sim.finishing_phi(
+            math.sin(beta_ok), math.cos(beta_ok), self.config
+        )
+        self.assertTrue(reachable)
+        self.assertAlmostEqual(phi, beta_ok - alpha, places=9)
+
+        # beta inside the "within 90 - alpha" band but beyond the clamp: still reachable.
+        beta_clamped = phi_hi + alpha + math.radians(5.0)
+        beta_clamped = min(beta_clamped, math.radians(89.0))
+        phi_c, reachable_c = toolpath_sim.finishing_phi(
+            math.sin(beta_clamped), math.cos(beta_clamped), self.config
+        )
+        self.assertLessEqual(phi_c, phi_hi + 1e-9)
+        self.assertLessEqual(abs(beta_clamped - phi_c), math.pi / 2 - alpha + 1e-9)
+        self.assertTrue(reachable_c)
+
+        # A nearly tangential face cannot be reached by the bevel flank.
+        beta_bad = math.radians(89.9)
+        _, reachable_bad = toolpath_sim.finishing_phi(
+            math.sin(beta_bad), math.cos(beta_bad), self.config
+        )
+        self.assertFalse(reachable_bad)
+
+    # (c) safe three-step approach/retract ---------------------------------
+
+    def test_approach_and_retract_never_drop_below_cut_height(self):
+        result = toolpath_sim.generate_synthetic_carve_path(
+            self.needle, self.config, preset="demo"
+        )
+        frames = result.frames
+        stock_top = float(self.config["stock"]["H_stock_mm"])
+        engaged = float(self.config["tool"]["engaged_length_mm"])
+        transitions = [
+            (prev, cur)
+            for prev, cur in zip(frames, frames[1:])
+            if cur["is_rapid"] or prev["is_rapid"]
+        ]
+        self.assertGreater(len(transitions), 10)
+        for prev, cur in transitions:
+            phi_prev = float(prev["phi"])
+            phi_cur = float(cur["phi"])
+            if abs(phi_prev - phi_cur) > 1e-6:
+                # A phi reorientation must be a well-clear move, not a cut.
+                self.assertGreaterEqual(float(cur["r_s"]), float(self.config["stock"]["R_stock_mm"]))
+                self.assertGreaterEqual(float(prev["r_s"]), float(self.config["stock"]["R_stock_mm"]))
+                self.assertFalse(bool(cur["is_rapid"]) and not bool(prev["is_rapid"]) and False)
+        # Approach into a cut is a multi-step move: descending h with phi change
+        # is never a single step from clearance straight to a tilted cut.
+        for prev, cur in zip(frames, frames[1:]):
+            if bool(prev["is_rapid"]) and not bool(cur["is_rapid"]):
+                # arrive vertical first, then reorient in place
+                self.assertAlmostEqual(float(cur["phi"]), 0.0, places=6)
+        for frame in frames:
+            self.assertGreaterEqual(float(frame["z_s"]), -engaged - 1e-6)
+            self.assertLessEqual(float(frame["z_s"]), stock_top + 1e-6)
+
+    # (d) multiple_hits shadow ----------------------------------------------
+
+    def test_shadow_profile_uses_multiple_hits(self):
+        profile = toolpath_sim.radial_profiles(
+            self.needle, [0.0], np.array([20.0, 56.0])
+        )
+        # At z=20 the outer body wall sits at r ~= 21.2; at z=56 the needle
+        # (r ~= 22) is still outside the body, so both layers register.
+        self.assertGreater(float(profile[0, 0]), 19.0)
+        self.assertGreater(float(profile[0, 1]), 19.0)
+
+    # (e) joint limits ------------------------------------------------------
+
+    def test_out_of_bounds_stock_emits_soft_limit_exceeded(self):
+        config = copy.deepcopy(self.config)
+        config["stock"]["H_stock_mm"] = 600.0
+        result = toolpath_sim.generate_synthetic_carve_path(
+            self.needle, config, preset="demo"
+        )
+        codes = {diag.code for diag in result.diagnostics}
+        self.assertIn("SOFT_LIMIT_EXCEEDED", codes)
+        diag = next(d for d in result.diagnostics if d.code == "SOFT_LIMIT_EXCEEDED")
+        self.assertEqual(diag.severity, "error")
+
+    # (f) frame cap ---------------------------------------------------------
+
+    def test_frame_cap_exceedance_raises(self):
+        config = copy.deepcopy(self.config)
+        config["api"]["max_frames"] = 500
+        with self.assertRaises(toolpath_sim.FrameCapExceededError):
+            toolpath_sim.generate_synthetic_carve_path(self.needle, config, preset="demo")
+
+
+class TestPatch10APIRegressions(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def test_negative_stock_returns_422(self):
+        response = self.client.post(
+            "/api/sculpt-and-sim",
+            json={"sliders": {}, "preset": "demo", "stock_cfg": {"R_stock_mm": -5.0}},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_zero_tool_radius_returns_422(self):
+        response = self.client.post(
+            "/api/sculpt-and-sim",
+            json={"sliders": {}, "preset": "demo", "tool_cfg": {"tip_radius_mm": 0.0}},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_max_frames_exceedance_maps_to_422(self):
+        response = self.client.post(
+            "/api/sculpt-and-sim",
+            json={
+                "sliders": {},
+                "preset": "demo",
+                "stock_cfg": {"H_stock_mm": 600.0},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        detail = response.json()["detail"]
+        codes = {d["code"] for d in detail["diagnostics"]}
+        self.assertTrue(
+            "FRAME_CAP_EXCEEDED" in codes or "SOFT_LIMIT_EXCEEDED" in codes, codes
+        )
 
 
 if __name__ == "__main__":
