@@ -1,0 +1,77 @@
+{
+  "mesh": "base_head.stl",
+  "facing": "+X at theta=0",
+  "stock_frame": "mm, +Z up, origin at platter top center",
+  "facial_features": {
+    "nose": {
+      "centers": [
+        [
+          23.0,
+          0.0,
+          50.0
+        ]
+      ],
+      "radius_mm": 9.0,
+      "max_displacement_mm": 5.0,
+      "label": "Nose bridge and tip"
+    },
+    "brow": {
+      "centers": [
+        [
+          21.0,
+          0.0,
+          61.0
+        ]
+      ],
+      "radius_mm": 12.5,
+      "max_displacement_mm": 3.5,
+      "label": "Brow ridge"
+    },
+    "cheeks": {
+      "centers": [
+        [
+          18.0,
+          14.0,
+          46.0
+        ],
+        [
+          18.0,
+          -14.0,
+          46.0
+        ]
+      ],
+      "radius_mm": 11.0,
+      "max_displacement_mm": 3.0,
+      "label": "Cheekbones"
+    },
+    "jaw": {
+      "centers": [
+        [
+          15.0,
+          11.0,
+          31.0
+        ],
+        [
+          15.0,
+          -11.0,
+          31.0
+        ]
+      ],
+      "radius_mm": 10.0,
+      "max_displacement_mm": 2.5,
+      "label": "Jaw line"
+    },
+    "chin": {
+      "centers": [
+        [
+          18.0,
+          0.0,
+          22.0
+        ]
+      ],
+      "radius_mm": 9.0,
+      "max_displacement_mm": 4.5,
+      "label": "Chin"
+    }
+  }
+}

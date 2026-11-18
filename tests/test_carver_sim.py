@@ -1,0 +1,545 @@
+"""Automated tests for the 4-DOF thermal wax carver simulation MVP.
+
+Covers the Python single-source-of-truth for kinematics, facial sculpting,
+synthetic toolpaths, and the columnar FastAPI payload contract.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import json
+import math
+import os
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+import sys
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import kinematics  # noqa: E402
+import face_sculpt  # noqa: E402
+import toolpath_sim  # noqa: E402
+from server import app  # noqa: E402
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+CONFIG_PATH = ROOT / "machine_config.json"
+HW_FIXTURE = ROOT / "tests" / "fixtures" / "hardware_poses.json"
+
+
+def load_config(**overrides):
+    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    for dotted, value in overrides.items():
+        node = cfg
+        parts = dotted.split(".")
+        for part in parts[:-1]:
+            node = node[part]
+        node[parts[-1]] = value
+    return cfg
+
+
+def fk_frame(r, theta, h, phi, config):
+    """Build the flat frame dict consumed by the timing helpers."""
+    fk = kinematics.forward_kinematics(r, theta, h, phi, config)
+    return {
+        "r": r,
+        "theta": theta,
+        "h": h,
+        "phi": phi,
+        "r_s": fk.r_s,
+        "theta_s": fk.theta_s,
+        "z_s": fk.z_s,
+        "tip_xyz_wax": fk.tip_xyz_wax,
+        "tool_axis_wax": fk.tool_axis_wax,
+    }
+
+
+def engaged_cone_displacement(a, b, length_mm, samples=17):
+    """Independent dense-sample check of the full engaged cone sweep."""
+    apex_a = np.asarray(a["tip_xyz_wax"], dtype=float)
+    apex_b = np.asarray(b["tip_xyz_wax"], dtype=float)
+    axis_a = np.asarray(a["tool_axis_wax"], dtype=float)
+    axis_b = np.asarray(b["tool_axis_wax"], dtype=float)
+    worst = 0.0
+    for s in np.linspace(0.0, length_mm, samples):
+        pa = apex_a - axis_a * s
+        pb = apex_b - axis_b * s
+        worst = max(worst, float(np.linalg.norm(pb - pa)))
+    return worst
+
+
+class TestConfigAndForwardKinematics(unittest.TestCase):
+    def setUp(self):
+        self.config = load_config()
+        self.x = self.config["arm_radial_offset_mm"]
+        self.h2 = self.config["arm_to_pivot_z_mm"]
+        self.p = self.config["pivot_to_tip_mm"]
+
+    def test_config_declares_datums_tool_and_limits(self):
+        self.assertGreater(self.p, 0.0)
+        self.assertGreater(self.x, 0.0)
+        self.assertGreater(self.h2, 0.0)
+        self.assertEqual(self.config["stock"]["R_stock_mm"], 40.0)
+        self.assertEqual(self.config["stock"]["H_stock_mm"], 120.0)
+        self.assertEqual(self.config["stock"]["z_plinth_mm"], 10.0)
+        self.assertEqual(self.config["stock"]["finish_allowance_mm"], 1.5)
+        self.assertEqual(self.config["singularity"]["r_s_min_mm"], 2.0)
+        self.assertEqual(self.config["singularity"]["theta_dot_warn_rad_s"], 3.0)
+        for key in (
+            "tip_radius_mm",
+            "cone_half_angle_deg",
+            "engaged_length_mm",
+            "melt_kerf_mm",
+            "shank_radius_mm",
+            "shank_length_mm",
+        ):
+            self.assertIn(key, self.config["tool"])
+
+    def test_fk_phi_zero(self):
+        r, theta, h, phi = 60.0, 0.30, 80.0, 0.0
+        fk = kinematics.forward_kinematics(r, theta, h, phi, self.config)
+        self.assertAlmostEqual(fk.theta_s, theta, places=8)
+        self.assertAlmostEqual(fk.r_s, r - self.x, places=8)
+        self.assertAlmostEqual(fk.z_s, h - self.p - self.h2, places=8)
+        tip = np.asarray(fk.tip_xyz_wax)
+        np.testing.assert_allclose(
+            tip,
+            [fk.r_s * math.cos(theta), fk.r_s * math.sin(theta), fk.z_s],
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(
+            np.asarray(fk.tool_axis_wax), [0.0, 0.0, -1.0], atol=1e-9
+        )
+
+    def test_fk_phi_ninety_degrees(self):
+        r, theta, h = 60.0, 0.4, 80.0
+        fk = kinematics.forward_kinematics(r, theta, h, math.pi / 2, self.config)
+        self.assertAlmostEqual(fk.r_s, r - self.x - self.p, places=8)
+        self.assertAlmostEqual(fk.z_s, h - self.h2, places=8)
+        # +phi tilts the tip inward (decreasing r_s).
+        lower = kinematics.forward_kinematics(r, theta, h, 0.2, self.config)
+        higher = kinematics.forward_kinematics(r, theta, h, 0.8, self.config)
+        self.assertLess(higher.r_s, lower.r_s)
+
+    def test_fk_arbitrary_phi_vectors(self):
+        r, theta, h, phi = 55.0, -0.9, 72.0, 0.37
+        fk = kinematics.forward_kinematics(r, theta, h, phi, self.config)
+        self.assertAlmostEqual(
+            fk.r_s, r - self.x - self.p * math.sin(phi), places=8
+        )
+        self.assertAlmostEqual(
+            fk.z_s, h - self.p * math.cos(phi) - self.h2, places=8
+        )
+        axis = np.asarray(fk.tool_axis_wax)
+        expected = np.asarray(
+            [
+                -math.sin(phi) * math.cos(theta),
+                -math.sin(phi) * math.sin(theta),
+                -math.cos(phi),
+            ]
+        )
+        np.testing.assert_allclose(axis, expected, atol=1e-9)
+        self.assertAlmostEqual(float(np.linalg.norm(axis)), 1.0, places=9)
+
+    @unittest.skipUnless(
+        HW_FIXTURE.exists(),
+        "pending physical hardware pose measurements (fixture not recorded yet)",
+    )
+    def test_hardware_calibration_fixture_within_one_mm(self):
+        fixture = json.loads(HW_FIXTURE.read_text(encoding="utf-8"))
+        for pose in fixture["poses"]:
+            fk = kinematics.forward_kinematics(
+                pose["r"], pose["theta"], pose["h"], math.radians(pose["phi_deg"]),
+                self.config,
+            )
+            measured = pose["measured"]
+            self.assertAlmostEqual(fk.r_s, measured["r_s"], delta=1.0)
+            self.assertAlmostEqual(fk.theta_s, measured["theta_s"], delta=1.0)
+            self.assertAlmostEqual(fk.z_s, measured["z_s"], delta=1.0)
+
+
+class TestInverseKinematicsAndLimits(unittest.TestCase):
+    def setUp(self):
+        self.config = load_config()
+
+    def test_ik_round_trip_with_phi_policy(self):
+        theta = 0.5
+        phi = 0.31
+        r, h = 64.0, 96.0
+        fk = kinematics.forward_kinematics(r, theta, h, phi, self.config)
+        normal = (
+            math.sin(phi) * math.cos(theta),
+            math.sin(phi) * math.sin(theta),
+            math.cos(phi),
+        )
+        ik = kinematics.inverse_kinematics_with_policy(
+            (fk.r_s, fk.theta_s, fk.z_s), normal, self.config
+        )
+        self.assertTrue(ik.ok, ik.diagnostics)
+        self.assertAlmostEqual(ik.phi, phi, places=6)
+        rt = kinematics.forward_kinematics(ik.r, ik.theta, ik.h, ik.phi, self.config)
+        self.assertAlmostEqual(rt.r_s, fk.r_s, places=6)
+        self.assertAlmostEqual(rt.theta_s, fk.theta_s, places=6)
+        self.assertAlmostEqual(rt.z_s, fk.z_s, places=6)
+
+    def test_phi_policy_clamped_is_informational(self):
+        config = copy.deepcopy(self.config)
+        config["limits"]["phi_limits_deg"] = [-45.0, 60.0]
+        phi_ideal = math.radians(80.0)
+        normal = (math.sin(phi_ideal), 0.0, math.cos(phi_ideal))
+        ik = kinematics.inverse_kinematics_with_policy(
+            (20.0, 0.0, 40.0), normal, config
+        )
+        codes = {d.code for d in ik.diagnostics}
+        self.assertIn("PHI_POLICY_CLAMPED", codes)
+        self.assertAlmostEqual(ik.phi, math.radians(60.0), places=6)
+        self.assertTrue(ik.ok)
+        clamped = next(d for d in ik.diagnostics if d.code == "PHI_POLICY_CLAMPED")
+        self.assertEqual(clamped.severity, "info")
+        # Clamping the policy must never silently clamp a joint past soft limits.
+        self.assertNotIn("SOFT_LIMIT_EXCEEDED", codes)
+
+    def test_tangential_normal_falls_back_to_zero_phi(self):
+        theta = 0.8
+        normal = (-math.sin(theta), math.cos(theta), 0.0)
+        ik = kinematics.inverse_kinematics_with_policy(
+            (18.0, theta, 40.0), normal, self.config
+        )
+        self.assertTrue(ik.ok)
+        self.assertAlmostEqual(ik.phi, 0.0, places=9)
+        rt = kinematics.forward_kinematics(ik.r, ik.theta, ik.h, ik.phi, self.config)
+        self.assertAlmostEqual(rt.r_s, 18.0, places=6)
+        self.assertAlmostEqual(rt.z_s, 40.0, places=6)
+
+    def test_out_of_bounds_joint_is_rejected_with_axis(self):
+        ik = kinematics.inverse_kinematics_with_policy(
+            (100.0, 0.0, 40.0), None, self.config
+        )
+        self.assertFalse(ik.ok)
+        err = next(d for d in ik.diagnostics if d.code == "SOFT_LIMIT_EXCEEDED")
+        self.assertEqual(err.severity, "error")
+        self.assertEqual(err.axis, "r")
+        self.assertGreater(err.value, self.config["limits"]["r_limits_mm"][1])
+
+    def test_height_limit_is_enforced(self):
+        ik = kinematics.inverse_kinematics_with_policy(
+            (10.0, 0.0, 400.0), None, self.config
+        )
+        self.assertFalse(ik.ok)
+        codes = {d.code for d in ik.diagnostics}
+        self.assertIn("SOFT_LIMIT_EXCEEDED", codes)
+
+
+class TestTipSpeedTimingAndSingularity(unittest.TestCase):
+    def setUp(self):
+        self.config = load_config()
+        self.x = self.config["arm_radial_offset_mm"]
+        self.p = self.config["pivot_to_tip_mm"]
+        self.h2 = self.config["arm_to_pivot_z_mm"]
+        self.feed = self.config["feeds"]["feed_cut_mm_s"]
+
+    def test_pure_turntable_rotation_reports_relative_tip_speed(self):
+        rs = 30.0
+        r = rs + self.x
+        h = 50.0 + self.p + self.h2
+        a = fk_frame(r, 0.0, h, 0.0, self.config)
+        b = fk_frame(r, 0.1, h, 0.0, self.config)
+        dt, v_tip = kinematics.segment_timing(a, b, False, self.config)
+        self.assertAlmostEqual(dt, rs * 0.1 / self.feed, places=6)
+        self.assertAlmostEqual(v_tip, rs * 0.1 / dt, places=6)
+        self.assertAlmostEqual(v_tip, self.feed, places=6)
+
+    def test_combined_motion_uses_full_relative_tip_speed(self):
+        a = fk_frame(58.0, 0.0, 95.0, 0.0, self.config)
+        b = fk_frame(61.5, 0.12, 97.5, 0.22, self.config)
+        dt, v_tip = kinematics.segment_timing(a, b, False, self.config)
+        expected = math.sqrt(
+            ((b["r_s"] - a["r_s"]) / dt) ** 2
+            + (0.5 * (a["r_s"] + b["r_s"]) * (b["theta_s"] - a["theta_s"]) / dt) ** 2
+            + ((b["z_s"] - a["z_s"]) / dt) ** 2
+        )
+        self.assertAlmostEqual(v_tip, expected, places=6)
+        self.assertGreater(v_tip, (b["theta_s"] - a["theta_s"]) * 0.0)  # nonzero
+
+    def test_timing_respects_joint_velocity_limits(self):
+        a = fk_frame(70.0, 0.0, 90.0, 0.0, self.config)
+        b = fk_frame(70.0, 2.0, 90.0, 0.0, self.config)
+        rapid = True
+        dt, _ = kinematics.segment_timing(a, b, rapid, self.config)
+        vmax = self.config["v_max"]["theta_rad_s"]
+        self.assertLessEqual(2.0 / dt, vmax + 1e-9)
+
+    def test_near_axis_fast_rotation_emits_singularity(self):
+        config = copy.deepcopy(self.config)
+        r = 1.0 + config["arm_radial_offset_mm"]
+        h = 40.0 + config["pivot_to_tip_mm"] + config["arm_to_pivot_z_mm"]
+        joints = [
+            {"r": r, "theta": 0.0, "h": h, "phi": 0.0},
+            {"r": r, "theta": 0.5, "h": h, "phi": 0.0},
+            {"r": r, "theta": 1.0, "h": h, "phi": 0.0},
+        ]
+        frames, diagnostics = kinematics.build_trajectory(joints, [False, False, False], config)
+        self.assertEqual(len(frames), 3)
+        codes = {d.code for d in diagnostics}
+        self.assertIn("SINGULARITY_HIGH_THETA_DOT", codes)
+        for i in range(1, len(frames)):
+            self.assertAlmostEqual(
+                frames[i]["theta_s"], frames[i]["theta"], places=9
+            )
+        # timestamps strictly increase
+        self.assertGreater(frames[1]["t"], 0.0)
+        self.assertLess(frames[0]["t"], frames[1]["t"])
+
+    def test_unwrapped_theta_has_no_wrap_discontinuity(self):
+        r = 20.0 + self.config["arm_radial_offset_mm"]
+        h = 60.0 + self.p + self.h2
+        joints = [
+            {"r": r, "theta": math.radians(deg), "h": h, "phi": 0.0}
+            for deg in (0.0, 90.0, 180.0, 270.0, 360.0, 450.0)
+        ]
+        frames, _ = kinematics.build_trajectory(joints, [False] * 6, self.config)
+        self.assertAlmostEqual(frames[-1]["theta_s"], 2.5 * math.pi, places=6)
+        for prev, cur in zip(frames, frames[1:]):
+            self.assertGreater(cur["theta_s"], prev["theta_s"])
+
+
+class TestFacialSculpting(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load_config()
+        cls.base = face_sculpt.load_base_head(cls.config)
+        cls.landmarks = face_sculpt.load_landmarks(cls.config)
+
+    def test_base_head_is_watertight_and_seated(self):
+        mesh = self.base
+        self.assertTrue(mesh.is_watertight)
+        self.assertTrue(mesh.is_winding_consistent)
+        self.assertGreater(mesh.volume, 0.0)
+        z_plinth = self.config["stock"]["z_plinth_mm"]
+        self.assertAlmostEqual(float(mesh.bounds[0][2]), z_plinth, delta=0.75)
+
+    def test_landmarks_cover_all_facial_features(self):
+        for name in ("nose", "brow", "cheeks", "jaw", "chin"):
+            self.assertIn(name, self.landmarks)
+            self.assertGreater(self.landmarks[name]["max_displacement_mm"], 0.0)
+
+    def test_positive_sculpt_preserves_watertightness_and_bounds(self):
+        params = {"nose": 1.0, "brow": 0.6, "cheeks": 0.4, "jaw": 0.3, "chin": 0.8}
+        result = face_sculpt.apply_facial_modifications(self.base, params, self.config)
+        self.assertEqual(result.diagnostics, [])
+        mesh = result.mesh
+        self.assertIsNotNone(mesh)
+        self.assertTrue(mesh.is_watertight)
+        self.assertTrue(mesh.is_winding_consistent)
+        self.assertGreater(mesh.volume, 0.0)
+        self.assertTrue(result.self_intersection_free)
+        max_r = float(np.max(np.linalg.norm(mesh.vertices[:, :2], axis=1)))
+        allowed_r = (
+            self.config["stock"]["R_stock_mm"]
+            - self.config["stock"]["finish_allowance_mm"]
+        )
+        self.assertLessEqual(max_r, allowed_r + 1e-6)
+        self.assertGreaterEqual(float(mesh.bounds[0][2]), -1e-6)
+        self.assertLessEqual(
+            float(mesh.bounds[1][2]), self.config["stock"]["H_stock_mm"] + 1e-6
+        )
+        moved = np.linalg.norm(mesh.vertices - self.base.vertices, axis=1)
+        self.assertGreater(float(np.max(moved)), 0.5)
+
+    def test_sculpting_is_deterministic_and_preserves_topology(self):
+        params = {"nose": 0.7, "chin": 0.5}
+        a = face_sculpt.apply_facial_modifications(self.base, params, self.config)
+        b = face_sculpt.apply_facial_modifications(self.base, params, self.config)
+        np.testing.assert_allclose(a.mesh.vertices, b.mesh.vertices, atol=0.0)
+        np.testing.assert_array_equal(a.mesh.faces, self.base.faces)
+
+    def test_out_of_stock_deformation_reports_error(self):
+        config = copy.deepcopy(self.config)
+        config["stock"]["R_stock_mm"] = 24.0
+        result = face_sculpt.apply_facial_modifications(
+            self.base, {"nose": 1.0}, config
+        )
+        codes = {d.code for d in result.diagnostics}
+        self.assertIn("STOCK_BOUNDS_EXCEEDED", codes)
+        err = next(d for d in result.diagnostics if d.code == "STOCK_BOUNDS_EXCEEDED")
+        self.assertEqual(err.severity, "error")
+
+
+class TestSyntheticToolpaths(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load_config()
+        cls.mesh = face_sculpt.load_base_head(cls.config)
+        cls.sculpt = face_sculpt.apply_facial_modifications(
+            cls.mesh, {"nose": 1.0, "chin": 0.6, "brow": 0.4}, cls.config
+        ).mesh
+        cls.result = toolpath_sim.generate_synthetic_carve_path(
+            cls.sculpt, cls.config, preset="demo"
+        )
+
+    def test_frames_are_columnar_and_well_formed(self):
+        frames = self.result.frames
+        self.assertGreater(len(frames), 200)
+        required = {
+            "t", "r", "theta", "h", "phi", "r_s", "theta_s", "z_s",
+            "v_tip", "is_rapid", "tip_xyz_wax", "tool_axis_wax", "stage",
+        }
+        self.assertTrue(required.issubset(frames[0].keys()))
+        for prev, cur in zip(frames, frames[1:]):
+            self.assertGreaterEqual(cur["t"], prev["t"] - 1e-12)
+            self.assertGreaterEqual(cur["v_tip"], 0.0)
+
+    def test_roughing_is_shadow_clipped_and_phi_zero(self):
+        frames = [f for f in self.result.frames if f["stage"] == "roughing" and not f["is_rapid"]]
+        self.assertGreater(len(frames), 50)
+        for f in frames:
+            self.assertAlmostEqual(math.degrees(abs(f["phi"])), 0.0, places=6)
+        # Independent shadow check on a deterministic subset of poses.
+        stock = self.config["stock"]
+        allowance = stock["finish_allowance_mm"]
+        for f in frames[:: max(1, len(frames) // 12)]:
+            theta = f["theta_s"]
+            z = f["z_s"]
+            e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
+            worst = 0.0
+            for z_probe in np.linspace(z, stock["H_stock_mm"], 7):
+                origin = np.array([[0.0, 0.0, z_probe]])
+                hits, _, _ = self.mesh.ray.intersects_location(
+                    origin, e_r[None, :], multiple_hits=True
+                )
+                if len(hits):
+                    worst = max(worst, float(np.max(hits[:, 0] * e_r[0] + hits[:, 1] * e_r[1])))
+            required = min(stock["R_stock_mm"], worst + allowance)
+            self.assertGreaterEqual(f["r_s"], required - 1e-3)
+
+    def test_rapids_retract_outside_stock(self):
+        clearance = self.config["stock"]["retract_clearance_mm"]
+        limit = self.config["stock"]["R_stock_mm"] + clearance
+        rapids = [f for f in self.result.frames if f["is_rapid"]]
+        self.assertGreater(len(rapids), 0)
+        for f in rapids:
+            self.assertGreaterEqual(f["r_s"], limit - 1e-6)
+
+    def test_finishing_uses_phi_and_reports_unreachable_undercuts(self):
+        finishing = [f for f in self.result.frames if f["stage"] == "finishing" and not f["is_rapid"]]
+        self.assertGreater(len(finishing), 20)
+        self.assertTrue(any(abs(f["phi"]) > 0.05 for f in finishing))
+        codes = {d.code for d in self.result.diagnostics}
+        self.assertIn("UNREACHABLE_UNDERCUT_AREA", codes)
+        diag = next(d for d in self.result.diagnostics if d.code == "UNREACHABLE_UNDERCUT_AREA")
+        self.assertEqual(diag.severity, "warning")
+        self.assertGreater(diag.value, 0.0)
+
+    def test_engaged_length_resampling_bound(self):
+        tip_width = self.config["tool"]["tip_width_mm"]
+        engaged = self.config["tool"]["engaged_length_mm"]
+        limit = 0.5 * tip_width
+        frames = self.result.frames
+        worst = 0.0
+        for prev, cur in zip(frames, frames[1:]):
+            if cur["is_rapid"]:
+                continue
+            worst = max(worst, engaged_cone_displacement(prev, cur, engaged))
+        self.assertLessEqual(worst, limit + 1e-6)
+        self.assertLess(worst, 1.0)
+
+    def test_unwrapped_theta_is_continuous_through_generator(self):
+        thetas = [f["theta_s"] for f in self.result.frames]
+        deltas = np.diff(thetas)
+        self.assertGreaterEqual(float(np.min(deltas)), -0.5)
+        self.assertLessEqual(float(np.max(deltas)), 5.0)
+        self.assertGreaterEqual(thetas[-1], thetas[0])
+
+    def test_gouge_detection_flags_tool_inside_target(self):
+        # Construct a deliberately bad CL pose that buries the tool in the target.
+        cc = np.array([20.0, 0.0, 50.0])
+        normal = np.array([1.0, 0.0, 0.0])
+        bad_tip = cc - normal * 4.0
+        pose = {
+            "tip_xyz_wax": tuple(float(v) for v in bad_tip),
+            "tool_axis_wax": (1.0, 0.0, 0.0),
+        }
+        diags = toolpath_sim.detect_gouges(self.mesh, [pose], self.config)
+        self.assertTrue(any(d.code == "GOUGE" for d in diags))
+
+    def test_standard_preset_produces_denser_path(self):
+        standard = toolpath_sim.generate_synthetic_carve_path(
+            self.sculpt, self.config, preset="standard"
+        )
+        self.assertGreater(len(standard.frames), len(self.result.frames))
+        self.assertLessEqual(
+            len(standard.frames), self.config["api"]["max_frames"]
+        )
+
+
+class TestSimulationAPI(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def test_health(self):
+        response = self.client.get("/api/health")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertIn("version", body)
+
+    def test_sculpt_and_sim_columnar_contract(self):
+        response = self.client.post(
+            "/api/sculpt-and-sim",
+            json={
+                "sliders": {"nose": 0.8, "brow": 0.4},
+                "preset": "demo",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["preset"], "demo")
+        self.assertIn("config", body)
+        self.assertIn("target_mesh", body)
+        self.assertIn("trajectory", body)
+        self.assertIn("diagnostics", body)
+
+        mesh_payload = body["target_mesh"]
+        vertices = np.frombuffer(
+            base64.b64decode(mesh_payload["vertices_b64"]), dtype=np.float32
+        )
+        faces = np.frombuffer(
+            base64.b64decode(mesh_payload["faces_b64"]), dtype=np.uint32
+        )
+        self.assertEqual(vertices.shape[0], mesh_payload["vertex_count"] * 3)
+        self.assertEqual(faces.shape[0], mesh_payload["face_count"] * 3)
+        self.assertGreater(mesh_payload["face_count"], 100)
+
+        traj = body["trajectory"]
+        self.assertLessEqual(traj["frame_count"], 250_000)
+        self.assertGreater(traj["frame_count"], 100)
+        columns = traj["columns"]
+        for name in (
+            "t", "r", "theta", "h", "phi", "r_s", "theta_s", "z_s",
+            "v_tip", "tip_xyz_wax", "tool_axis_wax",
+        ):
+            col = columns[name]
+            raw = np.frombuffer(base64.b64decode(col["b64"]), dtype=np.float32)
+            expected = traj["frame_count"] * (3 if name in ("tip_xyz_wax", "tool_axis_wax") else 1)
+            self.assertEqual(raw.shape[0], expected, name)
+            self.assertEqual(col["dtype"], "float32")
+        rapid = np.frombuffer(
+            base64.b64decode(columns["is_rapid"]["b64"]), dtype=np.uint8
+        )
+        self.assertEqual(rapid.shape[0], traj["frame_count"])
+        self.assertEqual(columns["is_rapid"]["dtype"], "uint8")
+        self.assertIn(rapid.max(), (0, 1))
+
+        expanded = body["diagnostics"]
+        self.assertIsInstance(expanded, list)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

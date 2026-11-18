@@ -24,3 +24,9 @@ output/patch*_det_*/
 # Workstation test reports and logs (see TESTING.md)
 reports/
 logs/
+
+# Node
+node_modules/
+
+# Local UI smoke artifacts
+.tmp-*
