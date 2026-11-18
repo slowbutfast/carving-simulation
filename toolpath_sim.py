@@ -1155,6 +1155,16 @@ def build_finishing(
     diagnostics: DiagnosticCollector,
     theta_start: float,
 ) -> tuple[list[dict[str, float]], list[bool], list[str], int, float]:
+    """Undercut-capable finishing, composed from the unit-tested helpers.
+
+    Per slice: :func:`section_polylines` -> batch ``finishing_phi`` +
+    :func:`cutter_location` + FK axis -> one :func:`tool_body_penetrates`
+    pre-filter -> split each polyline into runs of *consecutive accepted*
+    points.  A rejected point ends a run and is never bridged: every run gets
+    its own :func:`entry_moves`, its cuts and its :func:`exit_moves`.
+    Rejected points are counted into ``UNREACHABLE_UNDERCUT_AREA``.
+    """
+
     stock = config["stock"]
     radius_stock = float(stock["R_stock_mm"])
     z_plinth = float(stock["z_plinth_mm"])
@@ -1162,126 +1172,134 @@ def build_finishing(
     clearance = float(params["rapid_clearance_mm"])
     theta_grid = _theta_grid(float(params["theta_step_deg"]))
     theta_step = TAU / len(theta_grid)
-    offset = _melt_kerf_offset(config)
     clearance_target = radius_stock + clearance
     safe_zs = height_stock + clearance
+    # The polyline step honours the preset (never the azimuth grid).
+    step = float(params["finish_z_step_mm"])
 
     joints: list[dict[str, float]] = []
     rapid: list[bool] = []
     stages: list[str] = []
     total_points = 0
     unreachable_points = 0
-    last_theta = float(theta_start)
 
-    joints.append(_joint(clearance_target, last_theta, safe_zs, 0.0, config, diagnostics))
+    def link(move: Mapping[str, float]) -> None:
+        joints.append(dict(move))
+        rapid.append(False)
+        stages.append("finishing_link")
+
+    joints.append(_joint(clearance_target, float(theta_start), safe_zs, 0.0, config, diagnostics))
     rapid.append(True)
     stages.append("finishing")
 
     for slice_index in range(len(theta_grid)):
         theta_emit = theta_start + slice_index * theta_step
         current_theta = theta_emit % TAU
-        # ``radius >= 0`` keeps only this azimuth; the far half of the plane is
-        # theta + pi and is reached on another slice.
-        contour = section_contour(mesh, current_theta, z_plinth, height_stock)
-        if not contour:
+        polylines = section_polylines(mesh, current_theta, z_plinth, height_stock, step)
+        if not polylines:
             continue
-        if slice_index % 2 == 1:
-            contour = list(reversed(contour))
-        e_r = np.array([math.cos(current_theta), math.sin(current_theta), 0.0])
-        unit_z = np.array([0.0, 0.0, 1.0])
 
-        cut_points: list[dict[str, Any]] = []
-        for point in contour:
-            if point["z"] < z_plinth + 1.5:
-                # Plinth foot is seating geometry; finishing starts above it.
-                continue
-            total_points += 1
-            n_r_value = float(point["n_r"])
-            n_z_value = float(point["n_z"])
-            if n_z_value < -0.2:
-                # The pointed conical tip cannot finish a surface that faces
-                # down: reaching it would need stock removal below the datum.
-                # Report it rather than driving the flank through the body.
-                unreachable_points += 1
-                continue
-            phi, reachable = finishing_phi(n_r_value, n_z_value, config)
-            if not reachable:
-                unreachable_points += 1
-                continue
-            # Contact-Point -> Tip-Apex standoff along the local normal.  A
-            # purely radial offset is used for near-vertical flanks because the
-            # apex must sit outboard of the wall, not above it.
-            if abs(n_z_value) > abs(n_r_value):
-                normal = unit_z * n_z_value
-            else:
-                normal = e_r * (1.0 if n_r_value >= 0.0 else -1.0)
-            apex = np.asarray(point["point"], dtype=np.float64) + normal * offset
-            if apex[2] < z_plinth - EPS:
-                unreachable_points += 1
-                continue
-            # Conservative flank clearance: the pitched cone body must clear the
-            # material directly below the apex, otherwise a cut into a steeper
-            # flank below buries the flank further up.
-            if _flank_clearance(mesh, apex, normal, config) <= 0.0:
-                unreachable_points += 1
-                continue
-            cut_points.append(
-                {
-                    "rs": float(math.hypot(apex[0], apex[1])),
-                    "zs": float(apex[2]),
-                    "theta": theta_emit,
-                    "phi": phi,
-                }
+        # 1. Every point: pitch, cutter location, FK axis.  Reachability is
+        #    decided per point here; the body check is batched in step 2.
+        pose_of: dict[int, dict[str, Any]] = {}
+        flat: list[dict[str, Any]] = []
+        for line in polylines:
+            for point in line:
+                total_points += 1
+                n_r = float(point["n_r"])
+                n_z = float(point["n_z"])
+                phi, reachable = finishing_phi(n_r, n_z, config)
+                item: dict[str, Any] = {"point": point, "phi": phi, "accepted": reachable}
+                if reachable:
+                    apex = cutter_location(point["point"], n_r, n_z, current_theta, config)
+                    if float(apex[2]) < z_plinth - EPS:
+                        item["accepted"] = False
+                    else:
+                        item["apex"] = apex
+                        item["axis"] = np.array(
+                            [
+                                -math.sin(phi) * math.cos(current_theta),
+                                -math.sin(phi) * math.sin(current_theta),
+                                -math.cos(phi),
+                            ]
+                        )
+                        item["rs"] = float(math.hypot(apex[0], apex[1]))
+                        item["zs"] = float(apex[2])
+                pose_of[id(point)] = item
+                flat.append(item)
+
+        # 2. One batched body check for the whole slice: the same geometry the
+        #    GOUGE diagnostic uses, so pre-filter and report cannot disagree.
+        accepted = [item for item in flat if item["accepted"]]
+        if accepted:
+            penetrated = np.asarray(
+                tool_body_penetrates(
+                    mesh,
+                    [item["apex"] for item in accepted],
+                    [item["axis"] for item in accepted],
+                    config,
+                ),
+                dtype=bool,
             )
-        if not cut_points:
-            continue
+            for item, blocked in zip(accepted, penetrated):
+                if blocked:
+                    item["accepted"] = False
+        unreachable_points += sum(1 for item in flat if not item["accepted"])
 
-        first = cut_points[0]
-        joints.append(_joint(clearance_target, first["theta"], safe_zs, 0.0, config, diagnostics))
+        # 3. Runs of consecutive accepted points, per polyline.  A rejected
+        #    point ends a run; runs are never bridged by a straight cut.
+        for line in polylines:
+            runs: list[list[dict[str, Any]]] = []
+            current: list[dict[str, Any]] = []
+            for point in line:
+                item = pose_of[id(point)]
+                if not item["accepted"]:
+                    if current:
+                        runs.append(current)
+                        current = []
+                    continue
+                current.append(item)
+            if current:
+                runs.append(current)
+
+            for run in runs:
+                first = run[0]
+                entry = entry_moves(
+                    {"theta": theta_emit, "rs": first["rs"], "zs": first["zs"], "phi": first["phi"]},
+                    mesh,
+                    config,
+                    clearance_target,
+                    diagnostics,
+                )
+                if not entry:
+                    unreachable_points += len(run)
+                    continue
+                for move in entry:
+                    link(move)
+                for item in run:
+                    joints.append(
+                        _joint(item["rs"], theta_emit, item["zs"], item["phi"], config, diagnostics)
+                    )
+                    rapid.append(False)
+                    stages.append("finishing")
+                last = run[-1]
+                exit_ = exit_moves(
+                    last["apex"], last["phi"], theta_emit, mesh, config, clearance_target, diagnostics
+                )
+                if not exit_:
+                    # The run cannot be left safely; drop its end point (counted
+                    # unreachable) rather than driving the body back through.
+                    joints.pop()
+                    rapid.pop()
+                    stages.pop()
+                    unreachable_points += 1
+                    continue
+                for move in exit_:
+                    link(move)
+
+        joints.append(_joint(clearance_target, theta_emit, safe_zs, 0.0, config, diagnostics))
         rapid.append(True)
         stages.append("finishing")
-        for move in safe_approach_moves(
-            first["theta"],
-            first["rs"],
-            first["zs"],
-            first["phi"],
-            config,
-            clearance_target,
-            diagnostics,
-        ):
-            joints.append(move)
-            rapid.append(False)
-            stages.append("finishing")
-        last_theta = first["theta"]
-
-        for cut in cut_points[1:]:
-            joints.append(
-                _joint(cut["rs"], cut["theta"], cut["zs"], cut["phi"], config, diagnostics)
-            )
-            rapid.append(False)
-            stages.append("finishing")
-
-        last_cut = cut_points[-1]
-        if slice_index + 1 < len(theta_grid):
-            last_joint = _joint(
-                last_cut["rs"],
-                last_cut["theta"],
-                last_cut["zs"],
-                last_cut["phi"],
-                config,
-                diagnostics,
-            )
-            for move in safe_retract_moves(
-                last_joint, config, clearance_target, diagnostics
-            ):
-                joints.append(move)
-                rapid.append(False)
-                stages.append("finishing")
-            joints.append(
-                _joint(clearance_target, last_cut["theta"], safe_zs, 0.0, config, diagnostics)
-            )
-            rapid.append(True)
-            stages.append("finishing")
 
     percentage = 0.0 if total_points == 0 else 100.0 * unreachable_points / total_points
     return joints, rapid, stages, total_points, percentage
