@@ -30,3 +30,4 @@ node_modules/
 
 # Local UI smoke artifacts
 .tmp-*
+.sweep/
