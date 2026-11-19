@@ -1,0 +1,17 @@
+{
+  "name": "carving-simulation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "4-DOF thermal CNC wax carver digital twin (kinematics, facial sculpting, volumetric carving)",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test:node": "node --test tests/test_wax_sdf.mjs",
+    "bench:sdf": "BENCH=1 node --test tests/test_wax_sdf.mjs"
+  },
+  "dependencies": {
+    "three": "0.187.0"
+  }
+}
