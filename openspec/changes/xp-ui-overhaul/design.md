@@ -1,97 +1,138 @@
 ---
-version: alpha
-name: Windows XP Luna Retro Minimalist (Carver Studio 2001)
-description: Early-2000s desktop computing aesthetic (Windows XP Luna) migrated from wax-robot, adapted for 4-DOF thermal wax carving simulation.
+version: "alpha"
+name: "Windows XP Luna Studio (4-DOF Wax Carver)"
+description: "Early-2000s Windows XP Luna desktop aesthetic migrated from wax-robot, adapted for an emoji-free 4-DOF thermal wax carving simulation studio."
 colors:
   desktop: "#3a6ea5"
   surface: "#ece9d8"
   surface-light: "#ffffff"
   surface-inset: "#f0ede0"
-
   border-highlight: "#ffffff"
   border-light: "#ece9d8"
   border-shadow: "#918e82"
   border-dark: "#404040"
-
   titlebar-start: "#0058ee"
   titlebar-mid: "#3593ff"
   titlebar-end: "#072a8c"
   on-titlebar: "#ffffff"
-
   on-surface: "#222222"
   on-surface-muted: "#555555"
   on-surface-disabled: "#888888"
-
   action-start: "#70c040"
   action-end: "#3e8e18"
   action-border: "#286010"
   on-action: "#ffffff"
-
   close-hover: "#e81123"
   fault-error: "#e81123"
   fault-warning: "#f59e0b"
-
+  collision-text: "#ffffff"
   viewport-bg: "#f0ede0"
   wax-stock: "#e8d595"
   target-face-ghost: "#3b82f6"
   rig-metal: "#64748b"
   cutter-hot: "#f97316"
-
 typography:
   title:
-    fontFamily: Tahoma, "Segoe UI", sans-serif
-    fontSize: 12px
+    fontFamily: "Tahoma, Segoe UI, sans-serif"
+    fontSize: "12px"
     fontWeight: 700
     lineHeight: 1.2
   menu:
-    fontFamily: Tahoma, "Segoe UI", sans-serif
-    fontSize: 11px
+    fontFamily: "Tahoma, Segoe UI, sans-serif"
+    fontSize: "11px"
     fontWeight: 400
     lineHeight: 1.2
   body:
-    fontFamily: Tahoma, "Segoe UI", sans-serif
-    fontSize: 11px
+    fontFamily: "Tahoma, Segoe UI, sans-serif"
+    fontSize: "11px"
     fontWeight: 400
     lineHeight: 1.3
   label:
-    fontFamily: Tahoma, "Segoe UI", sans-serif
-    fontSize: 11px
+    fontFamily: "Tahoma, Segoe UI, sans-serif"
+    fontSize: "11px"
     fontWeight: 700
     lineHeight: 1.2
   code:
-    fontFamily: "Courier New", monospace
-    fontSize: 11px
+    fontFamily: "Courier New, monospace"
+    fontSize: "11px"
     fontWeight: 400
     lineHeight: 1.2
-
 rounded:
-  none: 0px
-  window-top: 6px
-  button: 3px
-
+  none: "0px"
+  button: "3px"
+  window-top: "6px"
 spacing:
-  xs: 2px
-  sm: 4px
-  md: 8px
-  lg: 12px
-  xl: 16px
+  xs: "2px"
+  sm: "4px"
+  md: "8px"
+  lg: "12px"
+  xl: "16px"
+components:
+  window:
+    backgroundColor: "{colors.surface}"
+    borderTopLeftRadius: "{rounded.window-top}"
+    borderTopRightRadius: "{rounded.window-top}"
+  titlebar:
+    backgroundColor: "{colors.titlebar-start}"
+    textColor: "{colors.on-titlebar}"
+  action-button:
+    backgroundColor: "{colors.action-end}"
+    textColor: "{colors.on-action}"
+    borderRadius: "{rounded.button}"
+  transport-dock:
+    backgroundColor: "{colors.surface}"
+    padding: "{spacing.sm} {spacing.md}"
+  status-collision:
+    backgroundColor: "{colors.fault-error}"
+    textColor: "{colors.collision-text}"
 ---
 
-# Windows XP Luna Retro Minimalist — Carver Studio 2001
+## Overview
 
-## 1. Visual Overview
-Replaces the earlier dark-mode UI draft with `wax-robot`'s tactile **Windows XP Luna** desktop window (`.desktop` `#3a6ea5`, `.window` `#ece9d8`, Luna blue `.titlebar`, 2px beveled `.inset-well`, green XP `#simulate-button`, 3-cell `.status-bar`, and `#f0ede0` gallery 3D viewport).
+Windows XP Luna Retro Minimalist meets 4-DOF Thermal CNC Wax Carving (**4-DOF Wax Carver Studio 2001**). The UI preserves the crisp tactility of a single native 2000s desktop window floating over a classic Luna blue desktop (`#3a6ea5`), pairing beveled Tahoma controls, inset telemetry cells, and a recessed `.transport-dock` with an interactive Three.js volumetric SDF carving viewport.
 
-## 2. Component Anatomy & States
-- **Window & Menu Bar**: Minimize (`_`), Maximize (`□`), Close (`✕` with `#e81123` hover); `File(F)`, `Presets(P)`, `Simulation(S)`, `Help(H)`.
-- **Sidebar (`320px` desktop; `.mobile-tabs` `< 900px`)**: `Model Source` (preset + upload), `Facial Sculpt` (`nose`, `brow`, `cheeks`, `jaw`, `chin` `.xp-slider`s), `Stock & Preset` (`R_stock`, `H_stock`, `demo`/`standard`, `Show Target Ghost`), and green `⚡ SCULPT & SIMULATE` CTA.
-- **Simulation Transport Bar (`.transport-bar` below `#viewport`)**:
-  - **Idle / Ready**: `Play` and `Carve to End` enabled, scrubber at `0%`, `#telemetry-readout` at home pose.
-  - **Playing**: `Pause` active, `1x–20x` speed, live `(r, theta, h, phi)` and `(r_s, theta_s, z_s, v_tip)` in `Courier New`.
-  - **Scrubbing**: Rig updates immediately; Worker restores nearest SDF snapshot asynchronously.
-  - **Fault / Warning**: Auto-pauses on `RAPID_COLLISION`, `SHANK_COLLISION`, `SOFT_LIMIT_EXCEEDED`, `STOCK_BOUNDS_EXCEEDED` (`#e81123` badge); highlights `#f59e0b` for `SINGULARITY_HIGH_THETA_DOT` / `UNREACHABLE_UNDERCUT_AREA`.
+## Colors
 
-## 3. Do's and Don'ts
-- **DO** keep all styling in vanilla `static/xp.css` with no external CSS frameworks or build tools.
-- **DO** render the target face mesh as a toggleable translucent ghost (`#3b82f6`) inside the `#e8d595` wax stock.
+- **Desktop (`#3a6ea5`)**: Classic Windows XP desktop backdrop behind the floating studio window.
+- **Surface (`#ece9d8`) & Inset (`#f0ede0`, `#ffffff`)**: Warm cream/grey XP chrome contrasting against the `#f0ede0` 3D gallery viewport well.
+- **Luna Titlebar (`#0058ee` -> `#3593ff` -> `#072a8c`)**: Horizontal royal-blue gradient with `#ffffff` bold title text.
+- **Action Green (`#70c040` -> `#3e8e18`, border `#286010`)**: High-contrast Start-style CTA for `SCULPT & SIMULATE`.
+- **Faults & Warnings**: `#e81123` on `#ffffff` text for `.status-badge-collision` (`RAPID_COLLISION`, `SHANK_COLLISION`, `SOFT_LIMIT_EXCEEDED`, `STOCK_BOUNDS_EXCEEDED`) and close-button hover; `#f59e0b` for warnings (`SINGULARITY_HIGH_THETA_DOT`, `UNREACHABLE_UNDERCUT_AREA`).
+- **3D Materials**: Machinable wax (`#e8d595`), translucent target face ghost (`#3b82f6`), primitive metal rig (`#64748b`), and hot conical-bevel tip (`#f97316`).
+
+## Typography
+
+- **UI Chrome & Labels**: `Tahoma, Segoe UI, sans-serif` at exact pixel sizes (`12px` bold titlebar, `11px` menus, body, and bold field labels).
+- **Telemetry & Time**: `Courier New, monospace` (`11px`) for `.transport-time` and `.status-cell` joint/tip coordinate readouts so numeric columns never jitter.
+
+## Layout
+
+- **Desktop (`>= 900px`)**: `.window` (`min(1220px, 100%)` to `96vw`, `max-width: 1400px`, `height: 92vh`) with horizontal `.window-body` (`aside.sidebar` `320px` + `section.viewport-shell`).
+- **Mobile (`< 900px`)**: `.window-body` stacks vertically (`flex-direction: column`) and `.mobile-tabs` (`Model`, `Sculpt`, `Sim`) toggle `data-tab-panel` visibility.
+- **Transport Dock**: Anchored inside `.inset-well.viewport-well` (`bottom: 8px; left: 8px; right: 8px; z-index: 10`).
+
+## Elevation & Depth
+
+- **Outset Bevels**: Top/left `#ffffff`, bottom/right `#404040` (with `#918e82` secondary shadow) for `.window`, `.transport-dock`, and `.transport-btn`.
+- **Inset Wells**: Top/left `#918e82`, bottom/right `#ffffff` for `.inset-well.viewport-well`, `.xp-input`, and `.status-cell` panes.
+
+## Shapes
+
+- **Window Frame**: `6px` rounded top corners (`borderTopLeftRadius`, `borderTopRightRadius`), `0px` squared bottom corners.
+- **Buttons**: `3px` corner radius on primary action buttons; `0px`–`2px` crisp edges on `.transport-btn` and `.status-cell`.
+
+## Components
+
+- **Titlebar & Menu Bar**: `4-DOF Wax Carver Studio 2001`, `Minimize` (`_`), `Maximize` (`□`), `Close` (`×`), and `File(F)`, `Presets(P)`, `Simulation(S)` / `View(V)`, `Help(H)` dropdowns.
+- **Sidebar Panels**: `Model Source` (preset + `.stl`/`.obj`/`.3mf` upload), `Facial Sculpt` (`nose`, `brow`, `cheeks`, `jaw`, `chin` `.xp-slider`s), `Stock & Preset` (`R_stock`, `H_stock`, `Demo`/`Standard`, `Show Target Ghost`), and green `SCULPT & SIMULATE` CTA.
+- **Transport Dock (`.transport-dock`)**: Plain-text `Prev`, `Play`/`Pause`, `Next`, `Carve to End` `.transport-btn`s, `#sim-scrubber`, `#sim-time`, and `#sim-speed` (`1x`, `5x`, `10x`, `20x`).
+- **Status Bar (`footer.status-bar`)**: Five inset `.status-cell` panes (`#status-text`, `#status-joints`, `#status-tip`, `#status-feed`, `#status-state`).
+
+## Do's and Don'ts
+
+- **DO** use exact pixel sizing (`11px`, `12px`) for Tahoma typography and `Courier New` for live joint/tip telemetry.
+- **DO** keep all styling in vanilla `static/xp.css` with zero external CSS frameworks or Node build steps.
+- **DO** use `ResizeObserver` on `#viewport` so `WebGLRenderer` tracks sidebar/window resizes, and render the target face mesh as a toggleable translucent ghost (`#3b82f6`).
+- **DON'T** use Unicode emojis anywhere in labels, titlebar icons, buttons, or transport controls (use plain ASCII text or CSS geometric borders instead).
 - **DON'T** duplicate kinematic trigonometry in `static/app.js` or set `camera.up.set(0, 0, 1)`.
+- **DON'T** use rounded modern pills, dark-mode gradients, or borderless flat cards that break the Windows XP Luna aesthetic.
