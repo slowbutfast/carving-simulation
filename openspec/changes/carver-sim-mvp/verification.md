@@ -1,5 +1,90 @@
 # Verification Report — `carver-sim-mvp`
 
+## PATCH-10f Merge Closeout (2026-11-18, closing commit of this squash: the PR #1 head after the PATCH-10f push)
+
+This section supersedes the "all suites pass" statement in the exec summary below,
+which described the pre-review tree. The PR #1 review chain (PATCH-10 … 10f) rewrote
+the finishing stage; the current state is:
+
+| Suite | Command | Result |
+| :--- | :--- | :--- |
+| Python | `.venv/bin/python -m unittest discover -s tests` | **51 run, 0 failures, 0 errors, 1 expected failure, 1 skip** (≈ 11 min) |
+| Node | `node --test tests/test_wax_sdf.mjs tests/test_wax_worker.mjs` | **13 tests, 9 pass, 4 skip, 0 fail** |
+| Worker (modules enabled) | `node --experimental-vm-modules --test tests/test_wax_worker.mjs` | **3/3 pass** |
+| Integrated sweep | `scripts/sweep_path.py` + `scripts/sweep_path.mjs`, 128³ | 0 `RAPID_COLLISION`, **86 `SHANK_COLLISION`** (known defect, below) |
+
+The skip is the pending hardware calibration fixture. The expected failure is
+`test_finishing_follows_planar_contours`, marked `@unittest.expectedFailure` in
+PATCH-10f; that decorator goes green-as-xfail-by-accident if the test ever passes,
+which the finishing rewrite in `machine-cad-integration` will make explicit.
+
+### Known defects deferred to `machine-cad-integration`
+
+1. **Corner-normal standoff collapse.** `cutter_location` offsets the Contact-Point
+   along the true surface normal by `tip_radius + melt_kerf`. At a box top-face edge
+   the slice normal is ≈ `(0.994, 0.11)` rather than `(1, 0)`, so the derived apex
+   lands inside the 0.5 mm tip: 0.249 mm from the surface against the 0.9 mm standoff,
+   with 542 of 4 439 finishing apexes inside the target (worst ≈ 0.3 mm). The
+   "true normal, no snapping" rule and the "apex is `tip_radius + melt_kerf` from the
+   surface" rule are mutually exclusive at a corner.
+2. **86 roughing `SHANK_COLLISION` at 128³**, shank checked on *every* cutting frame.
+   Every hit is `above:inboard` on a **vertical roughing** pose whose tip is already
+   inside the stock: roughing deliberately cuts under `finish_allowance`, so the
+   unheated shank sits inside that allowance shell. PATCH-07 suppressed this by
+   checking only tilted frames; PATCH-10e removed that gate as specified, which
+   exposes the real state. Rapid collisions are 0. Relaxing the stepdown bound by the
+   allowance was tried and made it worse (86 → 1 051), so it was reverted.
+3. **Roughing step-down bound is unverified as a measurement.** The clamp enforces
+   `stepdown <= engaged - (shank_r - tip_r - kerf)/tan(alpha)` = 4.36 mm by
+   construction; the sweep cannot resolve a 4.36-vs-6.0 mm sliver at the cutting-time
+   surface, so it neither confirms nor contradicts the geometric bound.
+
+### Frame counts (cap 250 000, no preset coarsening)
+
+| preset | frames | roughing | finishing | unreachable |
+| :--- | ---: | ---: | ---: | ---: |
+| demo | 136 358 | 104 896 | 8 733 | 12.18 % |
+| standard | 192 919 | 147 543 | 11 295 | 11.75 % |
+
+### Verbatim logs
+
+Python:
+
+```text
+....s........................x.....................
+----------------------------------------------------------------------
+Ran 51 tests in 671.508s
+
+OK (skipped=1, expected failures=1)
+```
+
+Node (both files as documented):
+
+```text
+# tests 13
+# pass 9
+# fail 0
+# skipped 4
+```
+
+Worker with ES modules enabled (the documented command leaves these 3 skipped):
+
+```text
+# tests 3
+# pass 3
+# fail 0
+# skipped 0
+```
+
+128³ sweep, demo preset (`{"preset":"demo","grid":"128^3","frames":136358,
+"cuttingChecked":119057,"rapidHits":0,"shankHits":86,...}`):
+
+```text
+{"preset":"demo","grid":"128^3","frames":136358,"cuttingChecked":119057,"rapidHits":0,"shankHits":86,"ms":113164}
+```
+
+---
+
 ## Executive Summary
 
 Implemented the complete v1 digital twin for the 4-DOF cylindrical thermal wax

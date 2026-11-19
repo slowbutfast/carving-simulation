@@ -8,7 +8,7 @@
  *
  * Usage:
  *   .venv/bin/python scripts/sweep_path.py --preset demo --out /tmp/path.json
- *   node tests/sweep_path.mjs /tmp/path.json
+ *   node scripts/sweep_path.mjs /tmp/path.json
  */
 
 import fs from 'node:fs';
@@ -27,7 +27,7 @@ function poseAt(poses, index) {
 }
 
 const file = process.argv[2];
-assert.ok(file, 'usage: node tests/sweep_path.mjs <path.json>');
+assert.ok(file, 'usage: node scripts/sweep_path.mjs <path.json>');
 const payload = JSON.parse(fs.readFileSync(file, 'utf8'));
 const poses = new Float32Array(payload.poses);
 const rapid = new Uint8Array(payload.rapid);

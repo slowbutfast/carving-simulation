@@ -1,4 +1,4 @@
-"""Dump a generated trajectory for `tests/sweep_path.mjs` (PATCH-10c sweep).
+"""Dump a generated trajectory for `scripts/sweep_path.mjs` (PATCH-10c sweep).
 
 Usage:
     .venv/bin/python scripts/sweep_path.py --preset demo --out /tmp/demo.json
