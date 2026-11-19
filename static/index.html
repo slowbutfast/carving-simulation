@@ -208,8 +208,19 @@
     .progress-track { height: 3px; background: #1f2b3f; border-radius: 9999px; overflow: hidden; }
     .progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2563eb, #38bdf8); transition: width 80ms linear; }
 
-    .hint-bar { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 10.5px; }
+    .hint-bar { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 10.5px; align-items: center; flex-wrap: wrap; }
     .mono { font-family: var(--mono); }
+    .provenance { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+    .detail-btn { min-height: 44px; padding: 6px 10px; }
+    .unassigned-note {
+      position: absolute; top: 94px; left: 14px; max-width: min(520px, calc(100% - 28px));
+      min-height: 44px; padding: 8px 12px; text-align: left;
+      background: rgba(15, 23, 42, 0.82); border: 1px solid var(--border);
+      border-radius: var(--radius); color: var(--muted); font-family: var(--sans);
+      font-size: 12px; cursor: pointer; backdrop-filter: blur(6px);
+    }
+    .unassigned-note:hover { border-color: #475569; color: var(--text); }
+    .unassigned-note.hidden { display: none; }
 
     @media (max-width: 900px) {
       body { overflow: auto; }
@@ -222,6 +233,7 @@
       .transport-row { flex-wrap: wrap; }
       .timecode { min-width: 0; text-align: left; }
       .overlay-top { flex-direction: column; }
+      .prov-home { display: none; }
     }
   </style>
 </head>
@@ -294,6 +306,10 @@
             <span>Carved wax stock</span>
             <label class="switch"><input id="showStock" type="checkbox" checked /><span></span></label>
           </div>
+          <div class="toggle-row">
+            <span>Machine detail</span>
+            <button class="btn detail-btn" id="machineDetailBtn" type="button" aria-pressed="false" disabled>Machine detail: Full</button>
+          </div>
           <div class="telemetry" id="telemetryGrid">
             <div><span class="k">r</span><span class="v" id="tele-r">—</span></div>
             <div><span class="k">θ</span><span class="v" id="tele-theta">—</span></div>
@@ -339,6 +355,8 @@
         </div>
       </div>
 
+      <button class="unassigned-note hidden" id="unassignedNote" type="button" aria-pressed="false"></button>
+
       <div class="transport">
         <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
         <div class="transport-row">
@@ -357,6 +375,7 @@
         </div>
         <div class="hint-bar">
           <span class="mono" id="toolpathInfo">No toolpath loaded</span>
+          <span class="mono provenance"><span id="provenanceStep">STEP —</span><span class="prov-home" id="provenanceHome"> · home: unset</span></span>
           <span>Drag to orbit · Scroll to zoom · Right-drag to pan</span>
         </div>
       </div>

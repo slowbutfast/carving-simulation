@@ -1,8 +1,9 @@
 /**
- * Worker-level regression tests for the wax SDF Web Worker (PATCH-10).
+ * Worker-level regression tests for the wax SDF Web Worker.
  *
  * The worker module talks to `self`; a small vm harness stubs that global scope
- * so its message protocol can be exercised directly in Node.
+ * so its message protocol can be exercised directly in Node.  The wax SDF is
+ * **negative inside** material and positive inside a carved cavity.
  */
 
 import test from 'node:test';
@@ -40,7 +41,6 @@ async function bootWorker() {
   await module.link(() => Promise.reject(new Error('unexpected import')));
   await module.evaluate();
 
-  let lastSeek = 0;
   const api = {
     messages,
     send: (data) => sandbox.self.onmessage({ data }),
@@ -48,135 +48,153 @@ async function bootWorker() {
     /** Carve forward incrementally until the requested index completes. */
     carveTo(index) {
       api.send({ type: 'seek', index });
-      lastSeek = index;
     },
     triangles() {
       const meshes = api.ofType('meshes').at(-1)?.meshes ?? [];
       return meshes.reduce((sum, mesh) => sum + mesh.indices.length / 3, 0);
-    },
-    get lastSeek() {
-      return lastSeek;
     },
   };
   return api;
 }
 
 function verticalPath(count, { x = 0, y = 0, z = 36, step = 0.01 } = {}) {
-  const poses = new Float32Array(count * 6);
+  const poses = new Float32Array(count * 7);
   const rapid = new Uint8Array(count);
   for (let index = 0; index < count; index += 1) {
-    poses[index * 6] = x;
-    poses[index * 6 + 1] = y;
-    poses[index * 6 + 2] = z - index * step;
-    poses[index * 6 + 5] = -1;
+    poses[index * 7] = x;
+    poses[index * 7 + 1] = y;
+    poses[index * 7 + 2] = z - index * step;
+    poses[index * 7 + 5] = -1;
+    // theta_s stays 0: u = -Z, a_w = +Y, a_n = -X.
   }
-  return { poses, rapid, count };
+  return { poses, rapid, count, stride: 7 };
 }
 
 const WIDE_TOOL = {
-  tip_radius_mm: 2.5,
-  cone_half_angle_deg: 30,
-  engaged_length_mm: 8,
+  blade_thickness_mm: 6.0,
+  blade_width_mm: 6.0,
+  blade_length_mm: 14.0,
+  heated_length_mm: 14.0,
   melt_kerf_mm: 0.4,
-  shank_radius_mm: 3,
-  shank_length_mm: 20,
+  shaft_radius_mm: 2.5,
+  shaft_span_mm: [14.0, 75.0],
+  body_radius_mm: 3.5,
+  body_span_mm: [75.0, 140.0],
+  head_clearance_mm: 46.5934,
+  head_envelope: {
+    shape: 'box',
+    center_mm: [9.0, -3.375, 111.0],
+    half_extents_mm: [20.0, 11.125, 61.0],
+  },
 };
 
-function initConfig(tool = {}) {
+function initConfig(tool = {}, stock = {}) {
   return {
-    stock: { R_stock_mm: 20, H_stock_mm: 40 },
+    stock: { R_stock_mm: 20, H_stock_mm: 40, ...stock },
     tool: { ...WIDE_TOOL, ...tool },
   };
 }
 
-test('worker maps data.config.tool on init (wide tip reaches the stock wall)', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
+test('worker maps config.tool blade constants on init', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
   const worker = await bootWorker();
   worker.send({ type: 'init', config: initConfig(), gridN: 48, chunkSize: 16 });
-  assert.ok(worker.ofType('ready').length === 1, 'worker announced ready');
+  assert.equal(worker.ofType('ready').length, 1, 'worker announced ready');
+  const readyTool = worker.ofType('ready')[0].tool;
+  assert.equal(readyTool.bladeThickness, 6.0);
+  assert.deepEqual([...readyTool.shaftSpan], [14.0, 75.0]);
+  assert.deepEqual([...readyTool.bodySpan], [75.0, 140.0]);
 
-  const { poses, rapid, count } = verticalPath(40, { x: 18.6, y: 0.0, z: 36 });
-  worker.send({ type: 'path', poses, rapid, count });
-  worker.carveTo(count - 1);
+  const wide = verticalPath(40, { x: 18.6, y: 0.0, z: 30 });
+  worker.send({ type: 'path', ...wide });
+  worker.carveTo(wide.count - 1);
   const wideTriangles = worker.triangles();
-  assert.ok(wideTriangles > 0, 'wide tip carved the wall');
+  assert.ok(wideTriangles > 0, 'wide blade carved the wall');
 
-  // Same pose with a hairline default-like tip (0.5 mm) cannot reach x = 18.6
-  // through the 20 mm stock wall: the cavity is narrower, so fewer triangles.
+  // A 1.2 mm blade only reaches 19.6 mm from the axis (half-thickness + kerf),
+  // so it leaves the 20 mm stock wall intact and produces less carved geometry.
   const narrow = await bootWorker();
   narrow.send({
     type: 'init',
-    config: initConfig({ tip_radius_mm: 0.5 }),
+    config: initConfig({ blade_thickness_mm: 1.2 }),
     gridN: 48,
     chunkSize: 16,
   });
-  const path2 = verticalPath(40, { x: 18.6, y: 0.0, z: 36 });
-  narrow.send({ type: 'path', poses: path2.poses, rapid: path2.rapid, count });
-  narrow.carveTo(count - 1);
+  const thin = verticalPath(40, { x: 18.6, y: 0.0, z: 30 });
+  narrow.send({ type: 'path', ...thin });
+  narrow.carveTo(thin.count - 1);
   const narrowTriangles = narrow.triangles();
 
   assert.notEqual(
     wideTriangles,
     narrowTriangles,
-    `carved geometry differs with tool radius (wide ${wideTriangles}, narrow ${narrowTriangles})`
+    `carved geometry differs with blade thickness (wide ${wideTriangles}, narrow ${narrowTriangles})`
   );
 });
 
-test('worker checks the shank on every cutting frame (no skipping)', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
+test('shaft intrusion reports SHANK_COLLISION with body "shaft"', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
   const worker = await bootWorker();
-  // 5 mm shank so the tilted body reaches the wall at frame 3 only.
-  worker.send({ type: 'init', config: initConfig({ shank_radius_mm: 5 }), gridN: 48, chunkSize: 16 });
-
-  const count = 10;
-  const tilt = Math.hypot(0.9, 0.435);
-  const poses = new Float32Array(count * 6);
-  const rapid = new Uint8Array(count);
-  const setFrame = (index, tipX) => {
-    poses[index * 6] = tipX;
-    poses[index * 6 + 1] = 0;
-    poses[index * 6 + 2] = 34;
-    poses[index * 6 + 3] = 0.9 / tilt;
-    poses[index * 6 + 4] = 0;
-    poses[index * 6 + 5] = -0.435 / tilt;
-  };
-  for (let index = 0; index < count; index += 1) setFrame(index, 34);
-
-  // Frame 3 alone tips the 5 mm unheated shank to within a millimetre of the
-  // stock wall; neighbouring frames stay clear by more than a voxel.
-  setFrame(3, 33);
-  // Send copies: structured-clone transfer detaches the scratch buffers.
+  // Stock reaches z = 120; a vertical tip at z = 10 puts the shaft span
+  // [14, 75] well inside the uncarved column.
   worker.send({
-    type: 'path',
-    poses: Float32Array.from(poses),
-    rapid: Uint8Array.from(rapid),
-    count,
+    type: 'init',
+    config: initConfig({}, { H_stock_mm: 120 }),
+    gridN: 48,
+    chunkSize: 16,
   });
-  worker.send({ type: 'seek', index: count - 1 });
+
+  const pathData = verticalPath(6, { x: 0, y: 0, z: 10 });
+  worker.send({ type: 'path', ...pathData });
+  worker.send({ type: 'seek', index: pathData.count - 1 });
 
   const collision = worker.ofType('collision')[0];
-  assert.ok(collision, 'shank collision reported');
+  assert.ok(collision, 'shaft collision reported');
   assert.equal(collision.code, 'SHANK_COLLISION');
-  assert.equal(collision.index, 3, 'the single offending frame is not skipped');
+  assert.equal(collision.body, 'shaft');
 });
 
-test('vertical cutting pose with the shank buried in uncarved stock posts SHANK_COLLISION', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
+test('tilt-head envelope intrusion reports SHANK_COLLISION with body "head"', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
   const worker = await bootWorker();
-  // The shank, not the tip, is the risk.  The engaged cone plus shank covers
-  // exactly half the stock height, so a tip at mid-height puts the shank rings
-  // inside the uncarved column above it.
-  const tool = { engaged_length_mm: 4, shank_radius_mm: 4, shank_length_mm: 40 };
-  const config = initConfig(tool);
-  config.stock = { R_stock_mm: 20, H_stock_mm: 40 };
-  worker.send({ type: 'init', config, gridN: 48, chunkSize: 16 });
+  // Move both cylinders far outside the stock so the explicit head box from the
+  // config is the only unheated body in range.  Its span starts 50 mm above the
+  // reference point.
+  worker.send({
+    type: 'init',
+    config: initConfig(
+      { shaft_span_mm: [2000, 2001], body_span_mm: [3000, 3001] },
+      { H_stock_mm: 120 }
+    ),
+    gridN: 48,
+    chunkSize: 16,
+  });
+
+  const pathData = verticalPath(6, { x: 0, y: 0, z: 0 });
+  worker.send({ type: 'path', ...pathData });
+  worker.send({ type: 'seek', index: pathData.count - 1 });
+
+  const collision = worker.ofType('collision')[0];
+  assert.ok(collision, 'head collision reported');
+  assert.equal(collision.code, 'SHANK_COLLISION');
+  assert.equal(collision.body, 'head');
+});
+
+test('vertical cutting pose with the shaft buried in uncarved stock posts SHANK_COLLISION', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
+  const worker = await bootWorker();
+  // The shaft spans 14..75 mm behind the tip; with a tip at mid-height it sits
+  // inside the uncarved column above the tip.
+  worker.send({
+    type: 'init',
+    config: initConfig({}, { R_stock_mm: 20, H_stock_mm: 40 }),
+    gridN: 48,
+    chunkSize: 16,
+  });
 
   const count = 6;
-  // Vertical (axis = -z, |axis.z| = 1) - exactly the pose the old `tilted`
-  // gate skipped.  Tip at z = 20, so the shank spans z 24..60 and its lower
-  // rings sit inside stock that reaches z = 40.
   const { poses, rapid } = verticalPath(count, { x: 0, y: 0, z: 20, step: 0.01 });
-  worker.send({ type: 'path', poses: Float32Array.from(poses), rapid: Uint8Array.from(rapid), count });
+  worker.send({ type: 'path', poses: Float32Array.from(poses), rapid: Uint8Array.from(rapid), count, stride: 7 });
   worker.send({ type: 'seek', index: count - 1 });
 
   const collision = worker.ofType('collision')[0];
   assert.ok(collision, 'vertical shank collision reported');
   assert.equal(collision.code, 'SHANK_COLLISION');
+  assert.equal(collision.body, 'shaft');
 });

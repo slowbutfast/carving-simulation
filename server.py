@@ -53,17 +53,13 @@ class StockCfg(BaseModel):
 
 
 class ToolCfg(BaseModel):
-    """Optional tool overrides; the melt kerf may be zero, nothing else."""
+    """Optional tool overrides. Blade dimensions are CAD-derived, not client
+    overridable; removed cone keys are rejected with 422 naming the key."""
 
     model_config = ConfigDict(extra="forbid")
 
-    tip_radius_mm: float | None = Field(default=None, gt=0.0)
-    cone_half_angle_deg: float | None = Field(default=None, gt=0.0, lt=90.0)
-    engaged_length_mm: float | None = Field(default=None, gt=0.0)
-    tip_width_mm: float | None = Field(default=None, gt=0.0)
     melt_kerf_mm: float | None = Field(default=None, ge=0.0)
-    shank_radius_mm: float | None = Field(default=None, gt=0.0)
-    shank_length_mm: float | None = Field(default=None, gt=0.0)
+    heated_length_mm: float | None = Field(default=None, gt=0.0)
 
 
 class SimulationRequest(BaseModel):
@@ -173,6 +169,27 @@ def sculpt_and_sim(request: SimulationRequest) -> dict[str, Any]:
         _deep_merge(config, {"stock": stock_overrides})
     if tool_overrides:
         _deep_merge(config, {"tool": tool_overrides})
+        blade_length = float(config["tool"]["blade_length_mm"])
+        heated_length = float(config["tool"]["heated_length_mm"])
+        if heated_length > blade_length + 1e-9:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "status": "error",
+                    "diagnostics": [
+                        {
+                            "code": "TOOL_CFG_INVALID",
+                            "severity": "error",
+                            "message": (
+                                f"tool_cfg.heated_length_mm={heated_length} exceeds "
+                                f"the CAD blade length {blade_length} mm"
+                            ),
+                            "axis": "heated_length_mm",
+                            "value": heated_length,
+                        }
+                    ],
+                },
+            )
 
     base_mesh = face_sculpt.load_base_head(config)
     sculpt = face_sculpt.apply_facial_modifications(base_mesh, request.sliders, config)

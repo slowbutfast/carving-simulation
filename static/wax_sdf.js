@@ -108,15 +108,17 @@ export class VolumetricWaxGrid {
   setPath(columns, frameCount) {
     const tip = columns.tip_xyz_wax;
     const axis = columns.tool_axis_wax;
+    const theta = columns.theta_s;
     const rapid = columns.is_rapid;
-    const poses = new Float32Array(frameCount * 6);
+    const poses = new Float32Array(frameCount * 7);
     for (let index = 0; index < frameCount; index++) {
-      poses[index * 6] = tip[index * 3];
-      poses[index * 6 + 1] = tip[index * 3 + 1];
-      poses[index * 6 + 2] = tip[index * 3 + 2];
-      poses[index * 6 + 3] = axis[index * 3];
-      poses[index * 6 + 4] = axis[index * 3 + 1];
-      poses[index * 6 + 5] = axis[index * 3 + 2];
+      poses[index * 7] = tip[index * 3];
+      poses[index * 7 + 1] = tip[index * 3 + 1];
+      poses[index * 7 + 2] = tip[index * 3 + 2];
+      poses[index * 7 + 3] = axis[index * 3];
+      poses[index * 7 + 4] = axis[index * 3 + 1];
+      poses[index * 7 + 5] = axis[index * 3 + 2];
+      poses[index * 7 + 6] = theta ? theta[index] : 0;
     }
     const rapidCopy = Uint8Array.from(rapid);
     this.frameCount = frameCount;
@@ -127,6 +129,7 @@ export class VolumetricWaxGrid {
         poses,
         rapid: rapidCopy,
         count: frameCount,
+        stride: 7,
       },
       [poses.buffer]
     );

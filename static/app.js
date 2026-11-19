@@ -7,29 +7,41 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { PrimitiveCarverRig } from './machine_rig.js';
+import { CadCarverRig } from './cad_rig.js';
 import { VolumetricWaxGrid } from './wax_sdf.js';
 
 const DEFAULT_CONFIG = {
-  arm_radial_offset_mm: 45,
-  arm_to_pivot_z_mm: 25,
-  pivot_to_tip_mm: 30,
+  arm_radial_offset_mm: 0,
+  arm_to_pivot_z_mm: 0,
+  pivot_to_tip_mm: 60,
   stock: {
     R_stock_mm: 40,
     H_stock_mm: 120,
-    z_plinth_mm: 10,
+    z_plinth_mm: 12,
     finish_allowance_mm: 1.5,
     retract_clearance_mm: 6,
   },
   tool: {
-    tip_radius_mm: 0.5,
-    cone_half_angle_deg: 30,
-    engaged_length_mm: 8,
-    tip_width_mm: 1.6,
+    blade_thickness_mm: 1.2,
+    blade_width_mm: 6.0,
+    blade_length_mm: 14.0,
+    heated_length_mm: 14.0,
     melt_kerf_mm: 0.4,
-    shank_radius_mm: 3,
-    shank_length_mm: 40,
+    shaft_radius_mm: 2.5,
+    shaft_span_mm: [14.0, 75.0],
+    body_radius_mm: 3.5,
+    body_span_mm: [75.0, 140.0],
+    head_clearance_mm: 46.5934,
   },
+  geometry: {
+    cad_reference_pose: { h: 151.0, r: 0.0, theta_deg: 0.0, phi_deg: 0.0 },
+    pivot_point_mm: [0.0, 0.0, 151.0],
+    pivot_axis_mm: [0.0, -1.0, 0.0],
+    tool_reference_point_mm: [0.0, 0.0, 91.0],
+    unassigned_parts: [],
+    home_pose: null,
+  },
+  geometry_provenance: { step_sha256: null, home_pose: null, unassigned_parts: [] },
 };
 
 const RAD_TO_DEG = 180 / Math.PI;
@@ -39,6 +51,7 @@ const WARNING_CODES = new Set([
   'SINGULARITY_HIGH_THETA_DOT',
   'UNREACHABLE_UNDERCUT_AREA',
   'PHI_POLICY_CLAMPED',
+  'BLADE_BROADSIDE_FEED',
 ]);
 
 const state = {
@@ -55,6 +68,7 @@ const state = {
   totalTime: 0,
   diagnostics: [],
   carvingToEnd: false,
+  machineDetail: window.matchMedia('(min-width: 900px)').matches ? 'full' : 'tool',
 };
 
 const dom = {};
@@ -65,7 +79,8 @@ for (const id of [
   'meshInfo', 'diagnostics', 'diagCount', 'tele-r', 'tele-theta', 'tele-h',
   'tele-phi', 'tele-rs', 'tele-zs', 'tele-vtip', 'tele-stage', 'sculptBtn',
   'preset', 'showGhost', 'showStock', 'headerBadge', 'sculptHint',
-  'telemetryGrid',
+  'telemetryGrid', 'machineDetailBtn', 'unassignedNote', 'provenanceStep',
+  'provenanceHome',
 ]) {
   dom[id] = document.getElementById(id);
 }
@@ -105,42 +120,45 @@ function initScene() {
 
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0b1220);
-  scene.fog = new THREE.Fog(0x0b1220, 420, 900);
+  scene.fog = new THREE.Fog(0x0b1220, 1200, 2600);
 
-  camera = new THREE.PerspectiveCamera(38, 1, 0.5, 3000);
-  camera.position.set(230, 190, 255);
+  camera = new THREE.PerspectiveCamera(38, 1, 0.5, 4000);
+  camera.position.set(620, 430, 700);
 
   controls = new OrbitControls(camera, renderer.domElement);
-  controls.target.set(6, 66, 0);
+  controls.target.set(0, 60, 0);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
-  controls.minDistance = 60;
-  controls.maxDistance = 620;
+  controls.minDistance = 120;
+  controls.maxDistance = 1800;
   controls.maxPolarAngle = Math.PI * 0.495;
   controls.update();
 
   scene.add(new THREE.HemisphereLight(0xbfdbfe, 0x1e293b, 1.15));
   const key = new THREE.DirectionalLight(0xffffff, 2.1);
-  key.position.set(140, 230, 120);
+  key.position.set(240, 360, 220);
   scene.add(key);
   const fill = new THREE.DirectionalLight(0x93c5fd, 0.85);
-  fill.position.set(-140, 90, -120);
+  fill.position.set(-240, 160, -220);
   scene.add(fill);
-  const rim = new THREE.PointLight(0x38bdf8, 1.2, 520, 2);
-  rim.position.set(-90, 140, 110);
+  const rim = new THREE.PointLight(0x38bdf8, 1.2, 900, 2);
+  rim.position.set(-160, 240, 180);
   scene.add(rim);
 
-  const grid = new THREE.GridHelper(420, 42, 0x1d3350, 0x142238);
-  grid.position.y = -0.2;
+  const grid = new THREE.GridHelper(1600, 80, 0x1d3350, 0x142238);
+  grid.position.y = -141;
   grid.material.opacity = 0.55;
   grid.material.transparent = true;
   scene.add(grid);
 
-  rig = new PrimitiveCarverRig(DEFAULT_CONFIG);
+  rig = new CadCarverRig(DEFAULT_CONFIG, {
+    machineDetail: state.machineDetail,
+    onEvent: handleRigEvent,
+  });
   scene.add(rig.root);
 
   wax = new VolumetricWaxGrid({
-    rigRoot: rig.root,
+    rigRoot: rig.links.static,
     config: DEFAULT_CONFIG,
     gridN: 128,
     chunkSize: 16,
@@ -148,9 +166,75 @@ function initScene() {
     onStatus: handleWaxStatus,
   });
 
+  if (dom.machineDetailBtn) dom.machineDetailBtn.disabled = true;
+  rig.ready.then(() => {
+    if (dom.machineDetailBtn) dom.machineDetailBtn.disabled = false;
+    applyMachineDetail();
+    updateUnassignedNote();
+    updateProvenance();
+  });
+  applyMachineDetail();
+
   window.addEventListener('resize', resize);
   resize();
   renderer.setAnimationLoop(tick);
+}
+
+function handleRigEvent(event) {
+  if (!event) return;
+  if (event.type === 'error') {
+    appendDiagnostic({
+      code: event.code || 'GLB_LOAD_FAILED',
+      severity: event.severity || 'warning',
+      message: event.message || 'Machine model failed to load — showing tool only',
+      count: 1,
+    });
+    setStatus('WARNING', 'warning');
+    if (dom.machineDetailBtn) dom.machineDetailBtn.disabled = false;
+  }
+  if (event.type === 'loaded') {
+    if (dom.machineDetailBtn) dom.machineDetailBtn.disabled = false;
+    updateUnassignedNote();
+    updateProvenance();
+  }
+}
+
+function applyMachineDetail() {
+  if (!rig) return;
+  const mode = state.machineDetail === 'tool' ? 'tool' : 'full';
+  rig.setMachineDetail(mode);
+  if (dom.machineDetailBtn) {
+    dom.machineDetailBtn.textContent =
+      mode === 'full' ? 'Machine detail: Full' : 'Machine detail: Tool only';
+    dom.machineDetailBtn.setAttribute('aria-pressed', String(mode === 'tool'));
+  }
+}
+
+function updateUnassignedNote() {
+  if (!rig || !dom.unassignedNote) return;
+  const parts = rig.getProvenance().unassignedParts || [];
+  if (!parts.length) {
+    dom.unassignedNote.classList.add('hidden');
+    dom.unassignedNote.textContent = '';
+    return;
+  }
+  dom.unassignedNote.classList.remove('hidden');
+  const names = [...new Set(parts.map((part) => String(part).replace(/:\d+$/, '')))];
+  dom.unassignedNote.textContent =
+    `${parts.length} CAD parts not simulated: ${names.join(', ')}`;
+  dom.unassignedNote.setAttribute('aria-pressed', String(!rig.ghostsVisible));
+}
+
+function updateProvenance() {
+  if (!rig) return;
+  const provenance = rig.getProvenance();
+  const sha = provenance.stepSha256 ? String(provenance.stepSha256).slice(0, 8) : '—';
+  if (dom.provenanceStep) dom.provenanceStep.textContent = `STEP ${sha}`;
+  if (dom.provenanceHome) {
+    dom.provenanceHome.textContent = ` · home: ${
+      provenance.homePose == null ? 'unset' : 'set'
+    }`;
+  }
 }
 
 function resize() {
@@ -263,6 +347,12 @@ function loadSimulation(body) {
   state.faultFrame = null;
   state.faultCode = null;
 
+  if (body.config) {
+    rig.configure(body.config);
+    updateUnassignedNote();
+    updateProvenance();
+  }
+
   const columns = decodeColumns(body.trajectory);
   state.frames = columns;
   state.frameCount = body.trajectory.frame_count;
@@ -305,8 +395,19 @@ function loadSimulation(body) {
     state.faultFrame = typeof fatal.frame === 'number' ? fatal.frame : 0;
     showFault(fatal.code);
   } else {
-    dom.faultBadge.classList.add('hidden');
-    setStatus('READY', 'ready');
+    const warning = state.diagnostics.find((diagnostic) => WARNING_CODES.has(diagnostic.code));
+    if (warning) {
+      // Reuse the existing amber warning badge path; broadside feeds are not
+      // fatal, so playback is not auto-paused.
+      dom.faultBadge.classList.remove('hidden');
+      dom.faultBadge.className = 'badge warning';
+      dom.faultText.textContent = warning.code;
+      setStatus('WARNING', 'warning');
+      rig.setFault(warning.code);
+    } else {
+      dom.faultBadge.classList.add('hidden');
+      setStatus('READY', 'ready');
+    }
   }
 
   updateRigAt(0);
@@ -433,24 +534,26 @@ function setStatus(label, tone) {
   dom.headerBadge.innerHTML = `<span class="dot"></span>${label}`;
 }
 
-function showFault(code) {
+function showFault(code, body = null) {
   state.faultCode = code;
   dom.faultBadge.classList.remove('hidden');
   dom.faultBadge.className = `badge ${WARNING_CODES.has(code) ? 'warning' : 'error'}`;
-  dom.faultText.textContent = code;
-  rig.setFault(code);
+  dom.faultText.textContent = body ? `${code} · ${body}` : code;
+  rig.setFault(code, body);
   setStatus(WARNING_CODES.has(code) ? 'WARNING' : 'FAULT', WARNING_CODES.has(code) ? 'warning' : 'error');
-  dom['hud-mode'].textContent = code;
+  dom['hud-mode'].textContent = body ? `${code} · ${body}` : code;
 }
 
 function handleCollision(message) {
   pause();
   state.faultFrame = message.index;
-  showFault(message.code);
+  showFault(message.code, message.body || null);
   appendDiagnostic({
     code: message.code,
     severity: 'error',
-    message: `Worker SDF collision at frame ${message.index}`,
+    message: `Worker SDF collision at frame ${message.index}${
+      message.body ? ` (${message.body})` : ''
+    }`,
     count: 1,
     frame: message.index,
   });
@@ -554,6 +657,16 @@ dom.showGhost.addEventListener('change', () => {
 });
 dom.showStock.addEventListener('change', () => {
   if (wax) wax.setVisible(dom.showStock.checked);
+});
+dom.machineDetailBtn.addEventListener('click', () => {
+  if (dom.machineDetailBtn.disabled) return;
+  state.machineDetail = state.machineDetail === 'full' ? 'tool' : 'full';
+  applyMachineDetail();
+});
+dom.unassignedNote.addEventListener('click', () => {
+  if (!rig) return;
+  rig.setGhostVisible(!rig.ghostsVisible);
+  updateUnassignedNote();
 });
 
 dom.playBtn.disabled = true;

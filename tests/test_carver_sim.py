@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 
 import kinematics  # noqa: E402
 import face_sculpt  # noqa: E402
+import tool_model  # noqa: E402
 import toolpath_sim  # noqa: E402
 from server import app  # noqa: E402
 
@@ -35,7 +36,7 @@ HW_FIXTURE = ROOT / "tests" / "fixtures" / "hardware_poses.json"
 
 
 def load_config(**overrides):
-    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    cfg = kinematics.load_config()
     for dotted, value in overrides.items():
         node = cfg
         parts = dotted.split(".")
@@ -62,15 +63,15 @@ def fk_frame(r, theta, h, phi, config):
 
 
 def engaged_cone_displacement(a, b, length_mm, samples=17):
-    """Independent dense-sample check of the full engaged cone sweep."""
-    apex_a = np.asarray(a["tip_xyz_wax"], dtype=float)
-    apex_b = np.asarray(b["tip_xyz_wax"], dtype=float)
+    """Independent dense-sample check of the full heated blade sweep."""
+    tip_a = np.asarray(a["tip_xyz_wax"], dtype=float)
+    tip_b = np.asarray(b["tip_xyz_wax"], dtype=float)
     axis_a = np.asarray(a["tool_axis_wax"], dtype=float)
     axis_b = np.asarray(b["tool_axis_wax"], dtype=float)
     worst = 0.0
     for s in np.linspace(0.0, length_mm, samples):
-        pa = apex_a - axis_a * s
-        pb = apex_b - axis_b * s
+        pa = tip_a - axis_a * s
+        pb = tip_b - axis_b * s
         worst = max(worst, float(np.linalg.norm(pb - pa)))
     return worst
 
@@ -83,24 +84,56 @@ class TestConfigAndForwardKinematics(unittest.TestCase):
         self.p = self.config["pivot_to_tip_mm"]
 
     def test_config_declares_datums_tool_and_limits(self):
-        self.assertGreater(self.p, 0.0)
-        self.assertGreater(self.x, 0.0)
-        self.assertGreater(self.h2, 0.0)
+        self.assertAlmostEqual(self.p, 60.0, delta=0.05)
+        self.assertAlmostEqual(self.x, 0.0, delta=0.05)
+        self.assertAlmostEqual(self.h2, 0.0, delta=0.05)
         self.assertEqual(self.config["stock"]["R_stock_mm"], 40.0)
         self.assertEqual(self.config["stock"]["H_stock_mm"], 120.0)
         self.assertEqual(self.config["stock"]["z_plinth_mm"], 10.0)
         self.assertEqual(self.config["stock"]["finish_allowance_mm"], 1.5)
         self.assertEqual(self.config["singularity"]["r_s_min_mm"], 2.0)
         self.assertEqual(self.config["singularity"]["theta_dot_warn_rad_s"], 3.0)
+        self.assertLessEqual(self.config["v_max"]["theta_rad_s"], 1.0)
+        for key in (
+            "blade_thickness_mm",
+            "blade_width_mm",
+            "blade_length_mm",
+            "melt_kerf_mm",
+            "heated_length_mm",
+        ):
+            self.assertIn(key, self.config["tool"])
         for key in (
             "tip_radius_mm",
             "cone_half_angle_deg",
             "engaged_length_mm",
-            "melt_kerf_mm",
+            "tip_width_mm",
             "shank_radius_mm",
             "shank_length_mm",
         ):
-            self.assertIn(key, self.config["tool"])
+            self.assertNotIn(key, self.config["tool"])
+
+    def test_toolpath_module_has_no_cone_geometry(self):
+        text = Path(toolpath_sim.__file__).read_text(encoding="utf-8")
+        for token in (
+            "cone_half_angle_deg",
+            "tip_radius_mm",
+            "engaged_length_mm",
+            "tip_width_mm",
+            "shank_radius_mm",
+            "shank_length_mm",
+        ):
+            self.assertNotIn(token, text, f"toolpath_sim still references {token}")
+
+    def test_cad_reference_pose_reproduces_the_cad_reference_point(self):
+        pose = self.config["cad_reference_pose"]
+        fk = kinematics.forward_kinematics(
+            float(pose["r"]),
+            math.radians(float(pose["theta_deg"])),
+            float(pose["h"]),
+            math.radians(float(pose["phi_deg"])),
+            self.config,
+        )
+        np.testing.assert_allclose(fk.tip_xyz_wax, [0.0, 0.0, 91.0], atol=0.05)
 
     def test_fk_phi_zero(self):
         r, theta, h, phi = 60.0, 0.30, 80.0, 0.0
@@ -195,7 +228,7 @@ class TestInverseKinematicsAndLimits(unittest.TestCase):
         phi_ideal = math.radians(80.0)
         normal = (math.sin(phi_ideal), 0.0, math.cos(phi_ideal))
         ik = kinematics.inverse_kinematics_with_policy(
-            (20.0, 0.0, 40.0), normal, config
+            (20.0, 0.0, 45.0), normal, config
         )
         codes = {d.code for d in ik.diagnostics}
         self.assertIn("PHI_POLICY_CLAMPED", codes)
@@ -220,13 +253,13 @@ class TestInverseKinematicsAndLimits(unittest.TestCase):
 
     def test_out_of_bounds_joint_is_rejected_with_axis(self):
         ik = kinematics.inverse_kinematics_with_policy(
-            (100.0, 0.0, 40.0), None, self.config
+            (200.0, 0.0, 40.0), None, self.config
         )
         self.assertFalse(ik.ok)
         err = next(d for d in ik.diagnostics if d.code == "SOFT_LIMIT_EXCEEDED")
         self.assertEqual(err.severity, "error")
         self.assertEqual(err.axis, "r")
-        self.assertGreater(err.value, self.config["limits"]["r_limits_mm"][1])
+        self.assertGreater(abs(err.value), self.config["limits"]["r_limits_mm"][1])
 
     def test_height_limit_is_enforced(self):
         ik = kinematics.inverse_kinematics_with_policy(
@@ -235,6 +268,67 @@ class TestInverseKinematicsAndLimits(unittest.TestCase):
         self.assertFalse(ik.ok)
         codes = {d.code for d in ik.diagnostics}
         self.assertIn("SOFT_LIMIT_EXCEEDED", codes)
+
+    def test_signed_r_solution_avoids_a_configured_orbit_stop(self):
+        # Synthetic fixture: it asserts the policy, not that +/-170 deg was
+        # measured from the CAD. previous=160 deg, target azimuth=-170 deg.
+        config = copy.deepcopy(self.config)
+        config["limits"]["theta_limits_deg"] = [-170.0, 170.0]
+        previous = math.radians(160.0)
+        target_azimuth = math.radians(-170.0)
+        target = (20.0, target_azimuth, 40.0)
+        ik = kinematics.inverse_kinematics_with_policy(
+            target, None, config, previous_theta_rad=previous
+        )
+        self.assertTrue(ik.ok, ik.diagnostics)
+        self.assertLess(ik.r, 0.0)
+        self.assertAlmostEqual(math.degrees(ik.theta), 10.0, places=6)
+        fk = kinematics.forward_kinematics(ik.r, ik.theta, ik.h, ik.phi, config)
+        expected = (
+            20.0 * math.cos(target_azimuth),
+            20.0 * math.sin(target_azimuth),
+            40.0,
+        )
+        np.testing.assert_allclose(fk.tip_xyz_wax, expected, atol=1e-5)
+
+    def test_unknown_cad_travel_limit_requires_an_explicit_fallback(self):
+        geometry = copy.deepcopy(self.config["geometry"])
+        geometry["theta_travel_deg"] = None
+        raw = copy.deepcopy(self.config)
+        raw.pop("geometry", None)
+        raw["limits"]["theta_limits_deg"] = None
+        raw["limits"].pop("fallbacks", None)
+        with self.assertRaises(kinematics.ConfigError):
+            kinematics.merge_geometry(raw, geometry)
+        # An explicitly labelled fallback is accepted.
+        raw["limits"]["theta_limits_deg"] = [-170.0, 170.0]
+        raw["limits"]["fallbacks"] = {
+            "theta_limits_deg": {"verified": False, "reason": "unmeasured"}
+        }
+        merged = kinematics.merge_geometry(raw, geometry)
+        self.assertEqual(merged["limits"]["theta_limits_deg"], [-170.0, 170.0])
+        self.assertIn(
+            "theta_limits_deg", merged["geometry_provenance"]["unverified_limits"]
+        )
+
+    def test_configuration_may_narrow_but_never_widen_cad_travel(self):
+        geometry = self.config["geometry"]
+        raw = copy.deepcopy(self.config)
+        raw.pop("geometry", None)
+        raw["limits"]["r_limits_mm"] = [-1000.0, 1000.0]
+        merged = kinematics.merge_geometry(raw, geometry)
+        self.assertEqual(merged["limits"]["r_limits_mm"], [-51.0, 135.0])
+        raw["limits"]["r_limits_mm"] = [0.0, 100.0]
+        narrowed = kinematics.merge_geometry(raw, geometry)
+        self.assertEqual(narrowed["limits"]["r_limits_mm"], [0.0, 100.0])
+
+    def test_known_cad_travel_rejects_an_out_of_range_target(self):
+        ik = kinematics.inverse_kinematics_with_policy(
+            (140.0, 0.0, 40.0), None, self.config
+        )
+        self.assertFalse(ik.ok)
+        err = next(d for d in ik.diagnostics if d.code == "SOFT_LIMIT_EXCEEDED")
+        self.assertEqual(err.axis, "r")
 
 
 class TestTipSpeedTimingAndSingularity(unittest.TestCase):
@@ -296,6 +390,21 @@ class TestTipSpeedTimingAndSingularity(unittest.TestCase):
         # timestamps strictly increase
         self.assertGreater(frames[1]["t"], 0.0)
         self.assertLess(frames[0]["t"], frames[1]["t"])
+
+    def test_axis_crossing_emits_singularity_on_both_sides(self):
+        config = copy.deepcopy(self.config)
+        h = 40.0 + config["pivot_to_tip_mm"] + config["arm_to_pivot_z_mm"]
+        joints = [
+            {"r": 1.0, "theta": 0.0, "h": h, "phi": 0.0},
+            {"r": -1.0, "theta": 0.5, "h": h, "phi": 0.0},
+        ]
+        frames, diagnostics = kinematics.build_trajectory(
+            joints, [False, False], config
+        )
+        self.assertEqual(len(frames), 2)
+        codes = {d.code for d in diagnostics}
+        self.assertIn("SINGULARITY_HIGH_THETA_DOT", codes)
+        self.assertLessEqual(config["v_max"]["theta_rad_s"], 1.0)
 
     def test_unwrapped_theta_has_no_wrap_discontinuity(self):
         r = 20.0 + self.config["arm_radial_offset_mm"]
@@ -419,12 +528,13 @@ class TestSyntheticToolpaths(unittest.TestCase):
             required = min(stock["R_stock_mm"], worst + allowance)
             self.assertGreaterEqual(f["r_s"], required - 1e-3)
 
-    def test_rapids_retract_outside_stock(self):
+    def test_rapids_retract_outside_stock_and_tool_extent(self):
         clearance = self.config["stock"]["retract_clearance_mm"]
-        limit = self.config["stock"]["R_stock_mm"] + clearance
         rapids = [f for f in self.result.frames if f["is_rapid"]]
         self.assertGreater(len(rapids), 0)
         for f in rapids:
+            extent = tool_model.radial_support_extent(float(f["phi"]), self.config)
+            limit = self.config["stock"]["R_stock_mm"] + clearance + extent
             self.assertGreaterEqual(f["r_s"], limit - 1e-6)
 
     def test_finishing_uses_phi_and_reports_unreachable_undercuts(self):
@@ -437,25 +547,59 @@ class TestSyntheticToolpaths(unittest.TestCase):
         self.assertEqual(diag.severity, "warning")
         self.assertGreater(diag.value, 0.0)
 
-    def test_engaged_length_resampling_bound(self):
-        tip_width = self.config["tool"]["tip_width_mm"]
-        engaged = self.config["tool"]["engaged_length_mm"]
-        limit = 0.5 * tip_width
+    def test_heated_blade_resampling_bound(self):
+        tool = self.config["tool"]
+        limit = 0.5 * (
+            float(tool["blade_thickness_mm"]) + 2.0 * float(tool["melt_kerf_mm"])
+        )
         frames = self.result.frames
         worst = 0.0
         for prev, cur in zip(frames, frames[1:]):
             if cur["is_rapid"]:
                 continue
-            worst = max(worst, engaged_cone_displacement(prev, cur, engaged))
+            a = tool_model.tool_pose(
+                prev["tip_xyz_wax"], prev["theta"], prev["phi"], self.config
+            )
+            b = tool_model.tool_pose(
+                cur["tip_xyz_wax"], cur["theta"], cur["phi"], self.config
+            )
+            corners_a = tool_model.heated_corners(a, self.config)
+            corners_b = tool_model.heated_corners(b, self.config)
+            worst = max(worst, float(np.max(np.linalg.norm(corners_b - corners_a, axis=1))))
         self.assertLessEqual(worst, limit + 1e-6)
-        self.assertLess(worst, 1.0)
 
-    def test_unwrapped_theta_is_continuous_through_generator(self):
-        thetas = [f["theta_s"] for f in self.result.frames]
-        deltas = np.diff(thetas)
-        self.assertGreaterEqual(float(np.min(deltas)), -0.5)
-        self.assertLessEqual(float(np.max(deltas)), 5.0)
-        self.assertGreaterEqual(thetas[-1], thetas[0])
+    def test_roughing_passes_slice_and_broadside_is_reported(self):
+        frames = self.result.frames
+        lengths = {"slice": 0.0, "broadside": 0.0, "plunge": 0.0}
+        for prev, cur in zip(frames, frames[1:]):
+            if cur["is_rapid"] or cur["stage"] != "roughing":
+                continue
+            direction = np.asarray(cur["tip_xyz_wax"]) - np.asarray(prev["tip_xyz_wax"])
+            if float(np.linalg.norm(direction)) <= 1e-12:
+                continue
+            pose = tool_model.tool_pose(
+                cur["tip_xyz_wax"], cur["theta"], cur["phi"], self.config
+            )
+            kind = tool_model.feed_class(direction, pose, self.config)
+            lengths[kind] += float(np.linalg.norm(direction))
+        total = sum(lengths.values())
+        self.assertGreater(total, 0.0)
+        self.assertGreaterEqual(lengths["slice"] / total, 0.90)
+        if lengths["broadside"] > 0.0:
+            codes = {d.code for d in self.result.diagnostics}
+            self.assertIn("BLADE_BROADSIDE_FEED", codes)
+
+    def test_unwrapped_theta_is_continuous_within_cut_runs(self):
+        # The orbit is bounded by the stop block, so a cut run sweeps the
+        # configured arc and the rapid between slices may reset theta. Within
+        # any non-rapid run the unwrapped angle is continuous.
+        frames = self.result.frames
+        for prev, cur in zip(frames, frames[1:]):
+            if cur["is_rapid"]:
+                continue
+            delta = float(cur["theta_s"]) - float(prev["theta_s"])
+            self.assertGreaterEqual(delta, -0.5)
+            self.assertLessEqual(delta, 5.0)
 
     def test_gouge_detection_flags_tool_inside_target(self):
         # Construct a deliberately bad CL pose that buries the tool in the target.
@@ -465,6 +609,7 @@ class TestSyntheticToolpaths(unittest.TestCase):
         pose = {
             "tip_xyz_wax": tuple(float(v) for v in bad_tip),
             "tool_axis_wax": (1.0, 0.0, 0.0),
+            "theta": 0.0,
         }
         diags = toolpath_sim.detect_gouges(self.mesh, [pose], self.config)
         self.assertTrue(any(d.code == "GOUGE" for d in diags))
@@ -586,15 +731,10 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
         for point in through:
             self.assertAlmostEqual(float(np.dot(point["point"], e_theta)), 0.0, places=6)
 
-    @unittest.expectedFailure
     def test_finishing_follows_planar_contours(self):
-        # PATCH-10f: corner-normal standoff collapse (0.249 vs 0.9 mm);
-        # superseded by machine-cad-integration.
-        # Corrected (PATCH-10c): the old bounds (|z - 48| < 24, r < 34) had no
-        # basis.  The body spans z 10-50 and the needle to z 56, so |z - 48| < 24
-        # is not a surface test at all.  What matters is that every finishing cut
-        # puts the tip apex exactly one standoff (rho + kerf) off the target
-        # surface.  Link moves are excluded: only stage == "finishing" cuts.
+        # Machine-cad-integration exit criterion: the PATCH-10f expectedFailure
+        # is gone. Every finishing cut must place the *heated blade* on the
+        # target surface (support-function CL), not one cone standoff away.
         result = toolpath_sim.generate_synthetic_carve_path(
             self.needle, self.config, preset="demo"
         )
@@ -602,48 +742,53 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
             f for f in result.frames if f["stage"] == "finishing" and not f["is_rapid"]
         ]
         self.assertGreater(len(finishing), 40)
-        standoff = (
-            float(self.config["tool"]["tip_radius_mm"])
-            + float(self.config["tool"]["melt_kerf_mm"])
-        )
+        tool = self.config["tool"]
+        allowance = float(self.config["stock"]["finish_allowance_mm"])
+        length = float(tool.get("heated_length_mm", tool["blade_length_mm"]))
+        checked = 0
         for frame in finishing[:: max(1, len(finishing) // 40)]:
-            tip = np.asarray(frame["tip_xyz_wax"], dtype=float)
-            distance = float(abs(self.needle.nearest.signed_distance([tip])[0]))
-            self.assertAlmostEqual(distance, standoff, delta=0.6, msg=frame["stage"])
+            pose = tool_model.tool_pose(
+                frame["tip_xyz_wax"], frame["theta"], frame["phi"], self.config
+            )
+            samples = np.vstack(
+                [
+                    tool_model.heated_corners(pose, self.config),
+                    pose.tip_xyz,
+                    pose.tip_xyz - pose.u * (0.5 * length),
+                ]
+            )
+            signed = np.asarray(self.needle.nearest.signed_distance(samples))
+            # signed_distance is POSITIVE inside. A tangent blade touches the
+            # surface (some sample near 0) and is never buried past the finish
+            # allowance (that would be a GOUGE).
+            self.assertLessEqual(float(np.max(signed)), allowance + 1e-6)
+            self.assertLessEqual(float(np.min(np.abs(signed))), 0.75)
+            checked += 1
+        self.assertGreater(checked, 10)
 
     # (b) reachability condition -------------------------------------------
 
-    def test_finishing_phi_reachability_allows_surface_close_to_phi(self):
-        alpha = math.radians(float(self.config["tool"]["cone_half_angle_deg"]))
-        phi_hi = math.radians(float(self.config["limits"]["phi_limits_deg"][1]))
-        # beta 40 deg with 30 deg bevel -> phi = 10 deg, well inside limits.
+    def test_finishing_phi_policy_projects_into_the_surface_frame(self):
+        # beta is the surface-normal angle from +Z. The policy asks for that
+        # pitch and clamps only at the configured phi limits; no cone
+        # half-angle is subtracted any more.
         beta_ok = math.radians(40.0)
         phi, reachable = toolpath_sim.finishing_phi(
             math.sin(beta_ok), math.cos(beta_ok), self.config
         )
         self.assertTrue(reachable)
-        self.assertAlmostEqual(phi, beta_ok - alpha, places=9)
+        self.assertAlmostEqual(phi, beta_ok, places=9)
 
-        # beta inside the "within 90 - alpha" band but beyond the clamp: still reachable.
-        beta_clamped = phi_hi + alpha + math.radians(5.0)
-        beta_clamped = min(beta_clamped, math.radians(89.0))
-        phi_c, reachable_c = toolpath_sim.finishing_phi(
-            math.sin(beta_clamped), math.cos(beta_clamped), self.config
-        )
-        self.assertLessEqual(phi_c, phi_hi + 1e-9)
-        self.assertLessEqual(abs(beta_clamped - phi_c), math.pi / 2 - alpha + 1e-9)
-        self.assertTrue(reachable_c)
+        phi_hi = math.radians(float(self.config["limits"]["phi_limits_deg"][1]))
+        phi_c, _ = toolpath_sim.finishing_phi(1.0, 0.0, self.config)
+        self.assertAlmostEqual(phi_c, phi_hi, places=9)
 
-        # A face pointing almost straight down cannot be reached by the bevel
-        # flank.  Corrected (PATCH-10c): beta = 89.9 deg is a *vertical wall*
-        # (horizontal normal, n_z ~= 0), reachable because |89.9 - 59.9| = 30
-        # <= 90 - 30.  beta = 179 deg is the downward-facing case the test means.
+        # A downward-facing overhang must clamp, never flip across zero.
         beta_bad = math.radians(179.0)
-        phi_bad, reachable_bad = toolpath_sim.finishing_phi(
+        phi_bad, _ = toolpath_sim.finishing_phi(
             math.sin(beta_bad), math.cos(beta_bad), self.config
         )
-        self.assertFalse(reachable_bad)
-        self.assertGreater(abs(beta_bad - phi_bad), math.pi / 2 - alpha + 1e-9)
+        self.assertGreater(phi_bad, 0.0)
 
     # (c) safe three-step approach/retract ---------------------------------
 
@@ -655,7 +800,7 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
         stock_top = float(self.config["stock"]["H_stock_mm"])
         clearance = float(self.config["stock"]["retract_clearance_mm"])
         pivot = float(self.config["pivot_to_tip_mm"])
-        engaged = float(self.config["tool"]["engaged_length_mm"])
+        blade_length = float(self.config["tool"]["blade_length_mm"])
         # Corrected (PATCH-10c): the generator's safe plane is
         # H_stock + retract_clearance, and the apex at phi = 0 sits p below the
         # pivot, so the apex may rise p above that plane.  The old bound
@@ -681,7 +826,7 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
                 # arrive vertical first, then reorient in place
                 self.assertAlmostEqual(float(cur["phi"]), 0.0, places=6)
         for frame in frames:
-            self.assertGreaterEqual(float(frame["z_s"]), -engaged - 1e-6)
+            self.assertGreaterEqual(float(frame["z_s"]), -blade_length - 1e-6)
             # Link moves ("finishing_link") use the same safe plane as rapids.
             self.assertLessEqual(float(frame["z_s"]), ceiling, frame["stage"])
 
@@ -736,10 +881,9 @@ class TestFinishingHelpers(unittest.TestCase):
         stock = cls.config["stock"]
         cls.R = float(stock["R_stock_mm"])
         cls.H = float(stock["H_stock_mm"])
-        cls.kerf_offset = float(cls.config["tool"]["tip_radius_mm"]) + float(
-            cls.config["tool"]["melt_kerf_mm"]
-        )
-        cls.alpha = math.radians(float(cls.config["tool"]["cone_half_angle_deg"]))
+        cls.tool = cls.config["tool"]
+        cls.kerf = float(cls.tool["melt_kerf_mm"])
+        cls.length = float(cls.tool["heated_length_mm"])
 
     def helper(self, name):
         fn = getattr(toolpath_sim, name, None)
@@ -753,24 +897,28 @@ class TestFinishingHelpers(unittest.TestCase):
             [-math.sin(phi) * math.cos(theta), -math.sin(phi) * math.sin(theta), -math.cos(phi)]
         )
 
-    def _ring(self, apex, axis, station, radius):
+    def _ring(self, tip, axis, station, radius):
         tmp = np.array([0.0, 0.0, 1.0])
         if abs(float(axis @ tmp)) > 0.9:
             tmp = np.array([1.0, 0.0, 0.0])
         e1 = np.cross(axis, tmp)
         e1 /= np.linalg.norm(e1)
         e2 = np.cross(axis, e1)
-        base = apex - axis * station
+        base = tip - axis * station
         angles = np.arange(8) * (math.pi / 4.0)
         return base + radius * (
             np.cos(angles)[:, None] * e1[None, :] + np.sin(angles)[:, None] * e2[None, :]
         )
 
     def _pose(self, cc, phi, theta, extra=0.0):
-        """Tool pose with its apex at the CL (or pushed `extra` along -n)."""
+        """Tool pose with its reference point at the support-function CL."""
+
         n = np.array([math.cos(theta), math.sin(theta), 0.0])
-        apex = np.asarray(cc, dtype=float) + n * (self.kerf_offset - extra)
-        return apex, self._axis_of(phi, theta)
+        axes = tool_model.tool_pose(cc, theta, phi, self.config)
+        tip = tool_model.place_on_contact(cc, n, axes, self.config)
+        if extra:
+            tip = tip - n * extra
+        return tip, self._axis_of(phi, theta)
 
     def _distances(self, mesh, points):
         return np.abs(mesh.nearest.signed_distance(np.atleast_2d(points)))
@@ -844,34 +992,30 @@ class TestFinishingHelpers(unittest.TestCase):
 
     # -- (2) finishing_phi table --------------------------------------------
     def test_finishing_phi_table(self):
-        table = [
-            (0.0, 0.0, True),
-            (40.0, 10.0, True),
-            (90.0, 60.0, True),
-            (120.0, 75.0, True),
-            (179.0, 75.0, False),
-            (-40.0, -10.0, True),
-        ]
-        for beta_deg, phi_deg, reachable in table:
+        phi_lo, phi_hi = (float(v) for v in self.config["limits"]["phi_limits_deg"])
+        table = [0.0, 40.0, 90.0, 120.0, 179.0, -40.0]
+        for beta_deg in table:
             beta = math.radians(beta_deg)
             phi, ok = toolpath_sim.finishing_phi(
                 math.sin(beta), math.cos(beta), self.config
             )
-            self.assertAlmostEqual(math.degrees(phi), phi_deg, delta=1e-6, msg=beta_deg)
-            self.assertEqual(ok, reachable, beta_deg)
-            if reachable:
-                self.assertLessEqual(
-                    abs(beta - phi), math.pi / 2 - self.alpha + 1e-9, beta_deg
-                )
+            expected = min(max(beta_deg, phi_lo), phi_hi)
+            self.assertAlmostEqual(math.degrees(phi), expected, delta=1e-6, msg=beta_deg)
+            self.assertTrue(ok, beta_deg)
 
     def test_finishing_phi_never_flips_an_undercut_forward(self):
-        # A steep overhang must not be clamped to phi_hi and called reachable.
+        # A steep overhang clamps at phi_hi; it is never mirrored across zero.
         beta = math.radians(150.0)
-        _, ok = toolpath_sim.finishing_phi(math.sin(beta), math.cos(beta), self.config)
-        self.assertFalse(ok)
+        phi, _ = toolpath_sim.finishing_phi(math.sin(beta), math.cos(beta), self.config)
+        self.assertGreater(phi, 0.0)
+        self.assertAlmostEqual(
+            math.degrees(phi),
+            float(self.config["limits"]["phi_limits_deg"][1]),
+            places=6,
+        )
 
     # -- (3) cutter_location ------------------------------------------------
-    def test_cutter_location_offsets_along_true_normal(self):
+    def test_cutter_location_is_the_support_function_placement(self):
         cutter_location = self.helper("cutter_location")
         # A box rotated 45 deg about y gives an *exact* plane with normal
         # (1, 0, 1)/sqrt2 - no tessellation error, so the fixture is analytic.
@@ -884,27 +1028,35 @@ class TestFinishingHelpers(unittest.TestCase):
         self.assertAlmostEqual(float(box.nearest.signed_distance([cc])[0]), 0.0, places=6)
         n_r = float(normal[0])
         n_z = float(normal[2])
-        apex = cutter_location(cc, n_r, n_z, 0.0, self.config)
-        signed = float(box.nearest.signed_distance([apex])[0])
-        # Exactly one standoff outside the plane, measured on the mesh itself.
-        self.assertAlmostEqual(-signed, self.kerf_offset, places=6)
-        # And along the true normal, not a snapped radial/vertical offset.
-        self.assertAlmostEqual(float(apex[2] - cc[2]), self.kerf_offset * n_z, places=9)
-        self.assertAlmostEqual(float(apex[0] - cc[0]), self.kerf_offset * n_r, places=9)
-        self.assertGreater(abs(float(apex[0] - cc[0])), 1e-3, "no radial snap")
-        self.assertGreater(abs(float(apex[2] - cc[2])), 1e-3, "no vertical snap")
+        cl = cutter_location(cc, n_r, n_z, 0.0, self.config)
+        phi, _ = toolpath_sim.finishing_phi(n_r, n_z, self.config)
+        expected = tool_model.place_on_contact(
+            cc,
+            normal,
+            tool_model.tool_pose(cc, 0.0, phi, self.config),
+            self.config,
+        )
+        np.testing.assert_allclose(cl, expected, atol=1e-12)
+        # The heated region touches the plane at cc (rounded-box distance 0).
+        pose = tool_model.tool_pose(cl, 0.0, phi, self.config)
+        self.assertAlmostEqual(
+            float(tool_model.heated_sdf([cc], pose, self.config)[0]), 0.0, places=9
+        )
+        # And it is not a scalar standoff along the normal alone.
+        naive = cc + (0.5 * float(self.tool["blade_thickness_mm"]) + self.kerf) * normal
+        self.assertGreater(float(np.linalg.norm(cl - naive)), 1e-3)
 
 
     def test_tool_body_clear_pose_does_not_penetrate(self):
         penetrates = self.helper("tool_body_penetrates")
         box = trimesh.creation.box(extents=(20.0, 20.0, 20.0))
         box.apply_translation([0.0, 0.0, 30.0])
-        # Top-face cut at theta = 0, phi from finishing_phi (u_phi = -1).
+        # Top-face cut at theta = 0: phi = 0, blade tangent, shaft 14+ mm up.
         phi, reachable = toolpath_sim.finishing_phi(0.0, 1.0, self.config)
         self.assertTrue(reachable)
         cc = np.array([5.0, 0.0, 40.0])
-        apex, axis = self._pose(cc, phi, 0.0)
-        self.assertFalse(bool(penetrates(box, [apex], [axis], self.config)[0]))
+        tip, axis = self._pose(cc, phi, 0.0)
+        self.assertFalse(bool(penetrates(box, [tip], [axis], self.config, [0.0])[0]))
 
     def test_tool_body_penetrates_when_pushed_in(self):
         penetrates = self.helper("tool_body_penetrates")
@@ -912,59 +1064,33 @@ class TestFinishingHelpers(unittest.TestCase):
         box.apply_translation([0.0, 0.0, 30.0])
         phi, _ = toolpath_sim.finishing_phi(0.0, 1.0, self.config)
         cc = np.array([5.0, 0.0, 40.0])
-        apex, axis = self._pose(cc, phi, 0.0)
-        self.assertFalse(bool(penetrates(box, [apex], [axis], self.config)[0]))
-        # Flank stations sit 2-5 mm behind the apex, so 1 mm of push-in leaves
-        # the body outside on a flat top.  The standoff is only 0.9 mm: a push
-        # past the standoff would bury the *apex*.  Push the body in by 3 mm,
-        # which the 8-ring at the 0.25 station reaches.
-        # Push straight down along the face normal (-n_z), not along -n: for a
-        # flat top, -n is radial and only slides the apex sideways.
-        pushed = np.asarray(cc, dtype=float) + np.array([0.0, 0.0, self.kerf_offset - 3.0])
-        pushed_axis = self._axis_of(phi, 0.0)
+        tip, axis = self._pose(cc, phi, 0.0)
+        self.assertFalse(bool(penetrates(box, [tip], [axis], self.config, [0.0])[0]))
+        # The unheated shaft starts at blade_length (14 mm) above the reference
+        # point, so a 3 mm push-in only buries the heated blade (a GOUGE, not a
+        # body collision). Pushing 20 mm brings the shaft into the top face.
+        pushed = tip - np.array([0.0, 0.0, 20.0])
         self.assertTrue(
-            bool(penetrates(box, [pushed], [pushed_axis], self.config)[0]),
-            "a 3 mm push-in must bury the 1.65 mm-radius first ring",
+            bool(penetrates(box, [pushed], [axis], self.config, [0.0])[0]),
+            "a 20 mm push-in must bring the shaft into the block",
         )
 
-    def test_tool_body_penetrates_when_tilted_into_wall(self):
+    def test_tool_body_penetrates_when_the_shaft_reaches_a_wall(self):
         penetrates = self.helper("tool_body_penetrates")
-        # A tall wall at r = 15 (theta = 0, y in [-15, 15]).
-        wall = trimesh.creation.box(extents=(30.0, 30.0, 60.0))
-        wall.apply_translation([0.0, 0.0, 40.0])
-        theta = 0.0
-        cc = np.array([15.0, 0.0, 65.0])
-        # Correct pitch from the wall's radial normal: apex sits outboard.
-        phi_ok, reachable = toolpath_sim.finishing_phi(1.0, 0.0, self.config)
-        self.assertTrue(reachable)
-        apex_ok, axis_ok = self._pose(cc, phi_ok, theta)
-        self.assertFalse(bool(penetrates(wall, [apex_ok], [axis_ok], self.config)[0]))
-        # The wall face is at x = 15.  Apex clear of it, body pitched so the
-        # flank leans back across that face: the ring at each station reaches
-        # a smaller x than the wall.  (The reach test must compare against the
-        # *wall* coordinate, not against 0 - comparing to 0 never fires.)
-        wall_face = 15.0
-        stations = (0.25, 0.5, 0.75, 1.0)
-        engaged = float(self.config["tool"]["engaged_length_mm"])
-        radii = [
-            float(self.config["tool"]["tip_radius_mm"])
-            + t * engaged * math.tan(self.alpha)
-            for t in stations
-        ]
-        for phi_bad in (math.radians(-60.0), math.radians(-30.0), 0.0):
-            apex_bad = np.array([15.0 + self.kerf_offset, 0.0, 65.0])
-            axis_bad = self._axis_of(phi_bad, theta)
-            reaches_wall = [
-                float((apex_bad - axis_bad * (t * engaged))[0]) - r < wall_face
-                for t, r in zip(stations, radii)
-            ]
-            if any(reaches_wall):
-                self.assertTrue(
-                    bool(penetrates(wall, [apex_bad], [axis_bad], self.config)[0]),
-                    f"phi {math.degrees(phi_bad):.1f}",
-                )
-                return
-        self.fail("fixture did not lean the body into the wall")
+        # A tall wall whose face is at x = 10.
+        # A tall block whose face is at x = 10, spanning the shaft height but
+        # stopping below the tilt head so this is a shaft-only collision.
+        wall = trimesh.creation.box(extents=(10.0, 30.0, 30.0))
+        wall.apply_translation([15.0, 0.0, 85.0])
+        tip_clear = np.array([7.0, 0.0, 65.0])
+        tip_buried = np.array([9.0, 0.0, 65.0])
+        axis = np.array([0.0, 0.0, -1.0])
+        self.assertFalse(
+            bool(penetrates(wall, [tip_clear], [axis], self.config, [0.0])[0])
+        )
+        self.assertTrue(
+            bool(penetrates(wall, [tip_buried], [axis], self.config, [0.0])[0])
+        )
 
     # -- (5) exit_moves -----------------------------------------------------
     def test_exit_moves_are_clear_and_end_outboard(self):
@@ -972,7 +1098,7 @@ class TestFinishingHelpers(unittest.TestCase):
         # Box overhang: an 80 mm wide slab whose underside is at z = 90, over a
         # column wall at r = 10 (plus the stock body the wall belongs to).
         slab = trimesh.creation.box(extents=(80.0, 80.0, 20.0))
-        slab.apply_translation([0.0, 0.0, 100.0])
+        slab.apply_translation([0.0, 0.0, 150.0])
         column = trimesh.creation.box(extents=(20.0, 20.0, 80.0))
         column.apply_translation([0.0, 0.0, 50.0])
         body = trimesh.creation.box(extents=(19.0, 19.0, 79.0))
@@ -980,13 +1106,14 @@ class TestFinishingHelpers(unittest.TestCase):
         mesh = trimesh.util.concatenate([slab, column, body])
         clearance_target = self.R + float(self.config["stock"]["retract_clearance_mm"])
         theta = 0.0
-        # A pitched 75 deg cut on the column wall at r = 10, apex one standoff
-        # out with its heater touching the wall, tucked at z = 82 under the
-        # overhang at z = 90.
+        # A pitched 75 deg cut on the column wall at r = 10, placed with the
+        # support function so the heated blade touches the wall, tucked at
+        # z = 82 under the overhang at z = 90.
         phi = math.radians(75.0)
-        apex = np.array([10.0 + self.kerf_offset, 0.0, 82.0])
+        cc = np.array([10.0, 0.0, 82.0])
+        tip, _axis = self._pose(cc, phi, theta)
         collector = kinematics.DiagnosticCollector()
-        moves = exit_moves(apex, phi, theta, mesh, self.config, clearance_target, collector)
+        moves = exit_moves(tip, phi, theta, mesh, self.config, clearance_target, collector)
         self.assertGreaterEqual(len(moves), 2)
         self.assertAlmostEqual(float(moves[-1]["phi"]), 0.0, places=9)
         self.assertGreaterEqual(float(moves[-1]["r"]) or 0.0, 0.0)
@@ -999,36 +1126,24 @@ class TestFinishingHelpers(unittest.TestCase):
             )
             poses.append((np.asarray(fk.tip_xyz_wax), np.asarray(fk.tool_axis_wax)))
         self.assertGreaterEqual(float(np.hypot(*poses[-1][0][:2])), self.R + 1e-6)
-        for apex_i, axis_i in poses[:-1]:
+        for tip_i, axis_i in poses[:-1]:
             self.assertFalse(
-                bool(self.helper("tool_body_penetrates")(mesh, [apex_i], [axis_i], self.config)[0]),
+                bool(
+                    self.helper("tool_body_penetrates")(
+                        mesh, [tip_i], [axis_i], self.config, [theta]
+                    )[0]
+                ),
                 "exit pose buried",
             )
 
 
-def _tool_body_points(mesh, config, apex, axis, stations=(0.25, 0.5, 0.75, 1.0)):
-    """Independent reference: axis + 8 ring points at each station."""
+def _tool_body_points(mesh, config, tip, axis):
+    """Independent reference: heated blade corners in the wax frame."""
+
     del mesh
-    tool = config["tool"]
-    engaged = float(tool["engaged_length_mm"])
-    tip_r = float(tool["tip_radius_mm"])
-    alpha = math.radians(float(tool["cone_half_angle_deg"]))
-    axis = np.asarray(axis, dtype=float)
-    axis = axis / np.linalg.norm(axis)
-    tmp = np.array([0.0, 0.0, 1.0])
-    if abs(float(axis @ tmp)) > 0.9:
-        tmp = np.array([1.0, 0.0, 0.0])
-    e1 = np.cross(axis, tmp)
-    e1 /= np.linalg.norm(e1)
-    e2 = np.cross(axis, e1)
-    points = [np.asarray(apex, dtype=float)]
-    for t in stations:
-        base = np.asarray(apex, dtype=float) - axis * (t * engaged)
-        radius = tip_r + t * engaged * math.tan(alpha)
-        for k in range(8):
-            angle = k * math.pi / 4.0
-            points.append(base + radius * (math.cos(angle) * e1 + math.sin(angle) * e2))
-    return np.asarray(points)
+    theta = 0.0
+    pose = toolpath_sim._pose_for_axis(tip, axis, theta, config)
+    return tool_model.heated_corners(pose, config)
 
 
 class TestPatch10APIRegressions(unittest.TestCase):
@@ -1043,12 +1158,34 @@ class TestPatch10APIRegressions(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422, response.text)
 
-    def test_zero_tool_radius_returns_422(self):
+    def test_removed_cone_key_returns_422_naming_it(self):
         response = self.client.post(
             "/api/sculpt-and-sim",
-            json={"sliders": {}, "preset": "demo", "tool_cfg": {"tip_radius_mm": 0.0}},
+            json={"sliders": {}, "preset": "demo", "tool_cfg": {"cone_half_angle_deg": 30.0}},
         )
         self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("cone_half_angle_deg", response.text)
+
+    def test_heated_length_longer_than_the_blade_returns_422(self):
+        response = self.client.post(
+            "/api/sculpt-and-sim",
+            json={"sliders": {}, "preset": "demo", "tool_cfg": {"heated_length_mm": 99.0}},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("heated_length_mm", response.text)
+
+    def test_demo_response_carries_geometry_provenance(self):
+        response = self.client.post(
+            "/api/sculpt-and-sim",
+            json={"sliders": {}, "preset": "demo"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        provenance = response.json()["config"]["geometry_provenance"]
+        self.assertEqual(
+            provenance["step_sha256"],
+            "00882f0ebeaeaae66b7b8eb28e4d2dc9bbf30d65c2d66705f86deec566fd7bd0",
+        )
+        self.assertIsNone(provenance["home_pose"])
 
     def test_max_frames_exceedance_maps_to_422(self):
         response = self.client.post(

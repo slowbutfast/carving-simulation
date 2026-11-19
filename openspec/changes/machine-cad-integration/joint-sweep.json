@@ -1,0 +1,1379 @@
+{
+  "cad_reference_pose": {
+    "h": 151.0,
+    "phi_deg": 0.0,
+    "r": 0.0,
+    "theta_deg": 0.0
+  },
+  "change": "machine-cad-integration",
+  "frames": [
+    {
+      "a_n_wax": [
+        0.984808,
+        0.173648,
+        0.0
+      ],
+      "a_w_wax": [
+        0.173648,
+        -0.984808,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": -170.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": -170.0,
+      "tip_xyz_wax": [
+        -0.0,
+        -0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        0.0,
+        0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        0.608761,
+        0.793353,
+        0.0
+      ],
+      "a_w_wax": [
+        0.793353,
+        -0.608761,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": -127.5,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": -127.5,
+      "tip_xyz_wax": [
+        -0.0,
+        -0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        0.0,
+        0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.087156,
+        0.996195,
+        0.0
+      ],
+      "a_w_wax": [
+        0.996195,
+        0.087156,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": -85.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": -85.0,
+      "tip_xyz_wax": [
+        0.0,
+        -0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.737277,
+        0.67559,
+        0.0
+      ],
+      "a_w_wax": [
+        0.67559,
+        0.737277,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": -42.5,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": -42.5,
+      "tip_xyz_wax": [
+        0.0,
+        -0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.737277,
+        -0.67559,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.67559,
+        0.737277,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 42.5,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 42.5,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.087156,
+        -0.996195,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.996195,
+        0.087156,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 85.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 85.0,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        0.608761,
+        -0.793353,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.793353,
+        -0.608761,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 127.5,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 127.5,
+      "tip_xyz_wax": [
+        -0.0,
+        0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        0.984808,
+        -0.173648,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.173648,
+        -0.984808,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 170.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 170.0,
+      "tip_xyz_wax": [
+        -0.0,
+        0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 71.0091,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": -79.9909
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        11.0091
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 91.008,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": -59.992
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        31.008
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 111.0068,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": -39.9932
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        51.0068
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 131.0057,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": -19.9943
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        71.0057
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0045,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0045
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        91.0045
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 171.0034,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 20.0034
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        111.0034
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 191.0023,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 40.0023
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        131.0023
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 211.0011,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 60.0011
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        151.0011
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 231.0,
+      "phi_deg": 0.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 80.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        0.0,
+        0.0,
+        171.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": -51.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": -51.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        -51.0,
+        -0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": -27.75,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": -27.75,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        -27.75,
+        -0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": -4.5,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": -4.5,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        -4.5,
+        -0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 18.75,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 18.75,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        18.75,
+        0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 42.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 42.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        42.0,
+        0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 65.25,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 65.25,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        65.25,
+        0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 88.5,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 88.5,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        88.5,
+        0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 111.75,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 111.75,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        111.75,
+        0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -1.0,
+        -0.0,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 0.0,
+      "r": 135.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 135.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        135.0,
+        0.0,
+        91.0
+      ],
+      "tool_axis_wax": [
+        -0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.5,
+        0.0,
+        -0.866025
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": -60.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": -60.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        51.9615,
+        0.0,
+        121.0
+      ],
+      "tool_axis_wax": [
+        0.866,
+        0.0,
+        -0.5
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.729864,
+        0.0,
+        -0.683592
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": -43.125,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": -43.125,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        41.0155,
+        0.0,
+        107.2082
+      ],
+      "tool_axis_wax": [
+        0.6836,
+        0.0,
+        -0.7299
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.896873,
+        0.0,
+        -0.442289
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": -26.25,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": -26.25,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        26.5373,
+        0.0,
+        97.1876
+      ],
+      "tool_axis_wax": [
+        0.4423,
+        0.0,
+        -0.8969
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.986643,
+        0.0,
+        -0.162895
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": -9.375,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": -9.375,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        9.7737,
+        0.0,
+        91.8014
+      ],
+      "tool_axis_wax": [
+        0.1629,
+        0.0,
+        -0.9866
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.991445,
+        -0.0,
+        0.130526
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 7.5,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 7.5,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        -7.8316,
+        -0.0,
+        91.5133
+      ],
+      "tool_axis_wax": [
+        -0.1305,
+        -0.0,
+        -0.9914
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.910864,
+        -0.0,
+        0.412707
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 24.375,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 24.375,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        -24.7624,
+        -0.0,
+        96.3482
+      ],
+      "tool_axis_wax": [
+        -0.4127,
+        -0.0,
+        -0.9109
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.75184,
+        -0.0,
+        0.659346
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 41.25,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 41.25,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        -39.5607,
+        -0.0,
+        105.8896
+      ],
+      "tool_axis_wax": [
+        -0.6593,
+        -0.0,
+        -0.7518
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.528068,
+        -0.0,
+        0.849202
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 58.125,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 58.125,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        -50.9521,
+        -0.0,
+        119.3159
+      ],
+      "tool_axis_wax": [
+        -0.8492,
+        -0.0,
+        -0.5281
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.258819,
+        -0.0,
+        0.965926
+      ],
+      "a_w_wax": [
+        -0.0,
+        1.0,
+        0.0
+      ],
+      "h": 151.0,
+      "phi_deg": 75.0,
+      "r": 0.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 0.0,
+        "radial_position_mm": 0.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 75.0,
+        "z_position_mm": 0.0
+      },
+      "theta_deg": 0.0,
+      "tip_xyz_wax": [
+        -57.9555,
+        -0.0,
+        135.4709
+      ],
+      "tool_axis_wax": [
+        -0.9659,
+        -0.0,
+        -0.2588
+      ]
+    },
+    {
+      "a_n_wax": [
+        0.939693,
+        -0.34202,
+        0.0
+      ],
+      "a_w_wax": [
+        -0.34202,
+        -0.939693,
+        0.0
+      ],
+      "h": 150.0,
+      "phi_deg": 0.0,
+      "r": -20.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 160.0,
+        "radial_position_mm": -20.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 0.0,
+        "z_position_mm": -1.0
+      },
+      "theta_deg": 160.0,
+      "tip_xyz_wax": [
+        18.7939,
+        -6.8404,
+        90.0
+      ],
+      "tool_axis_wax": [
+        0.0,
+        -0.0,
+        -1.0
+      ]
+    },
+    {
+      "a_n_wax": [
+        0.696364,
+        0.122788,
+        0.707107
+      ],
+      "a_w_wax": [
+        0.173648,
+        -0.984808,
+        0.0
+      ],
+      "h": 150.0,
+      "phi_deg": 45.0,
+      "r": -20.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": -170.0,
+        "radial_position_mm": -20.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": 45.0,
+        "z_position_mm": -1.0
+      },
+      "theta_deg": -170.0,
+      "tip_xyz_wax": [
+        61.478,
+        10.8402,
+        107.5736
+      ],
+      "tool_axis_wax": [
+        0.6964,
+        0.1228,
+        -0.7071
+      ]
+    },
+    {
+      "a_n_wax": [
+        -0.0,
+        -0.5,
+        -0.866025
+      ],
+      "a_w_wax": [
+        -1.0,
+        0.0,
+        0.0
+      ],
+      "h": 180.0,
+      "phi_deg": -60.0,
+      "r": -60.0,
+      "rig_deltas": {
+        "orbit_rotation_z_deg": 90.0,
+        "radial_position_mm": -60.0,
+        "tilt_rotation_axis": "pivot along -e_theta at pivot_point_mm",
+        "tilt_rotation_deg": -60.0,
+        "z_position_mm": 29.0
+      },
+      "theta_deg": 90.0,
+      "tip_xyz_wax": [
+        -0.0,
+        -8.0385,
+        150.0
+      ],
+      "tool_axis_wax": [
+        0.0,
+        0.866,
+        -0.5
+      ]
+    }
+  ],
+  "link_occurrence_counts": {
+    "orbit": 113,
+    "radial": 17,
+    "static": 100,
+    "stock_placeholder": 1,
+    "tilt": 8,
+    "unassigned": 2,
+    "z": 54
+  },
+  "machine_geometry_sha256": "d846d3e548464126300a7b524a3349b83bf040b7aca5c6f69a882f2da3bc455b",
+  "owner_checks": [
+    "No part moves with the wrong link (roles table above).",
+    "Tilt rotates about the servo-horn axis; confirm it is not the Dowel_3x37 axis (14.03 mm radial offset candidate in pivot_candidates).",
+    "The blade tip stays on tip_xyz_wax through orbit, Z, radial and tilt sweeps.",
+    "Negative-r frames place the tool on the far side of the orbit axis without orbiting through the stop block."
+  ],
+  "pivot_axis_mm": [
+    0.0,
+    -1.0,
+    0.0
+  ],
+  "pivot_point_mm": [
+    0.0,
+    0.0,
+    151.0
+  ],
+  "purpose": "Owner sign-off recording for task 7.1: every link swept through its travel, with the joint tuple, FK tool-reference point, tool frame, and the exact rig deltas the viewer applies.",
+  "step_sha256": "00882f0ebeaeaae66b7b8eb28e4d2dc9bbf30d65c2d66705f86deec566fd7bd0",
+  "stock_placeholder_parts": [
+    "Wax_Block_Cast_120x100x56:1"
+  ],
+  "sweeps": {
+    "orbit_theta_deg": [
+      -170.0,
+      -127.5,
+      -85.0,
+      -42.5,
+      0.0,
+      42.5,
+      85.0,
+      127.5,
+      170.0
+    ],
+    "radial_r_mm": [
+      -51.0,
+      -27.75,
+      -4.5,
+      18.75,
+      42.0,
+      65.25,
+      88.5,
+      111.75,
+      135.0
+    ],
+    "tilt_phi_deg": [
+      -60.0,
+      -43.125,
+      -26.25,
+      -9.375,
+      7.5,
+      24.375,
+      41.25,
+      58.125,
+      75.0
+    ],
+    "z_h_mm": [
+      71.0091,
+      91.008,
+      111.0068,
+      131.0057,
+      151.0045,
+      171.0034,
+      191.0023,
+      211.0011,
+      231.0
+    ]
+  },
+  "unassigned_parts": [
+    "Cold_Tool_6mm_Shank:1",
+    "Dowel_3x37:1"
+  ]
+}

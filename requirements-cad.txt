@@ -1,0 +1,5 @@
+# Dev-only CAD extraction dependencies. Never add cadquery-ocp to requirements.txt:
+# the runtime server must not import OCP or read .stp files.
+cadquery-ocp==8.0.1.1.0
+numpy>=1.24
+trimesh>=4.0
