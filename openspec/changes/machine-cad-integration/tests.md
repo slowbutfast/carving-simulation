@@ -1,0 +1,60 @@
+## Automated Tests
+
+- `.venv/bin/python -m unittest tests.test_machine_cad -v`. Runtime-only: these read the committed `machine_geometry.json` / GLBs and need no OCP.
+  - **Units, frame and orbit axis**: `source_length_unit == "cm"`, base plate diameter 700.0 ± 0.1 mm in the machine frame, orbit axis at machine (0, 0), the transform matrix is a proper rotation (det = +1), and `seat_y_cad` is recorded.
+  - **Provenance and staleness**: `step_sha256` equals the SHA-256 of the committed `assets/Wax+Face+Carver+v2.stp`, and `ocp_version` is present.
+  - **Role coverage**: per-link occurrence counts sum to 295. `Cold_Tool_6mm_Shank:1` is in `unassigned_parts`. `Wax_Block_Cast_120x100x56:1` is in `stock_placeholder_parts`. No `stock_placeholder` or `unassigned` part contributes to tool or collision geometry.
+  - **Kinematic constants**: `pivot_to_tip_mm` 60.0 ± 0.05, `pivot_radial_offset_mm` 0.0 ± 0.05, `tangential_tool_offset_mm` 0.0 ± 0.05, `r_travel_mm` [−51.0, 135.0] ± 0.5, and `cad_reference_pose` as in spec. Any `null` constant carries a `reason`.
+  - **Home pose not inferred**: `home_pose is None`.
+  - **GLB budget and reassembly**: total `static/models/*.glb` ≤ 8 MiB, mesh node names match CAD occurrence names, and the tilt-GLB cartridge's lowest vertex is at the recorded tool reference point within 0.05 mm.
+  - **Runtime import guard**: an AST scan of `server.py`, `kinematics.py`, `toolpath_sim.py`, `tool_model.py` finds no `OCP` import, and a text scan of `static/*.js` finds no `.stp` reference.
+- `.venv-cad/bin/python -m unittest tests.test_machine_cad_extract -v`. Skipped when `cadquery-ocp` is not importable.
+  - **Determinism**: two extractor runs into temp dirs produce byte-identical `machine_geometry.json`.
+  - **Committed artifact is current**: a fresh extraction equals the committed `machine_geometry.json`.
+  - **Unmatched part surfaces**: with a roles file missing one rule, that occurrence lands in `unassigned_parts` and in the summary output.
+- `.venv/bin/python -m unittest tests.test_tool_model -v`
+  - **Tool frame**: at θ = 0, φ = 0 the frame is a_n = −X, a_w = +Y, u = −Z, with `a_n × a_w = u`. It stays right-handed orthonormal (1e-12) across the φ/θ grid, with a_w = e_θ. The CAD blade thickness axis is unoriented, so ±X represent the same physical axis.
+  - **Heated SDF analytic probes**: the four probe values from the spec (reference point −kerf, side face 0, width side +1.0, below +2.0).
+  - **Support placement**: 500 seeded normals give tangency (|sdf(cc)| ≤ 1e-9) with no penetration of the tangent half-space. Flat top gives cc + kerf·Z. A tangential normal (|n_θ| > 0.3) differs from `cc + (ρ + kerf)·n`.
+  - **Body collision**: wall at 2.0 mm (20–40 mm from the reference point along −u) penetrates, wall at 3.0 mm does not. The tilt-head collision fixture is built from the explicit local envelope in `machine_geometry.json`. Sign convention: trimesh inside-positive, documented in the test docstring.
+  - **Feed class**: +e_r is broadside, +e_θ is slice, −Z is plunge at φ = 0, and the threshold is read from config.
+- `.venv/bin/python -m unittest tests.test_carver_sim -v`. MVP suite with fixtures migrated; each migrated assertion is listed in `patch.md`.
+  - **FK datums**: the MVP algebraic checks at the new constants, negative-r tip position, and `cad_reference_pose → (0, 0, 91.0)` within 0.05 mm.
+  - **IK signed-r and θ stop**: in a synthetic config explicitly setting `theta_limits_deg = [−170°, 170°]`, θ = 160° → azimuth −170° returns θ = 10°, r < 0. φ_ideal is computed in the chosen solution's frame. Round-trip within 1e-5 mm. This does not treat ±170° as a CAD measurement.
+  - **Unknown CAD travel**: a `null` CAD travel limit without an explicit config fallback fails config validation; unknown travel is never treated as unlimited.
+  - **Soft limits from CAD**: r = 140 raises `SOFT_LIMIT_EXCEEDED` (r) by CAD travel. A config limit wider than CAD travel is narrowed to CAD.
+  - **Singularity on both sides**: a crossing from r_s > 0 to r_s < 0 with high θ̇ emits `SINGULARITY_HIGH_THETA_DOT`. The default `v_max_theta_rad_s` is ≤ 1.0.
+  - **Roughing slices**: ≥ 90 % of `demo` roughing cutting length is classified `slice`, and broadside segments raise `BLADE_BROADSIDE_FEED`.
+  - **Finishing on tool_model**: finishing CL equals `place_on_contact` (1e-6). Unreachable chin overhang emits `UNREACHABLE_UNDERCUT_AREA`. No reference to cone keys remains (grep guard on `toolpath_sim.py`).
+  - **Sampling bound**: Δs_max ≤ 0.5·(1.2 + 2·kerf) over heated-region corner points.
+  - **Rapids clear by tool extent**: every rapid traverse segment has |r_s| ≥ R_stock + retract_clearance + radial support extent.
+  - **API**: `demo` returns 200 with `config.geometry_provenance.step_sha256`. `tool_cfg.cone_half_angle_deg` returns 422 naming the key. `heated_length_mm` > blade length returns 422.
+- **Performance guard**: `demo` toolpath-generation wall time is ≤ 1.5× the recorded MVP baseline (`main` at `98ac91d`, roughing + cone finishing) for the same enabled stages, preset, slider values, and environment. Record the baseline revision, stage list, frame count, and environment.
+- `node --test tests/test_wax_sdf.mjs`
+  - **Python/JS heated-SDF parity**: a committed fixture (`tests/fixtures/heated_sdf_parity.json`, generated by `tool_model.py`) of 1,000 points × 20 poses agrees within 1e-5 mm.
+  - **Direction-dependent kerf**: a 20 mm θ move carves a slot of 1.2 + 2·kerf (± 1 voxel). A 20 mm r move carves 6.0 + 2·kerf (± 1 voxel).
+  - **Undercut seams, snapshot scrub** (MVP tests) re-run with the blade stamp.
+  - **Shank collision bodies**: a shaft-only intrusion reports `SHANK_COLLISION` with `body: "shaft"`. A head intrusion reports `body: "head"`.
+  - **Zero-trig guard**: `static/cad_rig.js` and `static/app.js` contain no kinematic `Math.sin`/`Math.cos`.
+- `node --test tests/test_cad_rig.mjs` (headless Three.js scene graph, no WebGL renderer)
+  - **Rig tip tracks backend**: for 20 committed `demo` frames (including φ ≠ 0 and r < 0), the world position of the cartridge's lowest-point marker matches `tip_xyz_wax` within 0.1 mm.
+  - **Static wax**: rotating θ by 90° leaves the wax world matrix unchanged.
+  - **GLB load failure fallback**: a missing GLB path yields a tool-plus-wax scene and an error event, not an exception.
+
+## Manual Verification
+
+- **CAD rig fidelity**:
+  - **WHEN** the studio loads with no job
+  - **THEN** the machine renders at `cad_reference_pose`, matching the Fusion assembly by eye (ring, column, arm, tilt head, T12 pointing down). No rectangular wax block is visible, the cylindrical stock sits on the seat plane, and the unassigned-parts note lists `Cold_Tool_6mm_Shank` (and `Dowel_3x37` if still unassigned).
+- **Orbit and joints**:
+  - **WHEN** the user plays the `demo` job and scrubs across it
+  - **THEN** the ring, column and arm orbit while the wax stays still, the radial carriage crosses the orbit axis on negative-r frames, the tilt head rotates about the servo horn axis, and the blade tip stays visually in contact with the carving front.
+- **Blade kerf reads correctly**:
+  - **WHEN** a roughing ring pass completes
+  - **THEN** the carved groove is visibly narrow (about 2 mm) along θ, and any broadside segment raises the amber `BLADE_BROADSIDE_FEED` badge.
+- **Machine-detail toggle and mobile default**:
+  - **WHEN** the viewport is narrower than 900px
+  - **THEN** the toggle defaults to Tool only, its touch target is ≥ 44px, and switching to Full shows all links.
+- **Owner sign-off on roles and pivot**:
+  - **WHEN** the owner reviews `cad_part_roles.json` and the rig sweeping each joint through its travel
+  - **THEN** no part moves with the wrong link, and the pivot axis (horn vs `Dowel_3x37`) is confirmed and recorded in research.md.

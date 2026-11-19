@@ -31,3 +31,6 @@ node_modules/
 # Local UI smoke artifacts
 .tmp-*
 .sweep/
+
+# CAD: the STEP is the source of truth; STL exports are derived, nameless triangle soups
+assets/*.stl

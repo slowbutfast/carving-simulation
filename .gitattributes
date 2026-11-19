@@ -1,0 +1,5 @@
+# CAD exports must stay byte-exact (machine_geometry.json pins the STEP SHA-256)
+*.stp binary
+*.step binary
+*.stl binary
+*.glb binary
