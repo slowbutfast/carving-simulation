@@ -117,7 +117,7 @@
 
 ## 8. Verification & Empirical Audit
 
-- [ ] 8.1 Run the full regression suite: `.venv/bin/python -m unittest discover -s tests`, `node --test tests/`, and `.venv-cad/bin/python -m unittest tests.test_machine_cad_extract`. Verify clean passes and record pass/skip counts. Check `demo`/`standard` frame counts and toolpath-generation wall time against the post-fallback baseline using equivalent enabled stages and inputs.
+- [ ] 8.1 Run the full regression suite: `.venv/bin/python -m unittest discover -s tests`, `node --test tests/`, and `.venv-cad/bin/python -m unittest tests.test_machine_cad_extract`. Verify clean passes and record pass/skip counts. Check `demo`/`standard` frame counts and toolpath-generation wall time against the 0.3 baseline (`98ac91d`) using equivalent enabled stages and inputs.
 - [ ] 8.2 Populate `verification.md`:
   - Requirement Adherence Matrix (every requirement and scenario in all five spec files → test name → result)
   - resolved and remaining assumptions (pivot, heated length, stock, home pose, cold tool)
