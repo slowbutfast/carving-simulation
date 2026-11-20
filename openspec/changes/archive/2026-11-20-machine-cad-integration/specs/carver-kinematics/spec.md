@@ -49,10 +49,10 @@ The system SHALL solve joint coordinates $(r, \theta, h, \phi)$ from target tool
 ### Requirement: Relative tip speed, timing model, and axis singularity detection
 The system SHALL compute segment timestamps $t$ from configured feed rates (`feed_cut_mm_s`, `feed_rapid_mm_s`) and per-axis velocity limits (`v_max_r_mm_s`, `v_max_theta_rad_s`, `v_max_h_mm_s`, `v_max_phi_deg_s`) via $\Delta t = \max(\Delta s / \text{feed}, \max_i |\Delta q_i| / v_{\text{max}, i})$. Using unwrapped $\theta$ (`rad`), the system SHALL compute relative tip speed in the wax frame $v_{\text{tip}} = \sqrt{\dot{r}_s^2 + (r_s \dot{\theta}_s)^2 + \dot{z}_s^2}$. It SHALL emit a `SINGULARITY_HIGH_THETA_DOT` warning whenever $|r_s| < r_{s,\min}$ (configured `r_s_min_mm`, default `2.0 mm`) and $|\dot{\theta}_s| > \dot{\theta}_{\text{warn}}$ (configured `theta_dot_warn_rad_s`, default `3.0 rad/s`), limiting segment speed to `v_max_theta_rad_s`. Because the orbit ring carries the column, arm and counterweight, `v_max_theta_rad_s` SHALL default to a value no greater than `1.0 rad/s` until measured.
 
-#### Scenario: Pure orbit rotation and combined tilted motion report relative tip speed
+#### Scenario: Pure turntable rotation and combined tilted motion report relative tip speed
 - **WHEN** (a) only $\theta$ changes at $r_s = 30\text{ mm}$, or (b) $r, \theta, h, \phi$ change simultaneously with $\phi \ne 0^\circ$
 - **THEN** `v_tip` matches $\sqrt{\dot{r}_s^2 + (r_s \dot{\theta}_s)^2 + \dot{z}_s^2}$ in the wax frame rather than zero or joint-only speed
 
-#### Scenario: Near-axis trajectory triggers singularity warning on either side of the axis
+#### Scenario: Near-axis trajectory triggers singularity warning
 - **WHEN** a trajectory segment passes inside $|r_s| < r_{s,\min}$ (including a crossing from $r_s > 0$ to $r_s < 0$) with required $|\dot{\theta}_s| > \dot{\theta}_{\text{warn}}$
 - **THEN** the trajectory diagnostics include `SINGULARITY_HIGH_THETA_DOT` and segment timing respects `v_max_theta_rad_s`

@@ -97,7 +97,7 @@ Windows XP Luna Retro Minimalist meets 4-DOF Thermal CNC Wax Carving (**4-DOF Wa
 - **Surface (`#ece9d8`) & Inset (`#f0ede0`, `#ffffff`)**: Warm cream/grey XP chrome contrasting against the `#f0ede0` 3D gallery viewport well.
 - **Luna Titlebar (`#0058ee` -> `#3593ff` -> `#072a8c`)**: Horizontal royal-blue gradient with `#ffffff` bold title text.
 - **Action Green (`#70c040` -> `#3e8e18`, border `#286010`)**: High-contrast Start-style CTA for `SCULPT & SIMULATE`.
-- **Faults & Warnings**: `#e81123` on `#ffffff` text for `.status-badge-collision` (`RAPID_COLLISION`, `SHANK_COLLISION`, `SOFT_LIMIT_EXCEEDED`, `STOCK_BOUNDS_EXCEEDED`) and close-button hover; `#f59e0b` for warnings (`SINGULARITY_HIGH_THETA_DOT`, `UNREACHABLE_UNDERCUT_AREA`).
+- **Faults & Warnings**: `#e81123` on `#ffffff` text for `.status-badge-collision` (`RAPID_COLLISION`, `SHANK_COLLISION`, `SOFT_LIMIT_EXCEEDED`, `STOCK_BOUNDS_EXCEEDED`) and close-button hover; `#f59e0b` for warnings (`SINGULARITY_HIGH_THETA_DOT`, `UNREACHABLE_UNDERCUT_AREA`, `BLADE_BROADSIDE_FEED`, `GLB_LOAD_FAILED`).
 - **3D Materials**: Machinable wax (`#e8d595`), translucent target face ghost (`#3b82f6`), primitive metal rig (`#64748b`), and hot conical-bevel tip (`#f97316`).
 
 ## Typography
@@ -124,7 +124,7 @@ Windows XP Luna Retro Minimalist meets 4-DOF Thermal CNC Wax Carving (**4-DOF Wa
 ## Components
 
 - **Titlebar & Menu Bar**: `4-DOF Wax Carver Studio 2001`, `Minimize` (`_`), `Maximize` (`□`), `Close` (`×`), and `File(F)`, `Presets(P)`, `Simulation(S)` / `View(V)`, `Help(H)` dropdowns.
-- **Sidebar Panels**: `Model Source` (preset + `.stl`/`.obj`/`.3mf` upload), `Facial Sculpt` (`nose`, `brow`, `cheeks`, `jaw`, `chin` `.xp-slider`s), `Stock & Preset` (`R_stock`, `H_stock`, `Demo`/`Standard`, `Show Target Ghost`), and green `SCULPT & SIMULATE` CTA.
+- **Sidebar Panels**: `Model Source` (preset + `.stl`/`.obj`/`.3mf` upload), `Facial Sculpt` (`nose`, `brow`, `cheeks`, `jaw`, `chin` `.xp-slider`s), `Stock & CAD Rig` (`R_stock`, `H_stock`, `Demo`/`Standard`, `Show Target Ghost`, `Machine Detail: Full / Tool Only`, `Unassigned Parts`, `Provenance`), and green `SCULPT & SIMULATE` CTA.
 - **Transport Dock (`.transport-dock`)**: Plain-text `Prev`, `Play`/`Pause`, `Next`, `Carve to End` `.transport-btn`s, `#sim-scrubber`, `#sim-time`, and `#sim-speed` (`1x`, `5x`, `10x`, `20x`).
 - **Status Bar (`footer.status-bar`)**: Five inset `.status-cell` panes (`#status-text`, `#status-joints`, `#status-tip`, `#status-feed`, `#status-state`).
 
