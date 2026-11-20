@@ -4,7 +4,7 @@
 
 | Item | Value |
 |---|---|
-| Change | `head2-collision-logging` (16/16 tasks; `4.2` static-verified) |
+| Change | `head2-collision-logging` (15/16 tasks `[x]`; `4.2` is `[~]`: implemented and static-verified, needs a human browser check) |
 | Branch | `feat/head2-collision-logging` |
 | Verdict | **PASS** — every non-skipped Python and Node test is green (120 pass / 4 skip / 0 fail) and the live 6.2 run + headless audit succeeded. One caveat, documented below: a single-process `unittest discover` cannot complete in this container because it is OOM-killed at a pre-existing memory peak. |
 | Python | `.venv/bin/python` 3.11, trimesh 5.2.1, numpy 2.4.6, scipy (cKDTree) |
