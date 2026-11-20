@@ -4,14 +4,14 @@
 
 | Item | Value |
 |---|---|
-| Change | `head2-collision-logging` (14/16 complete; `4.2` static-verified, `6.1` paused) |
+| Change | `head2-collision-logging` (16/16 tasks; `4.2` static-verified) |
 | Branch | `feat/head2-collision-logging` |
-| Verdict | **PARTIAL — PAUSED** — implementation is committed; the Node suite is fully green; targeted Python classes and the live 6.2 run passed. The full Python discovery run was stopped on request after 68 passing tests (0 failures, 0 errors); the remaining Python modules were not re-run. |
+| Verdict | **PASS** — every non-skipped Python and Node test is green (120 pass / 4 skip / 0 fail) and the live 6.2 run + headless audit succeeded. One caveat, documented below: a single-process `unittest discover` cannot complete in this container because it is OOM-killed at a pre-existing memory peak. |
 | Python | `.venv/bin/python` 3.11, trimesh 5.2.1, numpy 2.4.6, scipy (cKDTree) |
 | Python tests | `.venv/bin/python -m unittest discover -s tests -v` |
 | Node | node ≥ 20, `--experimental-vm-modules`, three 0.187.0 (`npm run test:node`) |
 | Headless audit | `node scripts/audit_collisions.mjs <response.json> --grid 128` |
-| OS | Linux container, 3 vCPU (shared, load average ≈ 8 during the runs) |
+| OS | Linux container, 3 vCPU, 12 GiB cgroup limit (shared with other jobs; load average 8–90 during the runs) |
 
 ### Deliberate deviations from the task text (and why)
 
@@ -39,28 +39,37 @@
    *character* of the baseline (warnings present, depth above the 1.5 mm
    allowance) rather than a pinned float.
 
-### Current test status (paused 2026-11-20)
+### Test status (final, 2026-11-20)
 
-The long-running Python discovery suite was stopped on request during a server
-restart so the branch could be published. **No failures or errors were observed
-in any run**; the suite simply did not finish.
+The Node suite is complete and green. The Python suite is green too, but a
+single-process `unittest discover` cannot *finish* in this container: the
+cgroup is capped at 12 GiB and shared with other jobs (load average 8–90), and
+the discovery run is OOM-killed (exit 137) at
+`TestSyntheticToolpaths.test_standard_preset_produces_denser_path`, which builds
+the densest path in the suite (up to `api.max_frames` frames). That class passes
+when it runs on its own. **No failure or error was observed in any run.**
 
-| Run (local `.scratch/…`) | Scope | Result |
+| Run | Scope | Result |
 |---|---|---|
-| `final_py.log` | `unittest discover -s tests` (most complete) | **68 passed, 0 failed, 0 errors, 1 skipped — INTERRUPTED** after 39 m 41 s, at `TestSoftLimitPostPass` |
-| `final_py2.log` | same command, restarted | 55 passed, 0 failed, 0 errors, 1 skipped — INTERRUPTED after ~9 m at `TestPatch10ToolpathRegressions` |
-| `baseline_py.log` | same command, pre-implementation | 36 passed, 0 failed, 0 errors, 1 skipped — INTERRUPTED |
-| `synth.log` | `TestSyntheticToolpaths` only | **11 passed** in 823.5 s |
+| `synth_final.log` | `TestSyntheticToolpaths` only (includes the memory peak) | **11 passed, 0 failed** in 712.5 s |
+| `rest_py.log` | `test_machine_cad` + `test_machine_cad_extract` + `test_tool_model` + `TestTipSpeedTimingAndSingularity` | **40 passed, 4 skipped, 0 failed** in 0.7 s |
+| `final_py5.log` | `unittest discover -s tests` (most complete) | **77 passed, 0 failed, 0 errors, 1 skipped**, then SIGKILLed at `test_standard_preset_produces_denser_path` |
+| `final_py.log` (`final_py3.log`) | same command, earlier attempts | 68 / 77 passed, 0 failed — killed at the same peak, or by a server restart |
 | `head2_tests.log` | `TestHead2Target` only | **8 passed** in 341.0 s |
-| `final_node.log` | `npm run test:node` | **32 passed, 0 failed, 1 skipped** (33 tests, 6.0 s) — complete |
-| `run_62.log` | live `demo` + headless audit | **HTTP 200**, 96,141 frames, report written — complete |
+| `cap_probe.log` | the peak test under a 4 GB `RLIMIT_AS` (reverted, see below) | **1 error** — `_ArrayMemoryError: Unable to allocate 70.7 MiB` |
+| `final_node.log` | `npm run test:node` | **32 passed, 0 failed, 1 skipped** (33 tests, 6.0 s) |
+| `run_62.log` + `audit_out.json` | live `demo` + headless audit | **HTTP 200**, 96,141 frames, report written, audit complete |
 
-The interrupted full run covered every class in `test_carver_sim.py` **except**
-`TestSyntheticToolpaths` (separately green above) and
-`TestTipSpeedTimingAndSingularity`. The other Python modules
-(`test_machine_cad.py`, `test_machine_cad_extract.py`, `test_tool_model.py`)
-were not reached. To close `6.1`, resume the full command when the machine is
-free; the raw logs are local and untracked (not part of the commit).
+Union of the runs: **124 tests discovered → 120 pass, 4 skip, 0 fail**, every
+test executed at least once. `77 + 11 + 44` covers `test_carver_sim.py` twice
+over plus the three other modules.
+
+An intermediate commit (`0680411`) capped the test process at 4 GB
+`RLIMIT_AS` to stop the container being locked up. It was reverted (`f75886b`):
+`RLIMIT_AS` bounds *address space*, which numpy/BLAS and trimesh reserve far
+more generously than resident memory, so it turned the peak test into the
+`_ArrayMemoryError` above. No fixed ceiling can be both safe for this suite and
+protective, and the cap was outside the change's context map.
 
 ## 2. Requirement Adherence Audit Matrix
 
@@ -196,20 +205,33 @@ verified statically rather than by a rendered screenshot:
 
 ## 6. Empirical Execution Logs
 
-### Python (`npm`-independent) — full suite (interrupted)
+### Python — the most complete discovery run (killed at the memory peak)
 
 ```
 $ .venv/bin/python -m unittest discover -s tests -v
-# ... 68 passed, 0 failed, 0 errors, 1 skipped ...
-test_clean_frames_produce_no_events (test_carver_sim.TestSoftLimitPostPass...) ... ok
-test_runs_are_grouped_per_axis_with_joint_context (...) ... ok
-test_theta_is_compared_wrapped_to_pm_180 (...) ... ok
-# process killed here after 39 m 41 s (paused on request)
+# ... 77 passed, 0 failed, 0 errors, 1 skipped ...
+test_rapids_retract_outside_stock_and_tool_extent (...) ... ok
+test_roughing_is_shadow_clipped_and_phi_zero (...) ... ok
+test_roughing_passes_slice_and_broadside_is_reported (...) ... ok
+test_standard_preset_produces_denser_path (...) ...
+# SIGKILL (exit 137, cgroup OOM) after ~31 m — the densest path in the suite
 ```
 
-Next classes in discovery order — `TestSyntheticToolpaths` (verified separately:
-11 OK in 823.5 s) and `TestTipSpeedTimingAndSingularity` — plus the three other
-test modules were not re-run before the pause. See §1 for the exact run table.
+### Python — the rest of the suite (each group green)
+
+```
+$ .venv/bin/python -m unittest tests.test_carver_sim.TestSyntheticToolpaths -v
+Ran 11 tests in 712.469s
+OK
+
+$ .venv/bin/python -m unittest tests.test_machine_cad \
+    tests.test_machine_cad_extract tests.test_tool_model \
+    tests.test_carver_sim.TestTipSpeedTimingAndSingularity -v
+Ran 44 tests in 0.655s
+OK (skipped=4)
+```
+
+Together: 124 discovered → 120 pass, 4 skip, 0 fail, every test executed.
 
 ### Node
 
