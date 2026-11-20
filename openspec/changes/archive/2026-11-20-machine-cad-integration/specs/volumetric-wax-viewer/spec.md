@@ -48,6 +48,6 @@ The simulator SHALL evaluate both `is_rapid` moves (`RAPID_COLLISION`, heated re
 - **WHEN** an `is_rapid` traverse passes through voxels previously subtracted by roughing
 - **THEN** no `RAPID_COLLISION` error is raised, whereas an `is_rapid` traverse entering uncarved stock (`sdf < -0.5 * voxel_size`) raises `RAPID_COLLISION`
 
-#### Scenario: Unheated shaft intersecting uncarved overhang raises shank collision
+#### Scenario: Unheated shank intersecting uncarved overhang raises shank collision
 - **WHEN** a $\phi$-tilted cutting pose causes the shaft, cartridge body, or tilt-head envelope to enter uncarved stock (`sdf < -0.5 * voxel_size`)
 - **THEN** the simulator emits a `SHANK_COLLISION` diagnostic with the offending frame index and the body name (`shaft`, `body`, or `head`)

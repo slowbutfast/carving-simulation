@@ -23,7 +23,6 @@ from typing import Any, Literal
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -34,8 +33,14 @@ import toolpath_sim
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 THREE_DIR = ROOT / "node_modules" / "three"
+PRESETS_DIR = ROOT / "presets"
 SERVICE_NAME = "carver-sim"
 VERSION = "0.1.0"
+
+# Upload limits advertised to static/upload.js through GET /api/health.
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+ACCEPTED_FORMATS = [".stl", ".obj", ".3mf"]
+PRESET_LABELS = {"base_head": "Base Head"}
 
 app = FastAPI(title="Carving Studio API", version=VERSION)
 
@@ -156,7 +161,41 @@ def health() -> dict[str, Any]:
         "service": SERVICE_NAME,
         "version": VERSION,
         "max_frames": kinematics.load_config()["api"]["max_frames"],
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "accepted_formats": list(ACCEPTED_FORMATS),
     }
+
+
+@app.get("/api/presets")
+def presets() -> dict[str, Any]:
+    """Bundled model presets discovered from ``presets/*.stl``.
+
+    The static entry keeps ``#preset-select`` usable even when the directory is
+    absent (for example in a trimmed deployment).
+    """
+
+    entries: list[dict[str, Any]] = []
+    if PRESETS_DIR.exists():
+        for path in sorted(PRESETS_DIR.glob("*.stl")):
+            slug = path.stem
+            entries.append(
+                {
+                    "id": slug,
+                    "slug": slug,
+                    "label": PRESET_LABELS.get(slug, slug.replace("_", " ").title()),
+                    "path": f"/presets/{path.name}",
+                }
+            )
+    if not entries:
+        entries.append(
+            {
+                "id": "base_head",
+                "slug": "base_head",
+                "label": "Base Head",
+                "path": "/presets/base_head.stl",
+            }
+        )
+    return {"presets": entries}
 
 
 @app.post("/api/sculpt-and-sim")
@@ -240,9 +279,11 @@ def sculpt_and_sim(request: SimulationRequest) -> dict[str, Any]:
 if THREE_DIR.exists():
     app.mount("/vendor", StaticFiles(directory=THREE_DIR), name="three")
 
-if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+if PRESETS_DIR.exists():
+    app.mount("/presets", StaticFiles(directory=PRESETS_DIR), name="presets")
 
-    @app.get("/")
-    def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+if STATIC_DIR.exists():
+    # Keep the legacy /static prefix for compatibility, then serve the XP shell
+    # from the root last so /api/* and /vendor keep priority.
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="spa")
