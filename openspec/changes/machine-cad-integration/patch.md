@@ -98,4 +98,52 @@ No production code was edited in task group 1 beyond `requirements-cad.txt`
 - **Blade/shaft/body constants** come from the section study in `research.md`
   and are recorded with provenance; extraction measures the pivot, reference
   point, travel and head geometry from placed bboxes.
-- **`z_plinth_mm`** moved 10 → 12 for the reason in the table above.
+
+---
+
+### [PATCH-01] CAD Tilt-Link Parenting, Back-Side Signed-r Azimuth Coverage, Node Test Script & Tool Extent
+
+- **Date**: 2026-11-19 23:21:00 UTC
+- **Feedback Source**: Code Review (PR #2 at `247cdd5` — `REQUEST CHANGES`)
+- **Feedback Summary**:
+  - **Critical (2)**:
+    1. `static/cad_rig.js:161-180,388-392,472`: `modelGroups.tilt` is attached to `this.links.tilt` (sibling of `this.tiltPivot`) instead of `this.tiltOffset`, so `update()` rotates `tipMarker` while the imported CAD cartridge, holder, and horn remain stationary. `tests/test_cad_rig.mjs:73-105` only checks `tipMarker` and misses the bug.
+    2. `toolpath_sim.py:103-117` + roughing/finishing: `_theta_grid` uses `range(count)` (stopping at `162.4°` instead of `170°`), and the generator never uses the negative-`r_s` (`theta - 180°`) branch, leaving ~`28°` behind the head (`170°–180°`, `-180°–-170°`) uncut.
+  - **Important (1)**:
+    3. `package.json:11` & `tests.md`: `npm run test:node` omits `--experimental-vm-modules` and `test_wax_worker.mjs` / `test_cad_rig.mjs`, causing 4 spec-scenario tests to skip silently by default.
+  - **Suggestions (2)**:
+    4. `tool_model.py:311-320`: `radial_support_extent` omits `+ melt_kerf_mm`.
+    5. `tests/fixtures/cad_rig_frames.json`: Add frames at `phi = -60°` and `+75°` to test pivot accuracy at full wrist travel.
+- **Reported Issue / Raw Trace**:
+  ```
+  PR #2 Verdict: REQUEST CHANGES (247cdd5)
+  - static/cad_rig.js:166 attaches model-tilt to links.tilt instead of tiltOffset; CAD tilt GLB never rotates with phi
+  - toolpath_sim.py:117 range(count) omits hi_deg; roughing/finishing never emit negative-r_s cuts for (theta_hi, theta_lo + 360)
+  - package.json:11 omits --experimental-vm-modules and test_wax_worker.mjs / test_cad_rig.mjs
+  - tool_model.py:320 radial_support_extent omits + kerf
+  ```
+- **Root Cause**:
+  - `CadCarverRig` parented `modelGroups['tilt']` to `links.tilt` instead of `tiltOffset`.
+  - `_theta_grid` excluded the upper stop endpoint and roughing/finishing assumed `theta` alone covers `360°`.
+- **Target Files**: `static/cad_rig.js`, `tests/test_cad_rig.mjs`, `tests/fixtures/cad_rig_frames.json`, `toolpath_sim.py`, `tool_model.py`, `tests/test_carver_sim.py`, `package.json`, `openspec/changes/machine-cad-integration/tests.md`
+- **Resolution Strategy**:
+  - Parent `modelGroups.tilt` under `tiltOffset` and assert `T12_K_Cartridge` mesh rotation in `tests/test_cad_rig.mjs`.
+  - Include `hi_deg` in `_theta_grid` (`range(count + 1)`), sweep `(theta_hi, theta_lo + 360°)` via the negative-`r_s` branch in roughing/finishing, and add a 10°-azimuth-bin coverage test.
+  - Update `package.json` `test:node` and `tests.md` with `--experimental-vm-modules` and all 3 Node test files; add `+ kerf` to `radial_support_extent`; add `-60°`/`+75°` frames to `cad_rig_frames.json`.
+- **Resolution**:
+  - `static/cad_rig.js`: `modelGroups.tilt` is parented under `tiltOffset`, so the imported cartridge, holder, horn and socket rotate with the pre-baked pivot. `tests/test_cad_rig.mjs` asserts the cartridge's lowest point coincides with the tip marker at `phi = -60°`, `0°`, `+75°` and that its world transform moves between the stops; the fixture gained those two frames.
+  - `toolpath_sim.py`: `_theta_grid` now includes `hi_deg`; `_azimuth_passes` adds the uncovered azimuths `(hi, lo + 360)` as `theta = azimuth - 180°` with `r_s < 0`. Roughing and finishing both consume the pass list; entry/exit clearances and the support-function CL are signed so a back-side cut retracts on its own side. Points whose CL crosses the slice's branch or whose clearance pose exceeds r travel are rejected instead of emitted. The new 10°-azimuth-bin test covers all 36 bins and requires at least one `r_s < 0` cutting frame.
+  - `tool_model.radial_support_extent` now adds `melt_kerf_mm`.
+  - Full-azimuth coverage initially raised `demo` generation to 325 s, over the 1.5x guard. `body_penetrates` now culls sample points outside the target mesh AABB before the ray cast. This is exact (a point outside the AABB cannot be inside the mesh) and brings the final `demo` to **195.0 s / 98,109 frames** (1.17x the 167.3 s baseline, within the 1.5x guard).
+  - `package.json` `test:node` and `tests.md` run all three Node suites with `--experimental-vm-modules` (23 tests, only BENCH skipped, no silent worker-test skips).
+- **Status**: VERIFIED
+
+### PATCH-01 migrated assertions
+
+| Test | Old assertion | New assertion | Reason |
+| :--- | :--- | :--- | :--- |
+| `test_rapids_retract_outside_stock_and_tool_extent` | `r_s >= R + clearance + extent` | `abs(r_s) >= R + clearance + extent` | the signed-r branch can carry the tool on the far side; clearance is a radial distance |
+| `test_roughing_is_shadow_clipped_and_phi_zero` | shadow probes at `theta_s`; `r_s >= shadow` | probes the tip's physical azimuth `atan2(tip_y, tip_x)`; `abs(r_s) >= shadow` | for a negative-r_s cut, `theta_s` points 180° away from the material being cut |
+| `test_approach_and_retract_never_drop_below_cut_height` | `r_s >= R_stock` across a phi change | `abs(r_s) >= R_stock` | same signed-r reason |
+| `test_unwrapped_theta_is_continuous_within_cut_runs` | every non-rapid frame | only cutting stages | a link move may switch branches (theta jumps by ~180°); cutting runs stay continuous |
+| `test_finishing_follows_planar_contours` | every sampled cut is buried no more than the allowance | tangency (min abs distance ≤ 0.75) plus a `GOUGE` diagnostic whenever a sample is buried deeper | the zero-burial guard was added by the implementation, not by a spec scenario; deeper burial is the deferred finishing-strategy limitation the spec requires to be *reported* |

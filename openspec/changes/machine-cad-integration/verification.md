@@ -32,13 +32,12 @@ Two owner gates stay open by design: task 7.1 (roles + joint-sweep sign-off) and
 
 | Suite | Command | Result |
 | :--- | :--- | :--- |
-| Python runtime | `.venv/bin/python -m unittest discover -s tests -v` | **98 tests, 0 failures, 5 skipped** (one hardware-pose fixture not recorded; four OCP-gated extractor tests) |
+| Python runtime | `.venv/bin/python -m unittest discover -s tests -v` | **99 tests, 0 failures, 5 skipped** (one hardware-pose fixture not recorded; four OCP-gated extractor tests) |
 | OCP extractor | `.venv-cad/bin/python -m unittest tests.test_machine_cad_extract -v` | **4 tests, 0 failures** |
-| Node | `node --experimental-vm-modules --test tests/test_wax_sdf.mjs tests/test_wax_worker.mjs tests/test_cad_rig.mjs` | **22 tests, 21 pass, 0 fail, 1 skipped (BENCH)** |
+| Node | `node --experimental-vm-modules --test tests/test_wax_sdf.mjs tests/test_wax_worker.mjs tests/test_cad_rig.mjs` | **23 tests, 22 pass, 0 fail, 1 skipped (BENCH)** |
 
-Plain `node --test ...` runs 17 pass / 5 skipped: four worker tests need
-`--experimental-vm-modules` to import the ES module worker; the BENCH test is
-skipped unless `BENCH=1`.
+`npm run test:node` runs all three suites with `--experimental-vm-modules`
+(required for the ES-module worker); only the `BENCH` benchmark is skipped.
 
 ## Requirement adherence audit matrix
 
@@ -84,6 +83,7 @@ skipped unless `BENCH=1`.
 | Config narrows, never widens CAD travel | `test_configuration_may_narrow_but_never_widen_cad_travel` | pass |
 | Relative tip speed (pure orbit and combined) | `test_pure_turntable_rotation_reports_relative_tip_speed`, `test_combined_motion_uses_full_relative_tip_speed` | pass |
 | Singularity on both sides of the axis | `test_near_axis_fast_rotation_emits_singularity`, `test_axis_crossing_emits_singularity_on_both_sides` | pass |
+| Full 360-degree azimuth coverage behind the orbit stops | `test_every_azimuth_bin_receives_cutting_frames` | pass |
 | Default v_max_theta <= 1.0 | `test_config_declares_datums_tool_and_limits` | pass |
 
 ### face-sculpt-sim
@@ -106,6 +106,7 @@ skipped unless `BENCH=1`.
 | Requirement / scenario | Verifying test | Result |
 | :--- | :--- | :--- |
 | Rig tip tracks backend frames | Node `rig tip tracks 20 committed demo frames within 0.1 mm` | pass |
+| Imported CAD tilt link rotates with phi | Node `imported CAD tilt link rotates about the pivot with phi` | pass |
 | Wax static while the orbit advances | Node `wax is static while the orbit link advances 90 degrees` | pass |
 | No kinematic trig in JS | Node `CAD rig and app contain no kinematic trig` | pass |
 | Undercut subtraction, dirty neighbors, overhang preserved | Node `undercut subtraction crosses chunk boundaries...` | pass |
@@ -153,10 +154,13 @@ Baseline (`main` at `98ac91d`, cone finishing): `demo` 138,201 frames,
 
 | Preset | Frames (CAD blade) | Wall time | Ratio to baseline |
 | :--- | ---: | ---: | ---: |
-| `demo` | 63,583 | 62.5 s | 0.37x |
-| `standard` | 128,654 | 120.7 s | below the 250k cap |
+| `demo` | 98,109 | 195.0 s | 1.17x (guard <= 1.5x) |
+| `standard` | denser than `demo`, under the 250k frame cap | suite pass | — |
 
-The guard (<= 1.5x baseline for equivalent stages/inputs) passes with margin.
+The guard (<= 1.5x baseline for equivalent stages/inputs) passes: 195.0 s vs 250.9 s allowed.
+The extra time over the first implementation is the full 360-degree azimuth
+coverage; `body_penetrates` culls samples outside the target mesh AABB to keep
+the cost inside the guard.
 
 ## Committed artifact identity
 
@@ -175,7 +179,7 @@ $ .venv/bin/python -m unittest discover -s tests -v
 ...
 test_frame_is_right_handed_orthonormal_across_the_grid (test_tool_model.TestToolFrame...) ... ok
 ----------------------------------------------------------------------
-Ran 98 tests in 423.579s
+Ran 99 tests in 1420.824s
 
 OK (skipped=5)
 ```

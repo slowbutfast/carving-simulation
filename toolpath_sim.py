@@ -103,8 +103,8 @@ def _reachable_floor(config: Mapping[str, Any]) -> float:
 def _theta_grid(step_deg: float, config: Mapping[str, Any] | None = None) -> list[float]:
     """Orbit angles from the configured stop range, at approximately step_deg.
 
-    A bounded orbit cannot make a full 360-degree revolution, so the roughing
-    and finishing passes sweep the configured arc instead of wrapping.
+    The upper stop is included: the first implementation used ``range(count)``
+    and stopped one step short of ``hi``.
     """
 
     if config is not None and config.get("limits", {}).get("theta_limits_deg"):
@@ -114,7 +114,45 @@ def _theta_grid(step_deg: float, config: Mapping[str, Any] | None = None) -> lis
     span = max(1e-6, hi_deg - lo_deg)
     count = max(4, int(round(span / float(step_deg))))
     step = span / count
-    return [math.radians(lo_deg + index * step) for index in range(count)]
+    return [math.radians(lo_deg + index * step) for index in range(count + 1)]
+
+
+def _azimuth_passes(
+    step_deg: float, config: Mapping[str, Any]
+) -> list[tuple[float, float, float]]:
+    """Every azimuth around the wax, as ``(azimuth, ring theta, r-sign)``.
+
+    The ring is bounded by the stop block, so azimuths in
+    ``(theta_hi, theta_lo + 360)`` cannot be reached with positive ``r_s``.
+    They are reached on the far side of the axis: ``theta = azimuth - 180``
+    and ``r_s < 0``.
+    """
+
+    theta_grid = _theta_grid(step_deg, config)
+    passes: list[tuple[float, float, float]] = [
+        (theta, theta, 1.0) for theta in theta_grid
+    ]
+    limits = config.get("limits", {}).get("theta_limits_deg")
+    if not limits:
+        return passes
+    lo_deg, hi_deg = (float(v) for v in limits)
+    back_span = (lo_deg + 360.0) - hi_deg
+    if back_span <= 1e-9:
+        return passes
+    count = max(1, int(round(back_span / float(step_deg))))
+    step = back_span / count
+    for index in range(1, count + 1):
+        azimuth_deg = hi_deg + index * step
+        if azimuth_deg >= lo_deg + 360.0 - 1e-9:
+            continue  # duplicate of the lower stop
+        passes.append(
+            (
+                math.radians(azimuth_deg),
+                math.radians(azimuth_deg - 180.0),
+                -1.0,
+            )
+        )
+    return passes
 
 
 def _joint(
@@ -855,7 +893,7 @@ def build_roughing(
     clearance_radius = radius_stock + clearance + reach
     stepdown = max(1.0, float(params["rough_stepdown_mm"]))
     stepover = max(float(params["rough_stepover_mm"]), 0.25)
-    theta_grid = _theta_grid(float(params["theta_step_deg"]), config)
+    passes = _azimuth_passes(float(params["theta_step_deg"]), config)
 
     z_probes = np.arange(z_plinth, height_stock + 1e-6, 1.0)
     if z_probes.size == 0 or z_probes[-1] < height_stock - 1e-6:
@@ -865,8 +903,13 @@ def build_roughing(
     shadow_theta_deg = min(5.0, float(params["theta_step_deg"]) / 3.0)
     shadow_thetas = _theta_grid(shadow_theta_deg)
     shadow_profile = radial_profiles(mesh, shadow_thetas, z_probes)
-    fine_per_coarse = max(1, len(shadow_thetas) // len(theta_grid))
-    fine_step = TAU / len(shadow_thetas)
+    fine_per_coarse = max(
+        1,
+        (len(shadow_thetas) - 1)
+        // max(1, len(_theta_grid(float(params["theta_step_deg"]), config)) - 1),
+    )
+    shadow_count = len(shadow_thetas) - 1  # the grid repeats its endpoints
+    fine_step = TAU / shadow_count
     span = fine_per_coarse + 2
     wedge_profile = np.empty_like(shadow_profile)
     for center in range(len(shadow_thetas)):
@@ -919,31 +962,35 @@ def build_roughing(
             # radius starts where the previous one ended. Without this, every
             # radius pays a 340-degree traverse back to the arc start, which
             # dominates the frame count.
-            ring_thetas = (
-                list(theta_grid)
-                if radius_index % 2 == 0
-                else list(reversed(theta_grid))
-            )
+            ordered = passes if radius_index % 2 == 0 else list(reversed(passes))
             ring_shadows = []
-            for theta_value in ring_thetas:
-                center = int(round((theta_value % TAU) / fine_step)) % len(shadow_thetas)
+            shadow_lo = shadow_thetas[0]
+            for azimuth, _theta, _sign in ordered:
+                center = int(
+                    round(((azimuth - shadow_lo) % TAU) / fine_step)
+                ) % shadow_count
                 ring_shadows.append(float(level_shadow_by_center[center]))
             active = [
-                theta_index
-                for theta_index, shadow in enumerate(ring_shadows)
+                index
+                for index, shadow in enumerate(ring_shadows)
                 if radius >= shadow + reach - 1e-6
             ]
             if not active:
                 continue
             runs: list[list[int]] = []
-            for theta_index in active:
-                if runs and theta_index == runs[-1][-1] + 1:
-                    runs[-1].append(theta_index)
+            for index in active:
+                same_branch = (
+                    runs
+                    and index == runs[-1][-1] + 1
+                    and ordered[index][2] == ordered[runs[-1][-1]][2]
+                )
+                if same_branch:
+                    runs[-1].append(index)
                 else:
-                    runs.append([theta_index])
+                    runs.append([index])
 
             for run in runs:
-                start_theta = ring_thetas[run[0]]
+                start_theta = ordered[run[0]][1]
                 if abs(start_theta - last_theta) > 1e-9:
                     # Link out to the clearance radius, traverse at clearance,
                     # then link back in. Neither link is a cutting move.
@@ -958,13 +1005,29 @@ def build_roughing(
                     rapid.append(True)
                     stages.append("roughing_link")
                     joints.append(
-                        _joint(radius, start_theta, level, 0.0, config, diagnostics)
+                        _joint(
+                            ordered[run[0]][2] * radius,
+                            start_theta,
+                            level,
+                            0.0,
+                            config,
+                            diagnostics,
+                        )
                     )
                     rapid.append(False)
                     stages.append("roughing_link")
-                for theta_index in run:
-                    theta_value = ring_thetas[theta_index]
-                    joints.append(_joint(radius, theta_value, level, 0.0, config, diagnostics))
+                for index in run:
+                    _azimuth, theta_value, sign = ordered[index]
+                    joints.append(
+                        _joint(
+                            sign * radius,
+                            theta_value,
+                            level,
+                            0.0,
+                            config,
+                            diagnostics,
+                        )
+                    )
                     rapid.append(False)
                     stages.append("roughing")
                     last_theta = theta_value
@@ -983,6 +1046,25 @@ def build_roughing(
 # ---------------------------------------------------------------------------
 # Stage 2: r-Z undercut finishing
 # ---------------------------------------------------------------------------
+
+
+def _safe_radius(config: Mapping[str, Any], sign: float, phi: float) -> float:
+    """Radial standoff that clears the stock on the requested side of the axis.
+
+    On the negative-r side the CAD travel ends at ``r_min`` (about -51 mm), so
+    the generic ``R + clearance + extent`` radius can exceed what the machine
+    can reach. Clamp it to the travel while keeping the stock+retract minimum.
+    """
+
+    stock = config["stock"]
+    minimum = float(stock["R_stock_mm"]) + float(
+        stock.get("retract_clearance_mm", 6.0)
+    )
+    target = minimum + tool_model.radial_support_extent(phi, config)
+    if sign >= 0.0:
+        return target
+    r_min = float(config["limits"]["r_limits_mm"][0])
+    return max(minimum, min(target, abs(r_min) - 1.0))
 
 
 def _tool_body_clearance(config: Mapping[str, Any], phi: float = 0.0) -> float:
@@ -1060,6 +1142,11 @@ def exit_moves(
 
     tip = np.asarray(tip, dtype=np.float64)
     e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
+    signed_rs = float(tip[0] * e_r[0] + tip[1] * e_r[1])
+    sign = 1.0 if signed_rs >= 0.0 else -1.0
+    outward = e_r if signed_rs >= 0.0 else -e_r
+    safe_phi = _safe_radius(config, sign, phi)
+    safe_zero = _safe_radius(config, sign, 0.0)
     # Tool axis wrist -> tip.  As in kinematics.forward_kinematics (u(phi) =
     # -sin(phi) e_r - cos(phi) e_z), +phi tilts the tip *inward*, so with a
     # negative phi the axis leans outboard and the body runs inboard.
@@ -1078,26 +1165,26 @@ def exit_moves(
     # Candidate 0: horizontal +e_r at constant phi.  Under a wide overhang
     # both the -u slide and a vertical lift rise into the slab, but pulling
     # straight out at the cut height stays under it.  This is tried first.
-    if clearance_target > r_tip:
+    if safe_phi > r_tip:
         candidates.append(
             _clear_line(
-                clearance_target - r_tip,
-                tip + e_r * min(1.0, clearance_target - r_tip),
-                e_r,
+                safe_phi - r_tip,
+                tip + outward * min(1.0, safe_phi - r_tip),
+                outward,
             )
         )
     if math.sin(phi) > 0.05:
         # Leaving the cut is -u; with u = -sin(phi) e_r - cos(phi) e_z the
         # radius of the tip and of every body point grows by s sin(phi).
-        length = max(0.0, (clearance_target - r_tip) / math.sin(phi))
+        length = max(0.0, (safe_phi - r_tip) / math.sin(phi))
         candidates.append(_clear_line(length, tip - axis * min(1.0, length), -axis))
     lift = max(0.0, safe_z - float(tip[2]))
     start = tip + np.array([0.0, 0.0, min(1.0, lift)])
     top = tip + np.array([0.0, 0.0, lift])
-    radial = max(0.0, clearance_target - float(math.hypot(top[0], top[1])))
+    radial = max(0.0, safe_zero - float(math.hypot(top[0], top[1])))
     candidates.append(
         _clear_line(max(0.0, lift - 1.0), start, np.array([0.0, 0.0, 1.0]))
-        + _clear_line(radial, top, e_r)[1:]
+        + _clear_line(radial, top, outward)[1:]
     )
 
     # Candidate A ends pitched at the clearance radius; it re-pitches to
@@ -1110,19 +1197,26 @@ def exit_moves(
         if not _body_clear(mesh, samples, [axis] * len(samples), config, theta):
             continue
         clear = candidate[-1]
-        r_clear = max(float(math.hypot(clear[0], clear[1])), clearance_target)
+        r_clear = max(float(math.hypot(clear[0], clear[1])), safe_phi)
         z_clear = float(clear[2])
+        # Check the pitched clearance pose against the joint travel before
+        # emitting it; at_clear keeps the cut's pitch and is the worst case.
+        p = float(config["pivot_to_tip_mm"])
+        r_at_clear = sign * r_clear + p * math.sin(phi)
+        r_lo, r_hi = (float(v) for v in config["limits"]["r_limits_mm"])
+        if not (r_lo - 1e-9 <= r_at_clear <= r_hi + 1e-9):
+            continue
         reorient_z = z_clear + p * (1.0 - math.cos(phi))
         reorient = [
-            e_r * r_clear + np.array([0.0, 0.0, z])
+            outward * r_clear + np.array([0.0, 0.0, z])
             for z in np.linspace(z_clear, reorient_z, 8)
         ]
         if not _body_clear(mesh, reorient, [upright] * len(reorient), config, theta):
             continue
         # Wax tip poses, not joint radii: _joint would add p sin(phi).
-        at_clear = e_r * r_clear + np.array([0.0, 0.0, z_clear])
-        at_reorient = e_r * r_clear + np.array([0.0, 0.0, reorient_z])
-        at_safe = e_r * clearance_target + np.array([0.0, 0.0, safe_z])
+        at_clear = outward * r_clear + np.array([0.0, 0.0, z_clear])
+        at_reorient = outward * r_clear + np.array([0.0, 0.0, reorient_z])
+        at_safe = outward * safe_zero + np.array([0.0, 0.0, safe_z])
         return [
             _tip_joint(at_clear, phi, theta, config, collector),
             _tip_joint(at_reorient, 0.0, theta, config, collector),
@@ -1166,6 +1260,8 @@ def entry_moves(
     p = float(config["pivot_to_tip_mm"])
     h_min = float(config["limits"]["h_limits_mm"][0])
     tip = np.array([rs * math.cos(theta), rs * math.sin(theta), zs])
+    sign = 1.0 if rs >= 0.0 else -1.0
+    outward = e_r if rs >= 0.0 else -e_r
     # Pitching about the pivot at the cut height can drop the pivot below the
     # CAD Z-travel minimum (h = z + p cos(phi)). Pitch at the lowest height
     # that keeps h valid, then slide down to the contact.
@@ -1173,10 +1269,17 @@ def entry_moves(
     pitch_z = min(pitch_z, height_stock + clearance)
     # Pitch outside the stock: the reference point sits at the clearance radius
     # while the wrist rotates, then the tool slides onto the contact point.
-    ref = e_r * clearance_target + np.array([0.0, 0.0, pitch_z])
+    ref = outward * _safe_radius(config, sign, phi) + np.array([0.0, 0.0, pitch_z])
     pitched = _tip_joint(ref, phi, theta, config, collector)
     return [
-        _tip_joint(e_r * clearance_target + np.array([0.0, 0.0, height_stock + clearance]), 0.0, theta, config, collector),
+        _tip_joint(
+            outward * _safe_radius(config, sign, 0.0)
+            + np.array([0.0, 0.0, height_stock + clearance]),
+            0.0,
+            theta,
+            config,
+            collector,
+        ),
         _tip_joint(ref, 0.0, theta, config, collector),
         pitched,
         _tip_joint(tip, phi, theta, config, collector),
@@ -1195,7 +1298,8 @@ def _tip_joint(
     x = float(config["arm_radial_offset_mm"])
     h2 = float(config["arm_to_pivot_z_mm"])
     p = float(config["pivot_to_tip_mm"])
-    rs = float(math.hypot(tip[0], tip[1]))
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    rs = float(tip[0]) * cos_t + float(tip[1]) * sin_t
     return _joint_body(rs, theta, float(tip[2]), phi, x, h2, p, config, collector)
 
 
@@ -1245,7 +1349,6 @@ def build_finishing(
     z_plinth = _reachable_floor(config)
     height_stock = float(stock["H_stock_mm"])
     clearance = float(params["rapid_clearance_mm"])
-    theta_grid = _theta_grid(float(params["theta_step_deg"]), config)
     # Rapid clearance must cover the heated region at any wrist pitch, so use
     # the largest support extent over the configured phi range.
     phi_lo, phi_hi = (math.radians(float(v)) for v in config["limits"]["phi_limits_deg"])
@@ -1275,14 +1378,16 @@ def build_finishing(
         rapid.append(False)
         stages.append("finishing_link")
 
-    joints.append(_joint(clearance_target, theta_grid[0], safe_zs, 0.0, config, diagnostics))
+    slices = _azimuth_passes(float(params["theta_step_deg"]), config)
+    joints.append(
+        _joint(clearance_target, slices[0][1], safe_zs, 0.0, config, diagnostics)
+    )
     rapid.append(True)
     stages.append("finishing")
 
-    for slice_index in range(len(theta_grid)):
-        theta_emit = theta_grid[slice_index]
-        current_theta = theta_emit
-        polylines = section_polylines(mesh, current_theta, z_plinth, height_stock, step)
+    for azimuth, theta_emit, branch in slices:
+        e_r_tool = np.array([math.cos(theta_emit), math.sin(theta_emit), 0.0])
+        polylines = section_polylines(mesh, azimuth % TAU, z_plinth, height_stock, step)
         if not polylines:
             continue
 
@@ -1296,41 +1401,65 @@ def build_finishing(
             tip = tool_model.place_on_contact(
                 point["point"],
                 normal,
-                tool_model.tool_pose(point["point"], current_theta, phi, config),
+                tool_model.tool_pose(point["point"], theta_emit, phi, config),
                 config,
             )
             item["phi"] = phi
             item["tip"] = tip
             item["axis"] = np.array(
                 [
-                    -math.sin(phi) * math.cos(current_theta),
-                    -math.sin(phi) * math.sin(current_theta),
+                    -math.sin(phi) * math.cos(theta_emit),
+                    -math.sin(phi) * math.sin(theta_emit),
                     -math.cos(phi),
                 ]
             )
-            item["rs"] = float(math.hypot(tip[0], tip[1]))
+            item["rs"] = float(tip[0] * e_r_tool[0] + tip[1] * e_r_tool[1])
             item["zs"] = float(tip[2])
+            # A contact whose support-function CL lands on the far side of the
+            # axis does not belong to this slice's branch. Emitting it at this
+            # theta would place the tool on the wrong side of the axis; reject
+            # it instead of searching every pitch for it.
+            if item["rs"] * branch < 0.0:
+                item["valid"] = False
+                return
             p = float(config["pivot_to_tip_mm"])
             joint_diags = kinematics.validate_joints(
                 item["rs"] + p * math.sin(phi),
-                current_theta,
+                theta_emit,
                 item["zs"] + p * math.cos(phi),
                 phi,
                 config,
             )
             item["valid"] = not any(d.severity == "error" for d in joint_diags)
+            # The approach/reorient happens at the clearance radius with the
+            # same pitch. A cut whose pitch cannot also be held at clearance is
+            # not reachable by this machine, so reject it here instead of
+            # emitting an out-of-travel link. Use the tip's actual side: a
+            # near-axis CL can cross the axis even on a positive-azimuth slice.
+            sign_actual = 1.0 if item["rs"] >= 0.0 else -1.0
+            r_clear = (
+                sign_actual * _safe_radius(config, sign_actual, phi)
+                + p * math.sin(phi)
+            )
+            r_min, r_max = (float(v) for v in config["limits"]["r_limits_mm"])
+            if not (r_min - 1e-9 <= r_clear <= r_max + 1e-9):
+                item["valid"] = False
 
         for line in polylines:
             for point in line:
                 total_points += 1
-                n_r = float(point["n_r"])
+                n_r_azimuth = float(point["n_r"])
                 n_z = float(point["n_z"])
-                e_r = np.array(
-                    [math.cos(current_theta), math.sin(current_theta), 0.0]
+                # The world normal is the same whichever side of the axis the
+                # tool sits on; only its projection into the tool's own e_r
+                # changes sign for the negative-r branch.
+                e_r_azimuth = np.array(
+                    [math.cos(azimuth), math.sin(azimuth), 0.0]
                 )
-                normal = n_r * e_r + n_z * np.array([0.0, 0.0, 1.0])
+                normal = n_r_azimuth * e_r_azimuth + n_z * np.array([0.0, 0.0, 1.0])
                 magnitude = float(np.linalg.norm(normal)) or 1.0
-                phi_ideal, _ = finishing_phi(n_r, n_z, config)
+                n_r_tool = branch * n_r_azimuth
+                phi_ideal, _ = finishing_phi(n_r_tool, n_z, config)
                 item: dict[str, Any] = {
                     "point": point,
                     "normal": normal / magnitude,
@@ -1426,9 +1555,13 @@ def build_finishing(
                 for move in exit_:
                     link(move)
 
+        # Reposition to the positive clearance plane as a link, not a rapid:
+        # after a negative-r_s slice this segment crosses the axis, and a rapid
+        # that starts on the far-side clearance radius would momentarily pass
+        # inside the required radial clearance.
         joints.append(_joint(clearance_target, theta_emit, safe_zs, 0.0, config, diagnostics))
-        rapid.append(True)
-        stages.append("finishing")
+        rapid.append(False)
+        stages.append("finishing_link")
 
     percentage = 0.0 if total_points == 0 else 100.0 * unreachable_points / total_points
     return joints, rapid, stages, total_points, percentage

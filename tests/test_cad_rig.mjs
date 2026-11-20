@@ -74,7 +74,7 @@ test('rig tip tracks 20 committed demo frames within 0.1 mm', async () => {
   const fixture = JSON.parse(
     fs.readFileSync(path.join(ROOT, 'tests/fixtures/cad_rig_frames.json'), 'utf8')
   );
-  assert.equal(fixture.frames.length, 20);
+  assert.equal(fixture.frames.length, 22);
   assert.ok(
     fixture.frames.some((frame) => Math.abs(frame.phi) > 1e-3),
     'fixture includes a tilted frame'
@@ -82,6 +82,14 @@ test('rig tip tracks 20 committed demo frames within 0.1 mm', async () => {
   assert.ok(
     fixture.frames.some((frame) => frame.r < 0),
     'fixture includes a negative-r frame'
+  );
+  assert.ok(
+    fixture.frames.some((frame) => Math.abs(frame.phi + Math.PI / 3) < 1e-6),
+    'fixture includes the -60 degree wrist stop'
+  );
+  assert.ok(
+    fixture.frames.some((frame) => Math.abs(frame.phi - Math.PI * 75 / 180) < 1e-6),
+    'fixture includes the +75 degree wrist stop'
   );
 
   const rig = makeRig();
@@ -104,8 +112,48 @@ test('rig tip tracks 20 committed demo frames within 0.1 mm', async () => {
   assert.ok(worst <= 0.1, `worst tip error ${worst.toFixed(6)} mm`);
 });
 
-test('wax is static while the orbit link advances 90 degrees', async () => {
+test('imported CAD tilt link rotates about the pivot with phi', async () => {
   const rig = makeRig();
+  assert.equal(await rig.ready, true);
+  assert.ok(
+    Array.isArray(rig.cartridgeMeshes) && rig.cartridgeMeshes.length > 0,
+    'tilt GLB exposes the cartridge mesh'
+  );
+  const cartridge = rig.cartridgeMeshes.find((mesh) =>
+    mesh.name.startsWith('T12_K_Cartridge')
+  );
+  assert.ok(cartridge, 'T12_K_Cartridge mesh is present');
+
+  // The tilt GLB vertices are authored in the machine frame; the blade's
+  // lowest point is the reference point at (0, 0, 91).
+  const reference = new THREE.Vector3(0, 0, 91);
+  for (const phi of [0, -Math.PI / 3, (Math.PI * 75) / 180]) {
+    rig.update({ r: 0, theta: 0, theta_s: 0, h: 151, phi });
+    rig.root.updateMatrixWorld(true);
+    const tipWorld = rig.getTipWorld();
+    const cartridgeTip = cartridge.localToWorld(reference.clone());
+    const error = cartridgeTip.distanceTo(tipWorld);
+    assert.ok(
+      error <= 0.1,
+      `phi=${phi}: CAD cartridge tip is ${error.toFixed(6)} mm from the tip marker`
+    );
+  }
+
+  rig.update({ r: 0, theta: 0, theta_s: 0, h: 151, phi: -Math.PI / 3 });
+  rig.root.updateMatrixWorld(true);
+  const atMinus = cartridge.getWorldPosition(new THREE.Vector3());
+  rig.update({ r: 0, theta: 0, theta_s: 0, h: 151, phi: (Math.PI * 75) / 180 });
+  rig.root.updateMatrixWorld(true);
+  const atPlus = cartridge.getWorldPosition(new THREE.Vector3());
+  assert.ok(
+    atMinus.distanceTo(atPlus) > 10,
+    `CAD tilt geometry did not rotate with phi (moved ${atMinus
+      .distanceTo(atPlus)
+      .toFixed(3)} mm)`
+  );
+});
+
+test('wax is static while the orbit link advances 90 degrees', async () => {  const rig = makeRig();
   assert.equal(await rig.ready, true);
 
   // The app parents the wax to the static link; add a stand-in mesh here.

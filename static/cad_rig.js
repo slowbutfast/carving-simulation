@@ -163,7 +163,7 @@ export class CadCarverRig {
       const group = new THREE.Group();
       group.name = `model-${link}`;
       this.modelGroups[link] = group;
-      this.links[link].add(group);
+      if (link !== 'tilt') this.links[link].add(group);
     }
 
     this.unassignedGroup = new THREE.Group();
@@ -178,6 +178,11 @@ export class CadCarverRig {
     this.tiltOffset = new THREE.Group();
     this.tiltOffset.name = 'tilt-pivot-offset';
     this.tiltPivot.add(this.tiltOffset);
+
+    // The imported tilt GLB must live inside the pre-baked pivot group, not as
+    // a sibling of it in `links.tilt`, or `update()` would rotate only the tip
+    // marker and leave the CAD cartridge, holder and horn stationary.
+    this.tiltOffset.add(this.modelGroups.tilt);
 
     this.tipMarker = new THREE.Mesh(
       new THREE.SphereGeometry(1.25, 16, 12),

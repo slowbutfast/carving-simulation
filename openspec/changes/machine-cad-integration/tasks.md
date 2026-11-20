@@ -123,3 +123,11 @@
   - resolved and remaining assumptions (pivot, heated length, stock, home pose, cold tool)
   - `machine_geometry.json` SHA and `step_sha256`
   - verbatim execution logs
+
+## Patch 01: PR #2 Review Fixes (CAD Tilt Parenting, Back-Side Signed-r Coverage, Node Test Flags & Extent)
+
+- [x] P01.1 Scaffold failing tests: `T12_K_Cartridge` world rotation at `phi != 0` in `tests/test_cad_rig.mjs` (plus `-60°`/`+75°` frames in `tests/fixtures/cad_rig_frames.json`), and 10°-azimuth-bin coverage on `demo` in `tests/test_carver_sim.py`
+- [x] P01.2 Fix `static/cad_rig.js` (`modelGroups.tilt` parented under `this.tiltOffset` so imported CAD tilt geometry rotates with `phi`)
+- [x] P01.3 Fix `toolpath_sim.py` (`_theta_grid` endpoint inclusion + negative-`r_s` sweep for `(theta_hi, theta_lo + 360°)` in roughing/finishing) and `tool_model.py` (`+ kerf` in `radial_support_extent`)
+- [x] P01.4 Update `package.json` (`test:node` with `--experimental-vm-modules` and all 3 `.mjs` suites) and `tests.md`
+- [x] P01.5 Run full Python + Node suites and `openspec validate machine-cad-integration --strict --json`, update `verification.md`, and mark `PATCH-01` `VERIFIED` in `patch.md` (keeping owner gates 7.1 and 7.2 open)

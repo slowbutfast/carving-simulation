@@ -252,7 +252,17 @@ def body_penetrates(
     if not points:
         return np.zeros(len(poses), dtype=bool)
     all_points = np.concatenate(points, axis=0)
-    inside = np.asarray(mesh.contains(all_points), dtype=bool)
+    # Points outside the mesh AABB cannot be inside it. Culling them before the
+    # ray cast is exact and removes most of the long shaft/cartridge samples
+    # above the stock, which dominate the cost.
+    low = mesh_bounds[0] - 1e-6
+    high = mesh_bounds[1] + 1e-6
+    relevant = np.all(all_points >= low, axis=1) & np.all(all_points <= high, axis=1)
+    inside = np.zeros(len(all_points), dtype=bool)
+    if relevant.any():
+        inside[relevant] = np.asarray(
+            mesh.contains(all_points[relevant]), dtype=bool
+        )
     result = np.zeros(len(poses), dtype=bool)
     cursor = 0
     for block, owner in zip(points, owners):
@@ -316,5 +326,9 @@ def radial_support_extent(phi: float, config: Mapping[str, Any] | None = None) -
     the stock while traversing.
     """
 
-    thickness, _, length, _ = _heated_params(config)
-    return abs(length * math.sin(phi)) + 0.5 * thickness * abs(math.cos(phi))
+    thickness, _, length, kerf = _heated_params(config)
+    return (
+        abs(length * math.sin(phi))
+        + 0.5 * thickness * abs(math.cos(phi))
+        + kerf
+    )
