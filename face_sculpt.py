@@ -124,21 +124,72 @@ def generate_presets(force: bool = False) -> tuple[Path, Path]:
     return BASE_STL, LANDMARKS_JSON
 
 
-def load_base_head(config: Mapping[str, Any] | None = None) -> trimesh.Trimesh:
-    """Load the bundled base head, generating the preset if it is missing."""
+def resolve_mesh_path(config: Mapping[str, Any] | None = None) -> Path:
+    """The active target mesh for ``config``.
 
-    if not BASE_STL.exists():
+    ``config["target_mesh"]["path"]`` wins when it is configured; the analytic
+    ellipsoid preset is used only when ``target_mesh`` is ``None`` or omitted
+    (which is what the ellipsoid unit tests pin themselves to).
+    """
+
+    target = config.get("target_mesh") if isinstance(config, Mapping) else None
+    configured = target.get("path") if isinstance(target, Mapping) else None
+    if not configured:
+        return BASE_STL
+    candidate = Path(str(configured))
+    return candidate if candidate.is_absolute() else ROOT / candidate
+
+
+def landmarks_path(
+    config: Mapping[str, Any] | None = None,
+    mesh_path: str | Path | None = None,
+) -> Path:
+    """``presets/<stem>_landmarks.json`` for the active mesh (may not exist)."""
+
+    mesh = Path(mesh_path) if mesh_path is not None else resolve_mesh_path(config)
+    return mesh.with_name(f"{mesh.stem}_landmarks.json")
+
+
+def sliders_enabled(config: Mapping[str, Any] | None = None) -> bool:
+    """True when the active mesh carries a landmark sidecar to deform."""
+
+    return landmarks_path(config).exists()
+
+
+def load_base_head(config: Mapping[str, Any] | None = None) -> trimesh.Trimesh:
+    """Load the configured target mesh, generating the preset if it is missing."""
+
+    path = resolve_mesh_path(config)
+    if path == BASE_STL and not path.exists():
         generate_presets()
-    mesh = trimesh.load(BASE_STL, force="mesh")
+    if not path.exists():
+        raise FileNotFoundError(
+            f"target mesh {path} is missing; run scripts/import_head_mesh.py "
+            f"or clear config.target_mesh"
+        )
+    mesh = trimesh.load(path, force="mesh")
     if not isinstance(mesh, trimesh.Trimesh):  # pragma: no cover - defensive
-        raise TypeError("base_head.stl did not load as a single Trimesh")
+        raise TypeError(f"{path.name} did not load as a single Trimesh")
     return mesh
 
 
-def load_landmarks(config: Mapping[str, Any] | None = None) -> dict[str, dict[str, Any]]:
-    if not LANDMARKS_JSON.exists():
+def load_landmarks(
+    config: Mapping[str, Any] | None = None,
+    mesh_path: str | Path | None = None,
+) -> dict[str, dict[str, Any]] | None:
+    """Facial landmarks for the active mesh, or ``None`` without a sidecar.
+
+    The sidecar is resolved from the mesh path (``presets/<stem>_landmarks.json``),
+    not from a fixed file name, so swapping the target mesh cannot silently apply
+    another mesh's landmarks.
+    """
+
+    sidecar = landmarks_path(config, mesh_path)
+    if sidecar == LANDMARKS_JSON and not sidecar.exists():
         generate_presets()
-    payload = json.loads(LANDMARKS_JSON.read_text(encoding="utf-8"))
+    if not sidecar.exists():
+        return None
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
     return payload["facial_features"]
 
 
@@ -242,11 +293,17 @@ def apply_facial_modifications(
     parameters: Mapping[str, float] | None,
     config: Mapping[str, Any] | None = None,
 ) -> SculptResult:
-    """Apply smooth RBF normal deformations to the five facial landmarks."""
+    """Apply smooth RBF normal deformations to the five facial landmarks.
+
+    A mesh without a ``<stem>_landmarks.json`` sidecar (the imported ``head_2``)
+    cannot be deformed: the pass is skipped with zero displacement and, if any
+    slider is non-zero, an info ``SCULPT_SLIDERS_IGNORED`` diagnostic is emitted
+    instead of failing the request.
+    """
 
     cfg = kinematics.load_config(config) if config is not None else kinematics.load_config()
     params = dict(parameters or {})
-    landmarks = load_landmarks()
+    landmarks = load_landmarks(cfg)
 
     mesh = trimesh.Trimesh(
         vertices=np.array(base_mesh.vertices, dtype=np.float64, copy=True),
@@ -255,29 +312,46 @@ def apply_facial_modifications(
     )
     mesh.fix_normals()
     base_vertices = np.array(mesh.vertices, copy=True)
-    normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
-
-    displacement = np.zeros(len(base_vertices), dtype=np.float64)
-    for name, landmark in landmarks.items():
-        amplitude = float(params.get(name, 0.0))
-        if abs(amplitude) < 1e-12:
-            continue
-        amplitude = float(np.clip(amplitude, -1.5, 1.5))
-        radius = float(landmark["radius_mm"])
-        max_disp = float(landmark["max_displacement_mm"])
-        centers = _feature_centers(landmark)
-        # cKDTree over this feature's landmark centres gives each vertex the
-        # distance to the nearest RBF kernel centre (supports mirrored pairs).
-        feature_tree = cKDTree(centers)
-        nearest, _ = feature_tree.query(base_vertices, k=1)
-        weight = np.exp(-0.5 * (nearest / radius) ** 2)
-        weight[nearest > 2.75 * radius] = 0.0
-        displacement += amplitude * max_disp * weight
-
-    new_vertices = base_vertices + normals * displacement[:, None]
-    mesh.vertices = new_vertices
 
     collector = DiagnosticCollector()
+    if landmarks is None:
+        active = sorted(
+            name for name, value in params.items() if abs(float(value)) > 1e-12
+        )
+        if active:
+            collector.add(
+                "SCULPT_SLIDERS_IGNORED",
+                "info",
+                (
+                    f"{resolve_mesh_path(cfg).stem} has no landmark sidecar "
+                    f"({landmarks_path(cfg).name}); ignoring facial sliders "
+                    f"({', '.join(active)})"
+                ),
+            )
+        displacement = np.zeros(len(base_vertices), dtype=np.float64)
+        new_vertices = base_vertices
+    else:
+        normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
+        displacement = np.zeros(len(base_vertices), dtype=np.float64)
+        for name, landmark in landmarks.items():
+            amplitude = float(params.get(name, 0.0))
+            if abs(amplitude) < 1e-12:
+                continue
+            amplitude = float(np.clip(amplitude, -1.5, 1.5))
+            radius = float(landmark["radius_mm"])
+            max_disp = float(landmark["max_displacement_mm"])
+            centers = _feature_centers(landmark)
+            # cKDTree over this feature's landmark centres gives each vertex the
+            # distance to the nearest RBF kernel centre (supports mirrored pairs).
+            feature_tree = cKDTree(centers)
+            nearest, _ = feature_tree.query(base_vertices, k=1)
+            weight = np.exp(-0.5 * (nearest / radius) ** 2)
+            weight[nearest > 2.75 * radius] = 0.0
+            displacement += amplitude * max_disp * weight
+
+        new_vertices = base_vertices + normals * displacement[:, None]
+        mesh.vertices = new_vertices
+
     fold_violations = displacement_fold_violations(base_mesh, new_vertices)
     self_free = fold_violations == 0
     if not self_free:
