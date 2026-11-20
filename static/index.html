@@ -1,10 +1,10 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Carving Studio — 4-DOF Wax Carver</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232563eb'/%3E%3Crect x='9' y='9' width='14' height='14' fill='none' stroke='white' stroke-width='2.4'/%3E%3C/svg%3E" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>4-DOF Wax Carver Studio 2001</title>
+  <link rel="stylesheet" href="/xp.css" />
   <script type="importmap">
     {
       "imports": {
@@ -13,390 +13,225 @@
       }
     }
   </script>
-  <style>
-    :root {
-      --primary: #2563eb;
-      --primary-hover: #1d4ed8;
-      --bg: #0f172a;
-      --surface: #1e293b;
-      --surface-2: #172033;
-      --border: #334155;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --success: #22c55e;
-      --warning: #f59e0b;
-      --error: #ef4444;
-      --wax: #b91c1c;
-      --sans: Inter, system-ui, -apple-system, sans-serif;
-      --mono: 'JetBrains Mono', ui-monospace, monospace;
-      --radius: 8px;
-    }
-    * { box-sizing: border-box; }
-    html, body { height: 100%; margin: 0; }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: var(--sans);
-      font-size: 13px;
-      line-height: 1.4;
-      overflow: hidden;
-    }
-    .app-header {
-      height: 56px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 0 20px;
-      background: var(--surface-2);
-      border-bottom: 1px solid var(--border);
-    }
-    .brand { display: flex; align-items: center; gap: 12px; }
-    .brand-mark {
-      width: 28px; height: 28px; border-radius: 6px;
-      background: linear-gradient(135deg, var(--primary), #0ea5e9);
-      box-shadow: 0 0 18px rgba(37, 99, 235, 0.5);
-      position: relative;
-    }
-    .brand-mark::after {
-      content: ""; position: absolute; inset: 8px;
-      border: 2px solid rgba(255,255,255,0.85); border-radius: 2px;
-    }
-    h1 { font-size: 18px; font-weight: 600; margin: 0; letter-spacing: 0.2px; }
-    .brand-sub { color: var(--muted); font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; }
-    .header-meta { display: flex; align-items: center; gap: 10px; }
-
-    .studio {
-      height: calc(100% - 56px);
-      display: grid;
-      grid-template-columns: 320px 1fr;
-    }
-    .sidebar {
-      background: var(--surface);
-      border-right: 1px solid var(--border);
-      overflow-y: auto;
-      padding: 16px;
-      display: flex; flex-direction: column; gap: 16px;
-    }
-    .panel { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
-    .panel-head {
-      padding: 10px 12px; font-size: 14px; font-weight: 600;
-      border-bottom: 1px solid var(--border);
-      display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    }
-    .panel-body { padding: 12px; display: flex; flex-direction: column; gap: 12px; }
-    .hint { color: var(--muted); font-size: 11.5px; }
-
-    .slider-row { display: grid; grid-template-columns: 54px 1fr 38px; align-items: center; gap: 8px; }
-    .slider-row label { color: var(--muted); font-size: 12px; }
-    .slider-row output {
-      font-family: var(--mono); font-size: 11px; color: var(--text);
-      text-align: right; background: var(--bg); border: 1px solid var(--border);
-      border-radius: 4px; padding: 2px 4px;
-    }
-    input[type="range"] {
-      -webkit-appearance: none; appearance: none; width: 100%; height: 22px;
-      background: transparent; cursor: pointer; touch-action: manipulation;
-    }
-    input[type="range"]::-webkit-slider-runnable-track {
-      height: 4px; border-radius: 9999px; background: #334155;
-    }
-    input[type="range"]::-webkit-slider-thumb {
-      -webkit-appearance: none; appearance: none; width: 14px; height: 14px;
-      margin-top: -5px; border-radius: 9999px; background: var(--primary);
-      border: 2px solid #bfdbfe; box-shadow: 0 0 0 3px rgba(37,99,235,0.18);
-      transition: transform 150ms ease-out;
-    }
-    input[type="range"]::-moz-range-track { height: 4px; background: #334155; border-radius: 9999px; }
-    input[type="range"]::-moz-range-thumb {
-      width: 14px; height: 14px; border-radius: 9999px; background: var(--primary);
-      border: 2px solid #bfdbfe;
-    }
-    input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.15); }
-
-    .field { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-    .field label { color: var(--muted); font-size: 12px; }
-    select, .input {
-      background: var(--bg); color: var(--text); border: 1px solid var(--border);
-      border-radius: 6px; padding: 7px 9px; font-family: var(--sans); font-size: 12px;
-      outline: none;
-    }
-    select:focus, .input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(37,99,235,0.25); }
-    .btn {
-      appearance: none; border: 1px solid var(--border); background: var(--surface);
-      color: var(--text); border-radius: 6px; padding: 9px 12px; font-weight: 600;
-      font-size: 12.5px; cursor: pointer; transition: background 150ms ease-out, border-color 150ms ease-out, transform 150ms ease-out;
-      min-height: 38px;
-    }
-    .btn:hover { background: #263449; border-color: #475569; }
-    .btn:active { transform: translateY(1px); }
-    .btn.primary { background: var(--primary); border-color: var(--primary); color: #f8fafc; }
-    .btn.primary:hover { background: var(--primary-hover); }
-    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
-    .btn-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
-    .btn-row.two { grid-template-columns: 1fr 1fr; }
-    .slider-row.disabled { opacity: 0.45; }
-    .slider-row.disabled input[type="range"] { cursor: not-allowed; }
-    .slider-row output.disabled { color: var(--muted); }
-    .hint.hidden { display: none; }
-
-    .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); }
-    .switch { position: relative; width: 34px; height: 20px; flex: 0 0 auto; }
-    .switch input { opacity: 0; width: 0; height: 0; }
-    .switch span {
-      position: absolute; inset: 0; background: #334155; border-radius: 9999px;
-      transition: background 150ms ease-out; cursor: pointer;
-    }
-    .switch span::before {
-      content: ""; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px;
-      border-radius: 9999px; background: #cbd5e1; transition: transform 150ms ease-out;
-    }
-    .switch input:checked + span { background: var(--primary); }
-    .switch input:checked + span::before { transform: translateX(14px); background: #f8fafc; }
-
-    .telemetry { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }
-    .telemetry div { display: flex; justify-content: space-between; gap: 6px; padding: 4px 6px; background: var(--bg); border: 1px solid #273449; border-radius: 4px; }
-    .telemetry .k { color: var(--muted); font-size: 10.5px; letter-spacing: 0.3px; }
-    .telemetry .v { font-family: var(--mono); font-size: 11px; color: var(--text); }
-    .telemetry .wide { grid-column: 1 / -1; }
-
-    .diagnostics { display: flex; flex-direction: column; gap: 6px; max-height: 132px; overflow-y: auto; }
-    .diag { border-left: 3px solid var(--border); padding: 4px 8px; background: var(--bg); border-radius: 4px; font-size: 11px; }
-    .diag.info { border-color: var(--primary); }
-    .diag.warning { border-color: var(--warning); }
-    .diag.error { border-color: var(--error); }
-    .diag code { font-family: var(--mono); color: var(--text); }
-
-    .viewport { position: relative; background: radial-gradient(1200px 700px at 55% 40%, #16233c 0%, #0b1220 55%, #080d17 100%); overflow: hidden; }
-    #canvas-host { position: absolute; inset: 0; }
-    #canvas-host canvas { display: block; width: 100% !important; height: 100% !important; }
-
-    .overlay-top { position: absolute; top: 14px; left: 14px; right: 14px; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; pointer-events: none; }
-    .badge {
-      display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px;
-      border-radius: 9999px; font-family: var(--mono); font-size: 10.5px; font-weight: 600;
-      letter-spacing: 0.8px; text-transform: uppercase; border: 1px solid var(--border);
-      background: rgba(15, 23, 42, 0.82); backdrop-filter: blur(6px); color: var(--muted);
-    }
-    .badge .dot { width: 7px; height: 7px; border-radius: 9999px; background: currentColor; }
-    .badge.ready { color: var(--success); border-color: rgba(34,197,94,0.4); }
-    .badge.playing { color: #60a5fa; border-color: rgba(96,165,250,0.45); }
-    .badge.warning { color: var(--warning); border-color: rgba(245,158,11,0.5); }
-    .badge.error { color: var(--error); border-color: rgba(239,68,68,0.55); background: rgba(69,10,10,0.65); }
-    .badge.hidden { display: none; }
-    .overlay-stats { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-
-    .telemetry-hud {
-      position: absolute; top: 58px; right: 14px; width: 236px;
-      background: rgba(15, 23, 42, 0.82); border: 1px solid var(--border);
-      border-radius: var(--radius); backdrop-filter: blur(8px); overflow: hidden;
-      pointer-events: none;
-    }
-    .telemetry-hud .head { padding: 7px 10px; font-size: 10.5px; letter-spacing: 0.8px; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); }
-    .hud-grid { padding: 8px 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; font-family: var(--mono); font-size: 10.5px; }
-    .hud-grid div { display: flex; justify-content: space-between; gap: 6px; }
-    .hud-grid .k { color: var(--muted); }
-    .hud-grid .wide { grid-column: 1 / -1; }
-
-    .transport {
-      position: absolute; left: 14px; right: 14px; bottom: 14px;
-      background: rgba(15, 23, 42, 0.9); border: 1px solid var(--border);
-      border-radius: 10px; backdrop-filter: blur(10px);
-      padding: 10px 12px; display: flex; flex-direction: column; gap: 8px;
-    }
-    .transport-row { display: flex; align-items: center; gap: 8px; }
-    .transport .btn { min-height: 34px; padding: 6px 11px; }
-    .transport .play { min-width: 88px; }
-    .scrub { flex: 1; min-width: 80px; }
-    .timecode { font-family: var(--mono); font-size: 11px; color: var(--muted); min-width: 128px; text-align: right; }
-    .speed-label { color: var(--muted); font-size: 11px; }
-    .progress-track { height: 3px; background: #1f2b3f; border-radius: 9999px; overflow: hidden; }
-    .progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2563eb, #38bdf8); transition: width 80ms linear; }
-
-    .hint-bar { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 10.5px; align-items: center; flex-wrap: wrap; }
-    .mono { font-family: var(--mono); }
-    .provenance { font-family: var(--mono); font-size: 12px; color: var(--muted); }
-    .detail-btn { min-height: 44px; padding: 6px 10px; }
-    .unassigned-note {
-      position: absolute; top: 94px; left: 14px; max-width: min(520px, calc(100% - 28px));
-      min-height: 44px; padding: 8px 12px; text-align: left;
-      background: rgba(15, 23, 42, 0.82); border: 1px solid var(--border);
-      border-radius: var(--radius); color: var(--muted); font-family: var(--sans);
-      font-size: 12px; cursor: pointer; backdrop-filter: blur(6px);
-    }
-    .unassigned-note:hover { border-color: #475569; color: var(--text); }
-    .unassigned-note.hidden { display: none; }
-
-    @media (max-width: 900px) {
-      body { overflow: auto; }
-      .studio { height: auto; display: flex; flex-direction: column; }
-      .viewport { order: 0; height: 58vh; min-height: 360px; }
-      .sidebar { order: 1; border-right: none; border-top: 1px solid var(--border); }
-      .telemetry-hud { display: none; }
-      .transport .btn { min-height: 44px; }
-      .btn { min-height: 44px; }
-      .transport-row { flex-wrap: wrap; }
-      .timecode { min-width: 0; text-align: left; }
-      .overlay-top { flex-direction: column; }
-      .prov-home { display: none; }
-    }
-  </style>
+  <link rel="stylesheet" href="/xp.css" />
 </head>
 <body>
-  <header class="app-header">
-    <div class="brand">
-      <div class="brand-mark" aria-hidden="true"></div>
-      <div>
-        <h1>Carving Studio</h1>
-        <div class="brand-sub">4-DOF Thermal Wax Carver · Digital Twin</div>
+  <div class="desktop">
+    <main class="window" id="studio-window" aria-label="4-DOF Wax Carver Studio 2001">
+      <div class="titlebar" id="titlebar">
+        <div class="titlebar-icon" aria-hidden="true"></div>
+        <div class="titlebar-text">4-DOF Wax Carver Studio 2001</div>
+        <div class="titlebar-controls">
+          <button class="titlebar-button" id="btn-minimize" type="button" aria-label="Minimize">_</button>
+          <button class="titlebar-button" id="btn-maximize" type="button" aria-label="Maximize">[ ]</button>
+          <button class="titlebar-button close" id="btn-close" type="button" aria-label="Close">X</button>
+        </div>
       </div>
-    </div>
-    <div class="header-meta">
-      <span class="badge ready" id="headerBadge"><span class="dot"></span>SYSTEM READY</span>
-    </div>
-  </header>
 
-  <main class="studio">
-    <aside class="sidebar">
-      <section class="panel">
-        <div class="panel-head">Facial Sculpt <span class="hint" id="sculptHint">RBF displacement</span></div>
-        <div class="panel-body">
-          <div class="slider-row">
-            <label for="nose">Nose</label>
-            <input id="nose" type="range" min="-1" max="1" step="0.05" value="0.65" />
-            <output for="nose" id="nose-value">0.65</output>
+      <nav class="menu-bar" aria-label="Application menu">
+        <div class="menu-entry">
+          <button class="menu-item" type="button" data-menu="file" aria-haspopup="true" aria-expanded="false" aria-controls="menu-file"><span>File</span><u>F</u></button>
+          <div class="menu-dropdown" id="menu-file" role="menu" aria-label="File" hidden>
+            <button class="menu-option" id="menu-upload" type="button" role="menuitem"><span class="menu-check" aria-hidden="true"></span><span>Upload Model...</span></button>
+            <div class="menu-separator" role="separator"></div>
+            <button class="menu-option" id="menu-sculpt" type="button" role="menuitem"><span class="menu-check" aria-hidden="true"></span><span>Sculpt &amp; Simulate</span></button>
           </div>
-          <div class="slider-row">
-            <label for="brow">Brow</label>
-            <input id="brow" type="range" min="-1" max="1" step="0.05" value="0.35" />
-            <output for="brow" id="brow-value">0.35</output>
+        </div>
+        <div class="menu-entry">
+          <button class="menu-item" type="button" data-menu="presets" aria-haspopup="true" aria-expanded="false" aria-controls="menu-presets"><span>Presets</span><u>P</u></button>
+          <div class="menu-dropdown" id="menu-presets" role="menu" aria-label="Presets" hidden>
+            <div class="menu-section-label">Bundled Presets</div>
+            <button class="menu-option disabled" type="button" role="menuitem" disabled><span class="menu-check" aria-hidden="true"></span><span>Loading presets...</span></button>
           </div>
-          <div class="slider-row">
-            <label for="cheeks">Cheeks</label>
-            <input id="cheeks" type="range" min="-1" max="1" step="0.05" value="0.25" />
-            <output for="cheeks" id="cheeks-value">0.25</output>
+        </div>
+        <div class="menu-entry">
+          <button class="menu-item" type="button" data-menu="simulation" aria-haspopup="true" aria-expanded="false" aria-controls="menu-simulation"><span>Simulation</span><u>S</u></button>
+          <div class="menu-dropdown" id="menu-simulation" role="menu" aria-label="Simulation" hidden>
+            <button class="menu-option" id="menu-play" type="button" role="menuitem"><span class="menu-check" aria-hidden="true"></span><span>Play / Pause</span></button>
+            <button class="menu-option" id="menu-prev" type="button" role="menuitem"><span class="menu-check" aria-hidden="true"></span><span>Previous Frame</span></button>
+            <button class="menu-option" id="menu-next" type="button" role="menuitem"><span class="menu-check" aria-hidden="true"></span><span>Next Frame</span></button>
+            <button class="menu-option" id="menu-end" type="button" role="menuitem"><span class="menu-check" aria-hidden="true"></span><span>Carve to End</span></button>
           </div>
-          <div class="slider-row">
-            <label for="jaw">Jaw</label>
-            <input id="jaw" type="range" min="-1" max="1" step="0.05" value="0.15" />
-            <output for="jaw" id="jaw-value">0.15</output>
+        </div>
+        <div class="menu-entry">
+          <button class="menu-item" type="button" data-menu="help" aria-haspopup="true" aria-expanded="false" aria-controls="menu-help"><span>Help</span><u>H</u></button>
+          <div class="menu-dropdown" id="menu-help" role="menu" aria-label="Help" hidden>
+            <button class="menu-option" id="menu-about" type="button" role="menuitem"><span class="menu-check" aria-hidden="true"></span><span>About 4-DOF Wax Carver Studio 2001...</span></button>
           </div>
-          <div class="slider-row">
-            <label for="chin">Chin</label>
-            <input id="chin" type="range" min="-1" max="1" step="0.05" value="0.55" />
-            <output for="chin" id="chin-value">0.55</output>
+        </div>
+      </nav>
+
+      <div class="window-body">
+        <aside class="sidebar">
+          <div class="mobile-tabs" id="mobile-tabs" role="tablist" aria-label="Property sheet">
+            <button class="mobile-tab active" type="button" role="tab" data-tab="model" aria-selected="true">Model</button>
+            <button class="mobile-tab" type="button" role="tab" data-tab="sculpt" aria-selected="false">Sculpt</button>
+            <button class="mobile-tab" type="button" role="tab" data-tab="sim" aria-selected="false">Sim</button>
           </div>
-          <div class="field">
-            <label for="preset">Toolpath preset</label>
-            <select id="preset">
-              <option value="demo" selected>Demo (coarse)</option>
-              <option value="standard">Standard (dense)</option>
+
+          <section class="panel mobile-panel-active" data-tab-panel="model">
+            <h2 class="panel-title">Model Source</h2>
+            <label class="field-label" for="preset-select">Bundled preset</label>
+            <select class="xp-select" id="preset-select" aria-label="Bundled preset model">
+              <option value="base_head" selected>Base Head</option>
             </select>
-          </div>
-          <div class="hint hidden" id="sliderNote">This target mesh has no landmark sidecar; facial sliders are ignored.</div>
-          <div class="btn-row">
-            <button class="btn primary" id="sculptBtn" type="button">Sculpt &amp; Simulate</button>
-          </div>
-          <div class="hint">Stock Ø80 × 120 mm · plinth 10 mm · finish allowance 1.5 mm</div>
-        </div>
-      </section>
+            <div class="field-note" id="sliderNote" hidden>This target mesh has no landmark sidecar; facial sliders are ignored.</div>
 
-      <section class="panel">
-        <div class="panel-head">Simulation <span class="hint" id="meshInfo">—</span></div>
-        <div class="panel-body">
-          <div class="toggle-row">
-            <span>Target ghost</span>
-            <label class="switch"><input id="showGhost" type="checkbox" checked /><span></span></label>
-          </div>
-          <div class="toggle-row">
-            <span>Carved wax stock</span>
-            <label class="switch"><input id="showStock" type="checkbox" checked /><span></span></label>
-          </div>
-          <div class="toggle-row">
-            <span>Machine detail</span>
-            <button class="btn detail-btn" id="machineDetailBtn" type="button" aria-pressed="false" disabled>Machine detail: Full</button>
-          </div>
-          <div class="telemetry" id="telemetryGrid">
-            <div><span class="k">r</span><span class="v" id="tele-r">—</span></div>
-            <div><span class="k">θ</span><span class="v" id="tele-theta">—</span></div>
-            <div><span class="k">h</span><span class="v" id="tele-h">—</span></div>
-            <div><span class="k">φ</span><span class="v" id="tele-phi">—</span></div>
-            <div><span class="k">r_s</span><span class="v" id="tele-rs">—</span></div>
-            <div><span class="k">z_s</span><span class="v" id="tele-zs">—</span></div>
-            <div class="wide"><span class="k">tip speed</span><span class="v" id="tele-vtip">—</span></div>
-            <div class="wide"><span class="k">stage</span><span class="v" id="tele-stage">—</span></div>
-          </div>
-        </div>
-      </section>
+            <div class="upload-zone" id="upload-zone" tabindex="0" role="button" aria-label="Upload a custom STL, OBJ or 3MF">
+              <div class="upload-icon" aria-hidden="true"></div>
+              <div class="upload-title">Drop a custom model</div>
+              <div class="upload-subtitle" id="upload-subtitle">.stl, .obj or .3mf · watertight only</div>
+              <input type="file" id="file-input" accept=".stl,.obj,.3mf" hidden />
+            </div>
+            <div class="field-note" id="model-note">No custom file selected.</div>
+          </section>
 
-      <section class="panel">
-        <div class="panel-head">Diagnostics <span class="hint" id="diagCount">0</span></div>
-        <div class="panel-body">
-          <div class="toggle-row">
-            <span>Audit all collisions</span>
-            <label class="switch"><input id="auditAll" type="checkbox" /><span></span></label>
-          </div>
-          <div class="btn-row two">
-            <button class="btn" id="copyJson" type="button">Copy JSON</button>
-            <button class="btn" id="downloadJson" type="button">Download JSON</button>
-          </div>
-          <div class="hint" id="collisionCount">0 worker runs · 0 backend events</div>
-          <div class="diagnostics" id="diagnostics">
-            <div class="diag info"><code>READY</code> Load the demo to generate a toolpath.</div>
-          </div>
-        </div>
-      </section>
-    </aside>
+          <section class="panel" data-tab-panel="sculpt">
+            <h2 class="panel-title">Facial Sculpt</h2>
+            <div class="slider-row">
+              <input class="xp-slider" id="nose" type="range" min="-1" max="1" step="0.05" value="0.65" />
+              <output class="slider-value" id="nose-value" for="nose">0.65</output>
+            </div>
+            <div class="field-note">Nose</div>
+            <div class="slider-row">
+              <input class="xp-slider" id="brow" type="range" min="-1" max="1" step="0.05" value="0" />
+              <output class="slider-value" id="brow-value" for="brow">0.00</output>
+            </div>
+            <div class="field-note">Brow</div>
+            <div class="slider-row">
+              <input class="xp-slider" id="cheeks" type="range" min="-1" max="1" step="0.05" value="0" />
+              <output class="slider-value" id="cheeks-value" for="cheeks">0.00</output>
+            </div>
+            <div class="field-note">Cheeks</div>
+            <div class="slider-row">
+              <input class="xp-slider" id="jaw" type="range" min="-1" max="1" step="0.05" value="0" />
+              <output class="slider-value" id="jaw-value" for="jaw">0.00</output>
+            </div>
+            <div class="field-note">Jaw</div>
+            <div class="slider-row">
+              <input class="xp-slider" id="chin" type="range" min="-1" max="1" step="0.05" value="0" />
+              <output class="slider-value" id="chin-value" for="chin">0.00</output>
+            </div>
+            <div class="field-note">Chin</div>
+          </section>
 
-    <section class="viewport" id="viewport">
-      <div id="canvas-host"></div>
+          <section class="panel" data-tab-panel="sculpt">
+            <h2 class="panel-title">Stock &amp; CAD Rig</h2>
+            <label class="field-label" for="R_stock">Stock radius R_stock (mm)</label>
+            <input class="xp-input" id="R_stock" type="number" min="1" step="1" value="40" />
 
-      <div class="overlay-top">
-        <span class="badge ready" id="statusBadge"><span class="dot"></span>READY</span>
-        <div class="overlay-stats">
-          <span class="badge hidden" id="faultBadge"><span class="dot"></span><span id="faultText">FAULT</span></span>
-          <span class="badge" id="frameBadge">FRAME 0 / 0</span>
-        </div>
+            <label class="field-label" for="H_stock">Stock height H_stock (mm)</label>
+            <input class="xp-input" id="H_stock" type="number" min="1" step="1" value="120" />
+
+            <fieldset class="radio-group" id="stock-preset">
+              <legend class="field-label">Stock preset</legend>
+              <label class="radio-option">
+                <input type="radio" name="stock-preset" value="demo" checked />
+                <span>Demo</span>
+              </label>
+              <label class="radio-option">
+                <input type="radio" name="stock-preset" value="standard" />
+                <span>Standard</span>
+              </label>
+            </fieldset>
+
+            <label class="radio-option">
+              <input type="checkbox" id="showGhost" checked />
+              <span>Show Target Ghost</span>
+            </label>
+            <label class="radio-option">
+              <input type="checkbox" id="showStock" checked />
+              <span>Show Wax Stock</span>
+            </label>
+
+            <button class="download-button" id="machineDetailBtn" type="button" aria-pressed="false" disabled>Machine Detail: Full</button>
+            <button class="field-note unassigned-note" id="unassigned-note" type="button" hidden aria-pressed="false"></button>
+
+            <div class="field-note">Provenance</div>
+            <div class="metric-caption">
+              <span id="provenance-step">STEP -</span><span id="provenance-home"> · home: unset</span>
+            </div>
+          </section>
+
+          <section class="panel" data-tab-panel="sim">
+            <h2 class="panel-title">Simulation</h2>
+            <button class="action-button" id="simulate-button" type="button">SCULPT &amp; SIMULATE</button>
+            <div class="field-note" id="sculpt-hint">RBF displacement</div>
+
+            <label class="radio-option">
+              <input type="checkbox" id="auditAll" />
+              <span>Audit all collisions</span>
+            </label>
+            <div class="field-note" id="collisionCount">0 worker runs · 0 backend events</div>
+
+            <div class="panel-title diagnostics-heading">Diagnostics <span id="diag-count">0</span></div>
+            <div class="diagnostics" id="diagnostics">
+              <div class="diag info"><code>READY</code> Load a preset or upload a model to generate a toolpath.</div>
+            </div>
+          </section>
+        </aside>
+
+        <section class="viewport-shell">
+          <div class="viewport-toolbar">
+            <span class="viewport-title">3D Inspection</span>
+            <span class="viewport-hint">Drag to orbit · Wheel to zoom · Right-drag to pan</span>
+          </div>
+          <div class="inset-well viewport-well">
+            <div id="viewport" class="viewport" aria-label="3D model viewport"></div>
+
+            <div class="transport-dock" role="toolbar" aria-label="Playback transport">
+              <button class="transport-btn" id="prevBtn" type="button" disabled>Prev</button>
+              <button class="transport-btn play" id="playBtn" type="button" disabled>Play</button>
+              <button class="transport-btn" id="nextBtn" type="button" disabled>Next</button>
+              <button class="transport-btn" id="endBtn" type="button" disabled>Carve to End</button>
+              <input class="transport-scrubber" id="sim-scrubber" type="range" min="0" max="1000" step="1" value="0" aria-label="Timeline scrubber" disabled />
+              <span class="transport-time" id="sim-time">0.00 / 0.00 s</span>
+              <select class="transport-speed" id="sim-speed" aria-label="Playback speed">
+                <option value="1">1x</option>
+                <option value="5">5x</option>
+                <option value="10">10x</option>
+                <option value="20" selected>20x</option>
+              </select>
+            </div>
+          </div>
+        </section>
       </div>
 
-      <div class="telemetry-hud">
-        <div class="head">Live telemetry · wax frame</div>
-        <div class="hud-grid">
-          <div><span class="k">t</span><span id="hud-t">0.00 s</span></div>
-          <div><span class="k">v_tip</span><span id="hud-v">0.0 mm/s</span></div>
-          <div><span class="k">r_s</span><span id="hud-r">0.0</span></div>
-          <div><span class="k">z_s</span><span id="hud-z">0.0</span></div>
-          <div class="wide"><span class="k">mode</span><span id="hud-mode">IDLE</span></div>
+      <footer class="status-bar">
+        <div class="status-cell status-grow" id="status-text">Ready</div>
+        <div class="status-cell" id="status-joints">r - / theta - / h - / phi -</div>
+        <div class="status-cell" id="status-tip">tip -, -, -</div>
+        <div class="status-cell" id="status-feed">v_tip - mm/s</div>
+        <div class="status-cell" id="status-state">READY</div>
+      </footer>
+
+      <div class="xp-dialog" id="help-dialog" role="dialog" aria-modal="true" aria-labelledby="help-dialog-title" hidden>
+        <div class="xp-dialog-card">
+          <div class="titlebar">
+            <div class="titlebar-icon" aria-hidden="true"></div>
+            <div class="titlebar-text" id="help-dialog-title">About 4-DOF Wax Carver Studio 2001</div>
+            <div class="titlebar-controls">
+              <button class="titlebar-button close" id="help-dialog-close" type="button" aria-label="Close">X</button>
+            </div>
+          </div>
+          <div class="xp-dialog-body">
+            <p class="xp-dialog-heading">4-DOF Wax Carver Studio 2001</p>
+            <p>A 4-DOF thermal CNC wax carver digital twin: sculpt a face, generate a toolpath, and carve a machinable wax stock in the volumetric SDF viewport.</p>
+            <div class="xp-dialog-section-label">Pipeline</div>
+            <ol class="xp-dialog-steps">
+              <li>Choose the bundled <strong>Base Head</strong> preset or upload a watertight <code>.stl</code>, <code>.obj</code> or <code>.3mf</code> model.</li>
+              <li>Adjust the facial sculpt sliders and the stock / CAD rig settings.</li>
+              <li>Press <strong>SCULPT &amp; SIMULATE</strong>, then scrub or play the transport dock.</li>
+            </ol>
+          </div>
+          <div class="xp-dialog-actions">
+            <button class="action-button" id="help-dialog-ok" type="button">OK</button>
+          </div>
         </div>
       </div>
+    </main>
+  </div>
 
-      <button class="unassigned-note hidden" id="unassignedNote" type="button" aria-pressed="false"></button>
-
-      <div class="transport">
-        <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
-        <div class="transport-row">
-          <button class="btn primary play" id="playBtn" type="button">▶ Play</button>
-          <button class="btn" id="endBtn" type="button">Carve to End</button>
-          <button class="btn" id="resetBtn" type="button">Reset</button>
-          <input class="scrub" id="scrub" type="range" min="0" max="1000" value="0" step="1" aria-label="Timeline scrubber" />
-          <span class="timecode" id="timecode">0.00 / 0.00 s</span>
-          <span class="speed-label">Speed</span>
-          <select id="speed" aria-label="Playback speed">
-            <option value="1">1×</option>
-            <option value="5">5×</option>
-            <option value="10">10×</option>
-            <option value="20" selected>20×</option>
-          </select>
-        </div>
-        <div class="hint-bar">
-          <span class="mono" id="toolpathInfo">No toolpath loaded</span>
-          <span class="mono provenance"><span id="provenanceStep">STEP —</span><span class="prov-home" id="provenanceHome"> · home: unset</span></span>
-          <span>Drag to orbit · Scroll to zoom · Right-drag to pan</span>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <script type="module" src="/static/app.js"></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>
