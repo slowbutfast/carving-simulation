@@ -198,3 +198,18 @@ No production code was edited in task group 1 beyond `requirements-cad.txt`
 | `test_finishing_follows_planar_contours` | burial measured on every sampled finishing cut with corners+tip+mid | burial measured on a subset of `gouge_sample_poses` (the generator's own selection); reported depth must be `>=` it | guarantees the diagnostic cannot understate what is checked |
 | new `test_no_cross_axis_move_below_the_stock_plane` | — | no non-rapid segment in any stage changes `r_s` sign below `H_stock` | the critical finding |
 | new `test_radial_support_extent_covers_the_unheated_shaft` | — | `radial_support_extent(0) >= shaft_radius_mm` | rapid clearance must cover the shaft, not only the heated blade |
+
+---
+
+## Known Accepted Feedback at Merge (`fbc06e3`)
+
+Merged into `main` with owner acknowledgment of the following open items and deferred follow-ups:
+
+1. **Owner Review Gates Deferred (`tasks.md` 7.1 & 7.2)**:
+   - `7.1` (`cad_part_roles.json` + joint-sweep sign-off) and `7.2` (pivot axis: MG90D-270 servo horn vs `Dowel_3x37` 14.03 mm offset; cylindrical stock `R_stock_mm = 40`, `H_stock_mm = 120`) remain open and unverified against physical hardware. Accepted for merge; physical calibration will be recorded in a follow-up change.
+2. **Shaft Axial Span in `radial_support_extent` (`tool_model.py:321-338`)**:
+   - Currently computes `max(heated_reach, shaft_radius_mm)`, which covers the `2.5 mm` shaft radius at `phi = 0` but omits the shaft's `14–75 mm` axial span projected onto the radial axis at tilted wrist angles (`phi != 0`). Deferred to follow-up.
+3. **Gouge Pose Sub-Sampling (`toolpath_sim.py:874-908`)**:
+   - `gouge_sample_poses` checks every 4th resampled finishing frame and every 50th link frame; a narrow gouge between sampled poses can go unreported. Deferred to follow-up (swept-volume coverage or tighter sampling bound).
+4. **Prior Deferred Items (`I1`, `I2`, WebGL visual check)**:
+   - Non-tilting radial-link bracket & servo collision envelope (`I1`), low-overhang slab fixture (`I2`), and interactive WebGL visual verification in a display-enabled browser remain deferred to follow-up.
