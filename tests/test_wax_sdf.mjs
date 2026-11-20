@@ -15,9 +15,11 @@ import { fileURLToPath } from 'node:url';
 import {
   WaxSDFCore,
   DEFAULT_TOOL,
+  carveRange,
   cylinderSDF,
   heatedSDF,
   maxEngagedDisplacement,
+  truncateRuns,
 } from '../static/wax_sdf_core.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -311,8 +313,7 @@ test('snapshot restore and replay match sequential subtraction exactly', () => {
   assert.deepEqual(Array.from(core.data), Array.from(afterAll));
 });
 
-test('carved SDF surface stays within 2 voxels of the reachable target floor', () => {
-  const core = new WaxSDFCore({
+test('carved SDF surface stays within 2 voxels of the reachable target floor', () => {  const core = new WaxSDFCore({
     R_stock: 20,
     H_stock: 40,
     gridN: 56,
@@ -371,6 +372,143 @@ test('engaged-region displacement helper bounds the swept tool', () => {
   const d = maxEngagedDisplacement(a, b, 8);
   assert.ok(d >= 2);
   assert.ok(d < 5);
+});
+
+// ---------------------------------------------------------------------------
+// carveRange: the loop shared by the worker and the headless audit CLI
+// ---------------------------------------------------------------------------
+
+//: Shaft/body spans collapsed and the head envelope parked far away, so only the
+//: heated blade can interact with the stock: a clean cutting path.
+const CUT_ONLY_TOOL = {
+  ...DEFAULT_TOOL,
+  shaftSpan: [0, 0],
+  bodySpan: [0, 0],
+  headEnvelope: { shape: 'box', center: [0, 0, 400], halfExtents: [1, 1, 1] },
+};
+
+function posesFrom(tips, axis = [0, 0, -1], theta = 0) {
+  return tips.map((tip) => ({ tip, axis, theta }));
+}
+
+test('carveRange with auditAll off halts on the first fault and leaves it uncarved', () => {
+  const core = core48();
+  // A vertical tip at z = 10 buries the 14..75 mm shaft in the uncarved column.
+  const poses = posesFrom(
+    Array.from({ length: 8 }, (_, index) => [0, 0, 10 - index * 0.01])
+  );
+  const rapid = new Uint8Array(8);
+  const result = carveRange(core, poses, rapid, DEFAULT_TOOL, { from: 0, to: 7 });
+
+  assert.equal(result.faulted, true);
+  assert.equal(result.current, 1, 'the carve halts on the faulting frame');
+  assert.equal(result.runs.length, 1);
+  const run = result.runs[0];
+  assert.equal(run.code, 'SHANK_COLLISION');
+  assert.equal(run.body, 'shaft');
+  assert.deepEqual(run.frame_range, [1, 1]);
+  assert.equal(run.post_fault, false);
+  assert.equal(run.worst_frame, 1);
+  assert.equal(run.pose.tip.length, 3);
+  assert.equal(run.pose.axis.length, 3);
+  assert.equal(typeof run.pose.theta, 'number');
+  assert.ok(run.worst_sdf_mm < -0.5 * core.voxelSize);
+});
+
+test('carveRange with auditAll off subtracts exactly like sequential subtractTool', () => {
+  const carved = core48();
+  const poses = posesFrom([
+    [14, 0, 20],
+    [15, 0, 20],
+    [16, 0, 20],
+    [16, 0, 22],
+    [16, 2, 22],
+  ]);
+  const rapid = new Uint8Array(poses.length);
+  const result = carveRange(carved, poses, rapid, CUT_ONLY_TOOL, {
+    from: 0,
+    to: poses.length - 1,
+  });
+  assert.equal(result.faulted, false);
+  assert.equal(result.current, poses.length - 1);
+  assert.deepEqual(result.runs, []);
+
+  const manual = core48();
+  // Like the original worker loop, the carve starts at `from`, so frame 0 (the
+  // pose the tool is already sitting at) is not re-stamped.
+  for (const pose of poses.slice(1)) {
+    manual.subtractTool(pose, CUT_ONLY_TOOL, { includeShank: false });
+  }
+  assert.deepEqual(Array.from(carved.data), Array.from(manual.data));
+});
+
+test('carveRange with auditAll groups contiguous runs and marks post_fault', () => {
+  const core = core48();
+  const tips = Array.from({ length: 7 }, (_, index) => [0, 0, 10 - index * 0.01]);
+  tips[4] = [40, 0, 10]; // clear of the stock: breaks the run
+  const poses = posesFrom(tips);
+  const rapid = new Uint8Array(poses.length);
+  const result = carveRange(core, poses, rapid, DEFAULT_TOOL, {
+    from: 0,
+    to: poses.length - 1,
+    auditAll: true,
+  });
+
+  assert.equal(result.faulted, true);
+  assert.equal(result.current, poses.length - 1, 'auditAll never halts');
+  assert.deepEqual(
+    result.runs.map((run) => run.frame_range),
+    [
+      [1, 3],
+      [5, 6],
+    ]
+  );
+  assert.deepEqual(
+    result.runs.map((run) => run.post_fault),
+    [false, true],
+    'runs after the first fault are marked'
+  );
+  assert.deepEqual(
+    result.runs.map((run) => run.frames),
+    [3, 2]
+  );
+  assert.ok(result.runs.every((run) => run.code === 'SHANK_COLLISION'));
+});
+
+test('carveRange rapids report RAPID_COLLISION with the previous pose', () => {
+  const core = core48();
+  const poses = posesFrom([
+    [10, 0, 30],
+    [14, 0, 30],
+    [18, 0, 30],
+  ]);
+  const rapid = new Uint8Array([0, 1, 1]);
+  const result = carveRange(core, poses, rapid, DEFAULT_TOOL, { from: 0, to: 2 });
+  assert.equal(result.faulted, true);
+  const run = result.runs[0];
+  assert.equal(run.code, 'RAPID_COLLISION');
+  assert.ok(run.pose.previous, 'a rapid collision records where it came from');
+  assert.deepEqual(run.pose.previous.tip, [10, 0, 30]);
+  assert.deepEqual(run.pose.tip, [14, 0, 30]);
+});
+
+test('truncateRuns clamps a straddling run and drops later ones', () => {
+  const runs = [
+    { code: 'SHANK_COLLISION', body: 'shaft', frame_range: [1, 12], frames: 12 },
+    { code: 'RAPID_COLLISION', body: 'blade', frame_range: [20, 20], frames: 1 },
+  ];
+  const kept = truncateRuns(runs, 5);
+  assert.equal(kept.length, 1);
+  assert.deepEqual(kept[0].frame_range, [1, 5]);
+  assert.equal(kept[0].frames, 5);
+  assert.deepEqual(runs[0].frame_range, [1, 12], 'the input run is not mutated');
+  assert.deepEqual(
+    truncateRuns(runs, 30).map((run) => run.frame_range),
+    [
+      [1, 12],
+      [20, 20],
+    ]
+  );
 });
 
 test('CAD rig and app contain no kinematic trig', () => {

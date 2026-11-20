@@ -198,3 +198,119 @@ test('vertical cutting pose with the shaft buried in uncarved stock posts SHANK_
   assert.equal(collision.code, 'SHANK_COLLISION');
   assert.equal(collision.body, 'shaft');
 });
+
+// ---------------------------------------------------------------------------
+// Audit mode: enriched collision poses, run grouping, restore truncation
+// ---------------------------------------------------------------------------
+
+/** Tool whose unheated bodies sit far outside the stock: a clean cutting path. */
+const CLEAN_TOOL = {
+  ...WIDE_TOOL,
+  blade_thickness_mm: 1.2,
+  shaft_span_mm: [2000, 2001],
+  body_span_mm: [3000, 3001],
+};
+
+test('worker collision messages carry the tool pose', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
+  const worker = await bootWorker();
+  worker.send({
+    type: 'init',
+    config: initConfig({}, { R_stock_mm: 20, H_stock_mm: 120 }),
+    gridN: 48,
+    chunkSize: 16,
+  });
+  const pathData = verticalPath(6, { x: 0, y: 0, z: 10 });
+  worker.send({ type: 'path', ...pathData });
+  worker.send({ type: 'seek', index: pathData.count - 1 });
+
+  const collision = worker.ofType('collision')[0];
+  assert.ok(collision, 'shaft collision reported');
+  assert.ok(collision.pose, 'the collision carries the tool pose');
+  assert.equal(collision.pose.tip.length, 3);
+  assert.equal(collision.pose.axis.length, 3);
+  assert.equal(typeof collision.pose.theta, 'number');
+  // The pose is the faulting frame's pose, not the previous one's.
+  assert.ok(Math.abs(collision.pose.tip[2] - (10 - collision.index * 0.01)) < 1e-4);
+  assert.ok(Math.abs(collision.pose.axis[2] + 1) < 1e-6);
+});
+
+test('worker audit mode reports the run list and never halts', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
+  const worker = await bootWorker();
+  worker.send({
+    type: 'init',
+    config: initConfig({}, { R_stock_mm: 20, H_stock_mm: 120 }),
+    gridN: 48,
+    chunkSize: 16,
+  });
+  const pathData = verticalPath(20, { x: 0, y: 0, z: 10 });
+  worker.send({ type: 'path', ...pathData, auditAll: true });
+  worker.send({ type: 'seek', index: pathData.count - 1 });
+
+  const runs = worker.ofType('collisions').at(-1)?.runs ?? [];
+  assert.equal(runs.length, 1, 'contiguous collisions are one run');
+  assert.deepEqual(runs[0].frame_range, [1, pathData.count - 1]);
+  assert.equal(runs[0].post_fault, false);
+  assert.ok(runs[0].pose, 'runs carry a pose');
+});
+
+test('toggling audit all mid-playback resets the carve to frame 0', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
+  const worker = await bootWorker();
+  worker.send({
+    type: 'init',
+    config: initConfig(CLEAN_TOOL, { R_stock_mm: 20, H_stock_mm: 40 }),
+    gridN: 48,
+    chunkSize: 16,
+  });
+  const pathData = verticalPath(12, { x: 10, y: 0, z: 30 });
+  worker.send({ type: 'path', ...pathData });
+  worker.send({ type: 'seek', index: 8 });
+  assert.equal(worker.ofType('collisions').length, 0, 'no audit run list yet');
+
+  worker.send({ type: 'audit', enabled: true });
+  const reset = worker.ofType('meshes').at(-1);
+  assert.equal(reset.reason, 'reset');
+  assert.equal(reset.index, 0);
+  assert.equal(reset.auditAll, true);
+  assert.equal(worker.ofType('status').at(-1).auditAll, true);
+  assert.equal(worker.ofType('collisions').at(-1).runs.length, 0);
+
+  // The carve can be driven forward again from 0 under the new mode.
+  worker.send({ type: 'seek', index: 8 });
+  assert.equal(worker.ofType('meshes').at(-1).index, 8);
+});
+
+test('restoreNearest truncates a run straddling the restored snapshot', { skip: !hasSourceTextModule && 'requires --experimental-vm-modules' }, async () => {
+  const worker = await bootWorker();
+  worker.send({
+    type: 'init',
+    config: initConfig({}, { R_stock_mm: 20, H_stock_mm: 40 }),
+    gridN: 48,
+    chunkSize: 16,
+  });
+  // 600 frames gives snapshotEvery = 500, so a snapshot at 500 sits inside the
+  // continuous collision run and the seek back to 550 must cut the run at 500.
+  const pathData = verticalPath(600, { x: 0, y: 0, z: 20, step: 0.001 });
+  worker.send({ type: 'path', ...pathData, auditAll: true });
+  worker.send({ type: 'seek', index: 599 });
+
+  const carved = worker.ofType('collisions').at(-1).runs;
+  assert.equal(carved.length, 1);
+  assert.equal(carved[0].frame_range[0], 1);
+  assert.equal(carved[0].frame_range[1], 599);
+
+  worker.send({ type: 'seek', index: 550 });
+  const updates = worker.ofType('collisions');
+  const truncated = updates[updates.length - 2];
+  assert.equal(
+    truncated.runs[0].frame_range[1],
+    500,
+    'restoring posts the straddling run cut at the snapshot'
+  );
+  const runs = updates.at(-1).runs;
+  assert.ok(runs.length >= 1);
+  assert.ok(
+    runs.every((run) => run.frame_range[1] <= 550),
+    `a run still reaches past the restore index: ${JSON.stringify(runs)}`
+  );
+  assert.equal(runs[0].frame_range[0], 1, 'the run is re-carved from its start');
+});

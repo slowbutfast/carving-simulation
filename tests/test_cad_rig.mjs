@@ -13,7 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import * as THREE from 'three';
-import { CadCarverRig } from '../static/cad_rig.js';
+import { CadCarverRig, SCENE_COLORS } from '../static/cad_rig.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MODELS = ['static', 'orbit', 'z', 'radial', 'tilt', 'unassigned'];
@@ -242,4 +242,12 @@ test('GLB load failure falls back to a tool-plus-wax scene and emits an error', 
   rig.links.static.add(wax);
   assert.ok(rig.root.getObjectByName('fallback-tool'));
   assert.ok(rig.root.getObjectByName('test-wax'));
+});
+
+test('wax is deep carving red and the collision highlight is cyan', () => {
+  assert.equal(SCENE_COLORS.wax, '#b91c1c');
+  assert.equal(SCENE_COLORS.collision, '#22d3ee');
+  assert.equal('error' in SCENE_COLORS, false, 'SCENE_COLORS.error was renamed');
+  // Distinct enough for a red-green colour-blind viewer at a glance.
+  assert.notEqual(SCENE_COLORS.wax, SCENE_COLORS.collision);
 });
