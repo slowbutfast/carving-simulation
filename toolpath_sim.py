@@ -1,23 +1,27 @@
 """Synthetic 4-DOF roughing and undercut-capable finishing trajectory generator.
 
 Stage 1 - shadow-aware cylindrical roughing (phi = 0):
-    Z-level terracing from H_stock down to z_plinth.  At every level each
+    Z-level terracing from H_stock down to z_plinth. At every level each
     azimuth's material is removed from the stock radius inward to the top-down
     shadow ``max_{z' >= z} r_target(theta, z') + finish_allowance`` so the
-    vertical shank can never collide with an overhang above the cut.
+    unheated shaft can never collide with an overhang above the cut. Passes run
+    along theta at constant r; the blade's radial support extent is added to
+    the shadow so the heated region cannot enter it.
 
 Stage 2 - r-Z slice undercut finishing:
     The target mesh is cut with true planar sections
     (``plane_normal = e_theta``), so every contour point lies exactly on the
-    slice azimuth with its own radius (multi-valued overhangs included).  The
-    Contact-Point is offset to the Tip Apex by (tip_radius + melt_kerf), the
-    wrist pitch lays the conical flank on the surface, unreachable overhangs
-    are reported, and gouges are detected against the target mesh.
+    slice azimuth with its own radius (multi-valued overhangs included). The
+    contact point is placed with ``tool_model.place_on_contact`` (support
+    function, including the melt kerf); the wrist pitch comes from the IK
+    policy and is searched outward from phi_ideal until the unheated bodies
+    clear the target. Points with no clear pitch are reported as
+    ``UNREACHABLE_UNDERCUT_AREA``; heated-region burial is a ``GOUGE``.
 
-Every segment is resampled so the maximum displacement of any point on the
-engaged heated cone is <= 0.5 * tip_width.  Approaches and retracts are split
-into three safe moves (body retract at constant phi, reorient phi, then rapid)
-and all rapids retract outside the stock before traversing.
+Every segment is resampled so the maximum displacement of any heated-region
+corner is <= 0.5 * (blade_thickness + 2 * kerf). Approaches and retracts are
+split into safe moves and all rapids retract outside the stock by the
+retract clearance plus the tool's radial support extent.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import trimesh
 from trimesh import intersections as trimesh_intersections
 
 import kinematics
+import tool_model
 from kinematics import Diagnostic, DiagnosticCollector
 
 TAU = 2.0 * math.pi
@@ -80,9 +85,74 @@ def _wrap_angle(angle: float) -> float:
     return wrapped - math.pi
 
 
-def _theta_grid(step_deg: float) -> list[float]:
-    count = max(4, int(round(360.0 / step_deg)))
-    return [TAU * index / count for index in range(count)]
+def _reachable_floor(config: Mapping[str, Any]) -> float:
+    """Lowest reference-point height the machine can actually reach.
+
+    The stock's seating plinth may sit below the CAD Z-travel minimum; with
+    ``phi = 0`` the reference point is ``p`` below the pivot, so the reachable
+    floor is ``h_min - p``. Never cut where the machine cannot go.
+    """
+
+    stock_floor = float(config["stock"]["z_plinth_mm"])
+    h_min = float(config["limits"]["h_limits_mm"][0])
+    p = float(config["pivot_to_tip_mm"])
+    h2 = float(config["arm_to_pivot_z_mm"])
+    return max(stock_floor, h_min - p - h2 + 0.01)
+
+
+def _theta_grid(step_deg: float, config: Mapping[str, Any] | None = None) -> list[float]:
+    """Orbit angles from the configured stop range, at approximately step_deg.
+
+    The upper stop is included: the first implementation used ``range(count)``
+    and stopped one step short of ``hi``.
+    """
+
+    if config is not None and config.get("limits", {}).get("theta_limits_deg"):
+        lo_deg, hi_deg = (float(v) for v in config["limits"]["theta_limits_deg"])
+    else:
+        lo_deg, hi_deg = -180.0, 180.0
+    span = max(1e-6, hi_deg - lo_deg)
+    count = max(4, int(round(span / float(step_deg))))
+    step = span / count
+    return [math.radians(lo_deg + index * step) for index in range(count + 1)]
+
+
+def _azimuth_passes(
+    step_deg: float, config: Mapping[str, Any]
+) -> list[tuple[float, float, float]]:
+    """Every azimuth around the wax, as ``(azimuth, ring theta, r-sign)``.
+
+    The ring is bounded by the stop block, so azimuths in
+    ``(theta_hi, theta_lo + 360)`` cannot be reached with positive ``r_s``.
+    They are reached on the far side of the axis: ``theta = azimuth - 180``
+    and ``r_s < 0``.
+    """
+
+    theta_grid = _theta_grid(step_deg, config)
+    passes: list[tuple[float, float, float]] = [
+        (theta, theta, 1.0) for theta in theta_grid
+    ]
+    limits = config.get("limits", {}).get("theta_limits_deg")
+    if not limits:
+        return passes
+    lo_deg, hi_deg = (float(v) for v in limits)
+    back_span = (lo_deg + 360.0) - hi_deg
+    if back_span <= 1e-9:
+        return passes
+    count = max(1, int(round(back_span / float(step_deg))))
+    step = back_span / count
+    for index in range(1, count + 1):
+        azimuth_deg = hi_deg + index * step
+        if azimuth_deg >= lo_deg + 360.0 - 1e-9:
+            continue  # duplicate of the lower stop
+        passes.append(
+            (
+                math.radians(azimuth_deg),
+                math.radians(azimuth_deg - 180.0),
+                -1.0,
+            )
+        )
+    return passes
 
 
 def _joint(
@@ -93,7 +163,7 @@ def _joint(
     config: Mapping[str, Any],
     collector: DiagnosticCollector | None = None,
 ) -> dict[str, float]:
-    """Joint tuple for a desired wax-frame tip apex pose.
+    """Joint tuple for a desired wax-frame tip tip pose.
 
     Every generated joint is validated against the soft travel limits so an
     out-of-bounds stock/config surfaces ``SOFT_LIMIT_EXCEEDED`` instead of
@@ -148,40 +218,36 @@ def _fk_frame(frame: Mapping[str, Any], config: Mapping[str, Any]) -> kinematics
     )
 
 
+def _frame_pose(frame: Mapping[str, Any], config: Mapping[str, Any]) -> tool_model.ToolPose:
+    fk = _fk_frame(frame, config)
+    return tool_model.tool_pose(
+        fk.tip_xyz_wax, float(frame["theta"]), float(frame["phi"]), config
+    )
+
+
 def max_engaged_displacement(
     first: Mapping[str, Any],
     second: Mapping[str, Any],
-    engaged_length_mm: float,
     config: Mapping[str, Any],
 ) -> float:
-    """Exact maximum displacement over the engaged cone (convex in s).
+    """Exact max displacement over the eight heated-region corners.
 
-    Body points are ``P(s) = tip - s * axis`` for ``s in [0, L_tip]``.  The
-    difference ``d(s) = d_tip - s * d_axis`` is affine, so its norm is convex
-    and attains its maximum at an endpoint.
+    The corners are fixed in the tool frame, so comparing corresponding corners
+    between the two poses bounds every point of the blade under the linear
+    joint interpolation.
     """
 
-    a = _fk_frame(first, config)
-    b = _fk_frame(second, config)
-    dtip = np.asarray(b.tip_xyz_wax) - np.asarray(a.tip_xyz_wax)
-    daxis = np.asarray(b.tool_axis_wax) - np.asarray(a.tool_axis_wax)
-    at_tip = float(np.linalg.norm(dtip))
-    at_base = float(np.linalg.norm(dtip - engaged_length_mm * daxis))
-    return max(at_tip, at_base)
+    a = tool_model.heated_corners(_frame_pose(first, config), config)
+    b = tool_model.heated_corners(_frame_pose(second, config), config)
+    return float(np.max(np.linalg.norm(b - a, axis=1)))
 
 
 def sweep_length(
     first: Mapping[str, Any],
     second: Mapping[str, Any],
-    engaged_length_mm: float,
     config: Mapping[str, Any],
 ) -> float:
-    """Conservative swept path length for a segment (bounds every cone point).
-
-    Unlike the endpoint chord, this includes the angular arc ``r_s * dtheta``
-    and the tool-axis rotation contribution ``L_tip * |d_axis|``, so a
-    combined radial+angular move cannot hide behind a short chord.
-    """
+    """Conservative swept path length for a segment (bounds every blade point)."""
 
     a = _fk_frame(first, config)
     b = _fk_frame(second, config)
@@ -195,7 +261,8 @@ def sweep_length(
     axis_delta = np.linalg.norm(
         np.asarray(b.tool_axis_wax) - np.asarray(a.tool_axis_wax)
     )
-    return float(path + engaged_length_mm * axis_delta)
+    thickness = float(tool_model._tool(config)["blade_thickness_mm"])
+    return float(path + thickness * axis_delta)
 
 
 def _interpolate_joint(
@@ -212,17 +279,16 @@ def _subdivide_segment(
     second: Mapping[str, float],
     depth: int,
     limit: float,
-    engaged: float,
     config: Mapping[str, Any],
     out: list[dict[str, float]],
 ) -> None:
-    displacement = max_engaged_displacement(first, second, engaged, config)
+    displacement = max_engaged_displacement(first, second, config)
     if displacement <= limit or depth >= 11:
         out.append(dict(second))
         return
     midpoint = _interpolate_joint(first, second, 0.5)
-    _subdivide_segment(first, midpoint, depth + 1, limit, engaged, config, out)
-    _subdivide_segment(midpoint, second, depth + 1, limit, engaged, config, out)
+    _subdivide_segment(first, midpoint, depth + 1, limit, config, out)
+    _subdivide_segment(midpoint, second, depth + 1, limit, config, out)
 
 
 def resample_path(
@@ -231,13 +297,18 @@ def resample_path(
     stages: Sequence[str],
     config: Mapping[str, Any],
 ) -> tuple[list[dict[str, float]], list[bool], list[str]]:
-    """Adaptively subdivide until the engaged-cone sweep bound is satisfied."""
+    """Adaptively subdivide until the heated-region corner bound is satisfied."""
 
     if not joints:
         return [], [], []
-    tip_width = float(config["tool"]["tip_width_mm"])
-    engaged = float(config["tool"]["engaged_length_mm"])
-    limit = 0.5 * tip_width
+    tool = config["tool"]
+    cut_limit = 0.5 * (
+        float(tool["blade_thickness_mm"]) + 2.0 * float(tool["melt_kerf_mm"])
+    )
+    # Rapids traverse clearance/safe planes where nothing is being cut. They
+    # still need enough samples for collision checks, but not the blade's cut
+    # fidelity: 2.5 mm also bounds the 1.2 mm blade corners between samples.
+    rapid_limit = max(cut_limit, 2.5)
 
     out_joints: list[dict[str, float]] = [dict(joints[0])]
     out_rapid: list[bool] = [False]
@@ -245,9 +316,8 @@ def resample_path(
 
     for index in range(1, len(joints)):
         pieces: list[dict[str, float]] = []
-        _subdivide_segment(
-            joints[index - 1], joints[index], 0, limit, engaged, config, pieces
-        )
+        limit = rapid_limit if rapid_flags[index] else cut_limit
+        _subdivide_segment(joints[index - 1], joints[index], 0, limit, config, pieces)
         for piece in pieces:
             out_joints.append(piece)
             out_rapid.append(bool(rapid_flags[index]))
@@ -667,39 +737,28 @@ def section_contour(
 
 
 def finishing_phi(n_r: float, n_z: float, config: Mapping[str, Any]) -> tuple[float, bool]:
-    """Wrist pitch that lays the conical flank on the surface.
+    """Wrist-pitch preference for a section normal, from the IK policy.
 
-    ``beta = atan2(n_r, n_z)`` is the surface angle from +Z and ``alpha`` the
-    conical-bevel half angle.  The bevel flank removes material within
-    ``alpha`` of the tool axis, so the apex may touch the surface while the
-    flank clears it whenever ``|beta - phi| <= 90° - alpha``.  The requested
-    pitch is ``beta - alpha`` (clamped to the configured ``phi`` limits when the
-    preferred orientation is out of range); only a surface steeper than that
-    clearance band is genuinely unreachable.  Returns ``(phi_rad, reachable)``.
+    There is no cone half-angle any more: the blade's flank does not define a
+    reachability band. The pitch is ``atan2(n_r, n_z)`` projected into the
+    configured phi limits, and reachability is decided later by the
+    body-collision search over candidate pitches. Always returns ``True`` for
+    the policy step (the tuple is kept for callers that distinguish a
+    tangential normal).
     """
 
-    alpha = math.radians(float(config["tool"]["cone_half_angle_deg"]))
+    magnitude = math.hypot(float(n_r), float(n_z))
+    if magnitude < 1e-3:
+        return 0.0, True
+    n_r = float(n_r) / magnitude
+    n_z = float(n_z) / magnitude
     phi_lo, phi_hi = (math.radians(float(v)) for v in config["limits"]["phi_limits_deg"])
-    beta = math.atan2(n_r, n_z)
-    # A face whose outward normal turns away from the cut (+n_r) wants the flank
-    # leaning forward; one that faces the other way (an undercut) wants it
-    # leaning back, and is never clamped across zero.  There is no separate
-    # branch for downward faces: beta < 0 covers them and is judged by the same
-    # clearance band, so a reachable overhang is not thrown away.
-    if beta >= 0.0:
-        preferred = max(0.0, beta - alpha)
-    else:
-        preferred = min(0.0, beta + alpha)
-    phi = min(max(preferred, phi_lo), phi_hi)
-    reachable = abs(beta - phi) <= (math.pi / 2 - alpha) + EPS
-    return phi, reachable
+    phi = min(max(math.atan2(n_r, n_z), phi_lo), phi_hi)
+    return phi, True
 
 
-def _melt_kerf_offset(config: Mapping[str, Any]) -> float:
-    """Contact-Point -> Tip-Apex standoff: ``tip_radius + melt_kerf``."""
-
-    tool = config["tool"]
-    return float(tool["tip_radius_mm"]) + float(tool["melt_kerf_mm"])
+def _melt_kerf(config: Mapping[str, Any]) -> float:
+    return float(config["tool"]["melt_kerf_mm"])
 
 
 def cutter_location(
@@ -709,71 +768,144 @@ def cutter_location(
     theta: float,
     config: Mapping[str, Any],
 ) -> np.ndarray:
-    """Tip apex for a Contact-Point on the surface at ``theta``.
+    """Reference point for a contact point, via the blade support function.
 
-    The apex sits one standoff (``tip_radius + melt_kerf``) out along the
-    *true* outward normal ``n_r e_r + n_z e_z``.  The normal is never snapped
-    to pure radial or vertical: on a slope that would place the apex off the
-    CL, and the cut would no longer follow the section contour.
+    The section normal is ``n_r e_r + n_z e_z`` (planar slices carry no
+    tangential component). ``tool_model.place_on_contact`` replaces the old
+    ``(rho + kerf) * n`` offset, which was wrong by up to half the blade
+    thickness on tangential normals.
     """
 
     e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
-    normal = n_r * e_r + n_z * np.array([0.0, 0.0, 1.0])
-    return np.asarray(point_xyz, dtype=np.float64) + normal * _melt_kerf_offset(config)
+    normal = float(n_r) * e_r + float(n_z) * np.array([0.0, 0.0, 1.0])
+    magnitude = float(np.linalg.norm(normal)) or 1.0
+    normal = normal / magnitude
+    phi, _ = finishing_phi(n_r, n_z, config)
+    axes = tool_model.tool_pose(point_xyz, theta, phi, config)
+    return tool_model.place_on_contact(point_xyz, normal, axes, config)
+
+
+def _pose_for_axis(
+    tip: Sequence[float],
+    axis: Sequence[float],
+    theta: float,
+    config: Mapping[str, Any],
+) -> tool_model.ToolPose:
+    """Rebuild the tool frame from a reference point, axis and azimuth."""
+
+    e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
+    u = np.asarray(axis, dtype=np.float64)
+    u = u / (float(np.linalg.norm(u)) or 1.0)
+    phi = math.atan2(-float(u @ e_r), -float(u[2]))
+    return tool_model.tool_pose(tip, theta, phi, config)
 
 
 def tool_body_penetrates(
     mesh: trimesh.Trimesh,
-    apexes: Sequence[Sequence[float]],
+    tips: Sequence[Sequence[float]],
     axes: Sequence[Sequence[float]],
     config: Mapping[str, Any],
+    thetas: Sequence[float] | None = None,
 ) -> np.ndarray:
-    """Vectorised test: does the heated tool body intersect the mesh?
+    """Vectorised test: does an unheated tool body intersect the mesh?
 
-    Stations ``t in {0.25, 0.5, 0.75, 1.0} * engaged`` are walked back from each
-    apex along its axis.  At station ``t`` the flank point is the axis point
-    plus eight ring points at radius ``tip_radius + t * tan(alpha)`` in the
-    plane perpendicular to the axis (the melt kerf is deliberately omitted: it
-    is cut tolerance, not tool steel).
-
-    "Penetrates" is ``mesh.contains(...)`` for any of those points, which is the
-    one inside/outside authority here (``trimesh.nearest.signed_distance`` is
-    positive inside and agrees).  All points for all poses go through a single
-    ``contains`` call, so the caller can batch a whole slice.
+    Sign convention: ``trimesh.contains`` is POSITIVE inside the mesh. The wax
+    SDF used by the worker is the opposite and states it separately.
     """
 
-    apexes = np.atleast_2d(np.asarray(apexes, dtype=np.float64))
+    tips = np.atleast_2d(np.asarray(tips, dtype=np.float64))
     axes = np.atleast_2d(np.asarray(axes, dtype=np.float64))
-    if len(apexes) == 0:
+    if len(tips) == 0:
         return np.zeros(0, dtype=bool)
-    lengths = np.linalg.norm(axes, axis=1)
-    axes = axes / np.where(lengths == 0.0, 1.0, lengths)[:, None]
+    poses = []
+    for index, (tip, axis) in enumerate(zip(tips, axes)):
+        theta = float(thetas[index]) if thetas is not None else 0.0
+        poses.append(_pose_for_axis(tip, axis, theta, config))
+    return tool_model.body_penetrates(mesh, poses, config)
+
+
+def _heated_gouge_samples(
+    pose: tool_model.ToolPose, config: Mapping[str, Any]
+) -> np.ndarray:
+    """Corners, face centres, edge midpoints and centreline of the blade box.
+
+    A GOUGE report must not understate the deepest burial, so the sample set is
+    a superset of the corner/centre samples used by the tests.
+    """
 
     tool = config["tool"]
-    engaged = float(tool["engaged_length_mm"])
-    tip_radius = float(tool["tip_radius_mm"])
-    tan_alpha = math.tan(math.radians(float(tool["cone_half_angle_deg"])))
-    fractions = (0.25, 0.5, 0.75, 1.0)
-    angles = np.arange(8) * (math.pi / 4.0)
+    thickness = float(tool["blade_thickness_mm"])
+    width = float(tool["blade_width_mm"])
+    length = float(tool.get("heated_length_mm", tool["blade_length_mm"]))
+    half_t, half_w = 0.5 * thickness, 0.5 * width
+    tip, a_n, a_w, u = pose.tip_xyz, pose.a_n, pose.a_w, pose.u
 
-    # A stable perpendicular basis per pose (never parallel to the axis).
-    helper = np.tile(np.array([0.0, 0.0, 1.0]), (len(axes), 1))
-    almost_parallel = np.abs(axes @ np.array([0.0, 0.0, 1.0])) > 0.9
-    helper[almost_parallel] = np.array([1.0, 0.0, 0.0])
-    e1 = np.cross(axes, helper)
-    e1 /= np.linalg.norm(e1, axis=1)[:, None]
-    e2 = np.cross(axes, e1)
+    def point(n: float, w: float, s: float) -> np.ndarray:
+        return tip + n * a_n + w * a_w - s * u
 
-    points: list[np.ndarray] = [apexes]
-    for fraction in fractions:
-        station = engaged * fraction
-        radius = tip_radius + station * tan_alpha
-        base = apexes - axes * station
-        for angle in angles:
-            points.append(base + radius * (math.cos(angle) * e1 + math.sin(angle) * e2))
-    # Each block is (poses, 3); stacking gives one row per (sample, pose).
-    inside = np.asarray(mesh.contains(np.concatenate(points, axis=0)), dtype=bool)
-    return inside.reshape(len(points), len(apexes)).any(axis=0)
+    points: list[np.ndarray] = []
+    # 8 corners
+    for n in (-half_t, half_t):
+        for w in (-half_w, half_w):
+            for s in (0.0, length):
+                points.append(point(n, w, s))
+    # 6 face centres
+    for n in (-half_t, half_t):
+        points.append(point(n, 0.0, 0.5 * length))
+    for w in (-half_w, half_w):
+        points.append(point(0.0, w, 0.5 * length))
+    points.append(point(0.0, 0.0, 0.0))
+    points.append(point(0.0, 0.0, length))
+    # 12 edge midpoints
+    for n in (-half_t, half_t):
+        for w in (-half_w, half_w):
+            points.append(point(n, w, 0.5 * length))
+        for s in (0.0, length):
+            points.append(point(n, 0.0, s))
+    for w in (-half_w, half_w):
+        for s in (0.0, length):
+            points.append(point(0.0, w, s))
+    # centreline
+    for fraction in (0.25, 0.5, 0.75):
+        points.append(point(0.0, 0.0, fraction * length))
+    return np.asarray(points)
+
+
+GOUGE_FINISHING_STRIDE = 4
+GOUGE_LINK_STRIDE = 50
+
+
+def gouge_sample_poses(
+    frames: Sequence[Mapping[str, Any]], stages: Sequence[str]
+) -> list[dict[str, Any]]:
+    """Poses checked for GOUGE.
+
+    Finishing cuts are sampled every ``GOUGE_FINISHING_STRIDE`` resampled
+    frames (the resampling bound is <= 1 mm) and non-rapid link stages every
+    ``GOUGE_LINK_STRIDE``. The tests use this same selection, so a reported
+    depth can never understate what a test measures on it.
+    """
+
+    poses: list[dict[str, Any]] = []
+    for index, (frame, stage) in enumerate(zip(frames, stages)):
+        if frame["is_rapid"]:
+            continue
+        if stage == "finishing":
+            if index % GOUGE_FINISHING_STRIDE:
+                continue
+        elif stage in ("roughing_link", "finishing_link"):
+            if index % GOUGE_LINK_STRIDE:
+                continue
+        else:
+            continue
+        poses.append(
+            {
+                "tip_xyz_wax": frame["tip_xyz_wax"],
+                "tool_axis_wax": frame["tool_axis_wax"],
+                "theta": frame["theta_s"],
+            }
+        )
+    return poses
 
 
 def detect_gouges(
@@ -781,41 +913,53 @@ def detect_gouges(
     poses: Iterable[Mapping[str, Any]],
     config: Mapping[str, Any],
 ) -> list[Diagnostic]:
-    """Flag cutting poses whose heated body penetrates the target mesh.
+    """Report the deepest heated-region burial in the target.
 
-    Delegates the geometry to :func:`tool_body_penetrates`, so the pre-filter in
-    ``build_finishing`` and the reported diagnostic cannot disagree.  The text
-    keeps the offending station and the margin by which the flank is buried.
+    Uses the full corner/face/edge/centreline sample set and emits the maximum
+    depth across all poses, so the reported value cannot understate a burial a
+    test can measure on the same geometry.
     """
 
-    tool = config["tool"]
-    engaged = float(tool["engaged_length_mm"])
-    tip_radius = float(tool["tip_radius_mm"])
-    tan_alpha = math.tan(math.radians(float(tool["cone_half_angle_deg"])))
-    stations = [engaged * fraction for fraction in (0.25, 0.5, 0.75, 1.0)]
+    allowance = float(config["stock"].get("finish_allowance_mm", 1.5))
     collector = DiagnosticCollector()
+    deepest: tuple[float, np.ndarray] | None = None
+    bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    margin = 1e-6
     for pose in poses:
-        apex = np.asarray(pose["tip_xyz_wax"], dtype=np.float64)
+        tip = np.asarray(pose["tip_xyz_wax"], dtype=np.float64)
         axis = np.asarray(pose["tool_axis_wax"], dtype=np.float64)
-        if not bool(tool_body_penetrates(mesh, [apex], [axis], config)[0]):
+        theta = float(pose.get("theta", 0.0))
+        frame = _pose_for_axis(tip, axis, theta, config)
+        samples = _heated_gouge_samples(frame, config)
+        # Cheap rejects: a pose whose heated-region AABB misses the mesh cannot
+        # gouge it. Then test a set shrunk inward by 0.1 mm: a pose with no
+        # shrunken sample inside is at most 0.1 mm buried, far below the
+        # allowance, so only genuine penetrations pay for a signed distance.
+        if np.any(samples.min(axis=0) > bounds[1] + margin) or np.any(
+            samples.max(axis=0) < bounds[0] - margin
+        ):
             continue
-        # Locate the worst station for the message (signed distance is positive
-        # inside, so the deepest burial is the largest positive value).
-        lengths = float(np.linalg.norm(axis)) or 1.0
-        unit = axis / lengths
-        signed = np.asarray(
-            mesh.nearest.signed_distance(
-                np.asarray([apex - unit * t for t in stations], dtype=np.float64)
-            ),
-            dtype=np.float64,
-        )
+        centre = samples.mean(axis=0)
+        offsets = samples - centre
+        lengths = np.linalg.norm(offsets, axis=1)
+        shrunken = samples - 0.1 * offsets / np.where(lengths == 0.0, 1.0, lengths)[:, None]
+        if not bool(np.asarray(mesh.contains(shrunken), dtype=bool).any()):
+            continue
+        signed = np.asarray(mesh.nearest.signed_distance(samples), dtype=np.float64)
         index = int(np.argmax(signed))
-        flank = tip_radius + stations[index] * tan_alpha
+        depth = float(signed[index])
+        if depth > allowance and (deepest is None or depth > deepest[0]):
+            deepest = (depth, samples[index])
+    if deepest is not None:
+        depth, location = deepest
         collector.add(
             "GOUGE",
             "warning",
-            f"tool flank penetrates the target at {np.round(apex - unit * stations[index], 3).tolist()}",
-            value=float(flank + float(signed[index])),
+            (
+                f"heated blade is {depth:.3f} mm inside the target "
+                f"(allowance {allowance:.3f} mm) near {np.round(location, 3).tolist()}"
+            ),
+            value=depth,
         )
     return collector.as_list()
 
@@ -831,40 +975,27 @@ def build_roughing(
     params: Mapping[str, Any],
     collector: DiagnosticCollector | None = None,
 ) -> tuple[list[dict[str, float]], list[bool], list[str], float]:
-    """Returns joints, rapid flags, stages, and the final unwrapped theta."""
+    """Returns joints, rapid flags, stages, and the final unwrapped theta.
+
+    Passes run along theta at constant r. The blade's radial support extent is
+    added to the shadow, so the heated region (not just the reference point)
+    stays outside the material. Radial repositioning moves are
+    ``roughing_link`` transitions, not cuts, so the cutting moves themselves are
+    all slice-direction theta passes.
+    """
 
     diagnostics = collector if collector is not None else DiagnosticCollector()
     stock = config["stock"]
     radius_stock = float(stock["R_stock_mm"])
     height_stock = float(stock["H_stock_mm"])
-    z_plinth = float(stock["z_plinth_mm"])
+    z_plinth = _reachable_floor(config)
     allowance = float(stock["finish_allowance_mm"])
     clearance = float(params["rapid_clearance_mm"])
-    engaged = float(config["tool"]["engaged_length_mm"])
-    tool = config["tool"]
-    # The cone only removes material over the engaged length above the apex, so
-    # clamp the stepdown there.  It must also keep the unheated shank clear of
-    # the terrace left by the previous level: on a vertical wall the previous
-    # cone's flank cuts r_prev - (shank_r - tip_r - kerf) at this level's apex,
-    # so a stepdown above
-    #   engaged - (shank_r - tip_r - kerf) / tan(alpha)
-    # leaves a sliver of wax inside the shank.  With the shipped tool that is
-    # 8 - (3.0 - 0.5 - 0.4) / tan(30 deg) = 4.36 mm, floor 1.0 mm.
-    alpha = math.radians(float(tool["cone_half_angle_deg"]))
-    radial_overhang = (
-        float(tool["shank_radius_mm"]) - float(tool["tip_radius_mm"]) - float(tool["melt_kerf_mm"])
-    )
-    # This bounds the sliver left *below* a vertical wall's terrace.  The
-    # separate case "uncut stock in front of a terrace at the same level" is
-    # controlled by the finish allowance, not by the stepdown.
-    shank_safe = engaged - radial_overhang / math.tan(alpha)
-    stepdown = min(
-        float(params["rough_stepdown_mm"]),
-        max(1.0, engaged * 0.75),
-        max(1.0, shank_safe),
-    )
+    reach = tool_model.radial_support_extent(0.0, config)
+    clearance_radius = radius_stock + clearance + reach
+    stepdown = max(1.0, float(params["rough_stepdown_mm"]))
     stepover = max(float(params["rough_stepover_mm"]), 0.25)
-    theta_grid = _theta_grid(float(params["theta_step_deg"]))
+    passes = _azimuth_passes(float(params["theta_step_deg"]), config)
 
     z_probes = np.arange(z_plinth, height_stock + 1e-6, 1.0)
     if z_probes.size == 0 or z_probes[-1] < height_stock - 1e-6:
@@ -874,10 +1005,13 @@ def build_roughing(
     shadow_theta_deg = min(5.0, float(params["theta_step_deg"]) / 3.0)
     shadow_thetas = _theta_grid(shadow_theta_deg)
     shadow_profile = radial_profiles(mesh, shadow_thetas, z_probes)
-    fine_per_coarse = max(1, len(shadow_thetas) // len(theta_grid))
-    fine_step = TAU / len(shadow_thetas)
-    # Precompute a circular wedge max around every fine azimuth so a chord
-    # between two sampled cutting angles cannot clip a localized feature.
+    fine_per_coarse = max(
+        1,
+        (len(shadow_thetas) - 1)
+        // max(1, len(_theta_grid(float(params["theta_step_deg"]), config)) - 1),
+    )
+    shadow_count = len(shadow_thetas) - 1  # the grid repeats its endpoints
+    fine_step = TAU / shadow_count
     span = fine_per_coarse + 2
     wedge_profile = np.empty_like(shadow_profile)
     for center in range(len(shadow_thetas)):
@@ -886,101 +1020,213 @@ def build_roughing(
             for offset in range(-span, span + 1)
         ]
         wedge_profile[center] = np.maximum.reduce(columns)
-    theta_count = len(theta_grid)
 
-    top_level = min(height_stock, height_stock - engaged + stepdown)
+    top_level = height_stock - stepdown
     levels = list(np.arange(top_level, z_plinth - 1e-6, -stepdown))
-    if not levels or abs(levels[-1] - z_plinth) > 1e-6:
+    if not levels:
+        levels = [height_stock]
+    if abs(levels[-1] - z_plinth) > 1e-6:
         levels.append(z_plinth)
-    if levels[0] > z_plinth and levels[0] < height_stock:
-        levels.insert(0, height_stock)
 
     joints: list[dict[str, float]] = []
     rapid: list[bool] = []
     stages: list[str] = []
     theta_base = 0.0
     last_theta = 0.0
+    last_sign = 1.0
 
-    # Establish a safe home outside the stock.
-    joints.append(_joint(radius_stock + clearance, 0.0, height_stock, 0.0, config, diagnostics))
+    # Establish a safe home outside the stock and the blade's radial extent.
+    joints.append(_joint(clearance_radius, 0.0, height_stock, 0.0, config, diagnostics))
     rapid.append(True)
-    stages.append("roughing")
+    stages.append("roughing_link")
 
     for level_index, level in enumerate(levels):
         level = float(level)
         if level_index > 0:
-            # Rapid at clearance to the next terrace before plunging in.
             joints.append(
-                _joint(radius_stock + clearance, last_theta, level, 0.0, config, diagnostics)
+                _joint(
+                    last_sign * clearance_radius,
+                    last_theta,
+                    level,
+                    0.0,
+                    config,
+                    diagnostics,
+                )
             )
             rapid.append(True)
-            stages.append("roughing")
-        probe_index = int(np.argmin(np.abs(z_probes - level)))
+            stages.append("roughing_link")
+        probe_index = int(np.searchsorted(z_probes, level, side="right")) - 1
+        probe_index = max(0, min(probe_index, len(z_probes) - 1))
         level_shadow_by_center = (
             np.max(wedge_profile[:, probe_index:], axis=1) + allowance + 0.3
         )
-        lowest = max(0.0, float(np.min(level_shadow_by_center)))
-        radii = list(np.arange(radius_stock, lowest - 1e-6, -stepover))
+        lowest_shadow = float(np.min(level_shadow_by_center))
+        lowest = max(0.0, lowest_shadow + reach)
+        radii = list(np.arange(radius_stock + reach, lowest - 1e-6, -stepover))
         if not radii or radii[-1] > lowest + 1e-6:
             radii.append(lowest)
-        radii = [min(radius_stock, max(0.0, float(r))) for r in radii]
+        radii = [float(r) for r in radii]
 
-        for radius in radii:
-            # Unwrapped theta never wraps: each ring continues from the last.
-            ring_thetas = [
-                theta_base + theta_grid[index] for index in range(len(theta_grid))
-            ]
+        for radius_index, radius in enumerate(radii):
+            # Serpentine: alternate the sweep direction so the next (smaller)
+            # radius starts where the previous one ended. Without this, every
+            # radius pays a 340-degree traverse back to the arc start, which
+            # dominates the frame count.
+            ordered = passes if radius_index % 2 == 0 else list(reversed(passes))
             ring_shadows = []
-            for theta_value in ring_thetas:
-                center = int(round((theta_value % TAU) / fine_step)) % len(shadow_thetas)
+            shadow_lo = shadow_thetas[0]
+            for azimuth, _theta, _sign in ordered:
+                center = int(
+                    round(((azimuth - shadow_lo) % TAU) / fine_step)
+                ) % shadow_count
                 ring_shadows.append(float(level_shadow_by_center[center]))
             active = [
-                theta_index
-                for theta_index, shadow in enumerate(ring_shadows)
-                if radius >= shadow - 1e-6
+                index
+                for index, shadow in enumerate(ring_shadows)
+                if radius >= shadow + reach - 1e-6
             ]
             if not active:
                 continue
-            # Split active angles into contiguous runs.  A chord across an
-            # inactive gap would sweep past an overhang that needs a larger
-            # radius, so each run gets a safe clearance approach.
             runs: list[list[int]] = []
-            for theta_index in active:
-                if runs and theta_index == runs[-1][-1] + 1:
-                    runs[-1].append(theta_index)
+            for index in active:
+                same_branch = (
+                    runs
+                    and index == runs[-1][-1] + 1
+                    and ordered[index][2] == ordered[runs[-1][-1]][2]
+                )
+                if same_branch:
+                    runs[-1].append(index)
                 else:
-                    runs.append([theta_index])
+                    runs.append([index])
 
             for run in runs:
-                start_theta = ring_thetas[run[0]]
-                if abs(start_theta - last_theta) > 1e-9:
-                    # Cut radially out, rapid at clearance across the gap, then
-                    # plunge back in at the run start.
+                new_sign = float(ordered[run[0]][2])
+                start_theta = ordered[run[0]][1]
+                if abs(start_theta - last_theta) > 1e-9 or new_sign != last_sign:
+                    # Link out on the current branch, then either traverse at
+                    # the same level (same branch) or lift above the stock and
+                    # change sides there before descending on the new branch.
                     joints.append(
-                        _joint(radius_stock + clearance, last_theta, level, 0.0, config, diagnostics)
+                        _joint(
+                            last_sign * clearance_radius,
+                            last_theta,
+                            level,
+                            0.0,
+                            config,
+                            diagnostics,
+                        )
                     )
                     rapid.append(False)
-                    stages.append("roughing")
+                    stages.append("roughing_link")
+                    if new_sign != last_sign:
+                        safe_zs = height_stock + clearance
+                        joints.append(
+                            _joint(
+                                last_sign * clearance_radius,
+                                last_theta,
+                                safe_zs,
+                                0.0,
+                                config,
+                                diagnostics,
+                            )
+                        )
+                        rapid.append(True)
+                        stages.append("roughing_link")
+                        joints.append(
+                            _joint(
+                                last_sign * clearance_radius,
+                                start_theta,
+                                safe_zs,
+                                0.0,
+                                config,
+                                diagnostics,
+                            )
+                        )
+                        rapid.append(True)
+                        stages.append("roughing_link")
+                        joints.append(
+                            _joint(
+                                new_sign * clearance_radius,
+                                start_theta,
+                                safe_zs,
+                                0.0,
+                                config,
+                                diagnostics,
+                            )
+                        )
+                        rapid.append(True)
+                        stages.append("roughing_link")
+                        joints.append(
+                            _joint(
+                                new_sign * clearance_radius,
+                                start_theta,
+                                level,
+                                0.0,
+                                config,
+                                diagnostics,
+                            )
+                        )
+                        rapid.append(False)
+                        stages.append("roughing_link")
+                        last_sign = new_sign
+                    else:
+                        joints.append(
+                            _joint(
+                                new_sign * clearance_radius,
+                                start_theta,
+                                level,
+                                0.0,
+                                config,
+                                diagnostics,
+                            )
+                        )
+                        rapid.append(True)
+                        stages.append("roughing_link")
                     joints.append(
-                        _joint(radius_stock + clearance, start_theta, level, 0.0, config, diagnostics)
+                        _joint(
+                            new_sign * radius,
+                            start_theta,
+                            level,
+                            0.0,
+                            config,
+                            diagnostics,
+                        )
                     )
-                    rapid.append(True)
-                    stages.append("roughing")
-                for theta_index in run:
-                    theta_value = ring_thetas[theta_index]
-                    joints.append(_joint(radius, theta_value, level, 0.0, config, diagnostics))
+                    rapid.append(False)
+                    stages.append("roughing_link")
+                for index in run:
+                    _azimuth, theta_value, sign = ordered[index]
+                    joints.append(
+                        _joint(
+                            sign * radius,
+                            theta_value,
+                            level,
+                            0.0,
+                            config,
+                            diagnostics,
+                        )
+                    )
                     rapid.append(False)
                     stages.append("roughing")
                     last_theta = theta_value
+                    last_sign = float(sign)
             theta_base = last_theta
 
-        # Cut radially out at the current azimuth, then rapid to the next level.
-        joints.append(_joint(radius_stock + clearance, last_theta, level, 0.0, config, diagnostics))
+        # Link out at the current azimuth (and branch) before the next level.
+        joints.append(
+            _joint(
+                last_sign * clearance_radius,
+                last_theta,
+                level,
+                0.0,
+                config,
+                diagnostics,
+            )
+        )
         rapid.append(False)
-        stages.append("roughing")
+        stages.append("roughing_link")
 
-    theta_base = last_theta
-    return joints, rapid, stages, float(theta_base)
+    return joints, rapid, stages, float(last_theta)
 
 
 # ---------------------------------------------------------------------------
@@ -988,42 +1234,62 @@ def build_roughing(
 # ---------------------------------------------------------------------------
 
 
-def _tool_body_clearance(config: Mapping[str, Any]) -> float:
-    """Radial standoff where the *body* (not the apex) is fully clear."""
+def _safe_radius(config: Mapping[str, Any], sign: float, phi: float) -> float:
+    """Radial standoff that clears the stock on the requested side of the axis.
 
-    tool = config["tool"]
-    alpha = math.radians(float(tool["cone_half_angle_deg"]))
-    engaged = float(tool["engaged_length_mm"])
-    reach = float(tool["tip_radius_mm"]) + float(tool["melt_kerf_mm"])
-    return reach + engaged * math.tan(alpha)
+    On the negative-r side the CAD travel ends at ``r_min`` (about -51 mm), so
+    the generic ``R + clearance + extent`` radius can exceed what the machine
+    can reach. Clamp it to the travel while keeping the stock+retract minimum.
+    """
+
+    stock = config["stock"]
+    minimum = float(stock["R_stock_mm"]) + float(
+        stock.get("retract_clearance_mm", 6.0)
+    )
+    target = minimum + tool_model.radial_support_extent(phi, config)
+    if sign >= 0.0:
+        return target
+    r_min = float(config["limits"]["r_limits_mm"][0])
+    return max(minimum, min(target, abs(r_min) - 1.0))
+
+
+def _tool_body_clearance(config: Mapping[str, Any], phi: float = 0.0) -> float:
+    """Radial standoff added to the stock so the heated region is clear."""
+
+    return tool_model.radial_support_extent(phi, config)
 
 
 def _body_clear(
     mesh: trimesh.Trimesh,
-    apexes: Sequence[np.ndarray],
+    tips: Sequence[np.ndarray],
     axes: Sequence[np.ndarray],
     config: Mapping[str, Any],
+    theta: float = 0.0,
 ) -> bool:
     """True when every sampled pose in the batch clears the mesh."""
 
-    if len(apexes) == 0:
+    if len(tips) == 0:
         return True
-    return not bool(np.asarray(tool_body_penetrates(mesh, apexes, axes, config)).any())
+    return not bool(
+        np.asarray(
+            tool_body_penetrates(mesh, tips, axes, config, [theta] * len(tips))
+        ).any()
+    )
 
 
 def _sample_poses(
-    apexes: list[np.ndarray],
+    tips: list[np.ndarray],
     axis: np.ndarray,
 ) -> list[np.ndarray]:
-    """Sample a list of apexes every 1 mm, keeping the pitch (axis) constant."""
+    """Sample a list of tips every 1 mm, keeping the pitch (axis) constant."""
 
     samples: list[np.ndarray] = []
-    for first, second in zip(apexes, apexes[1:]):
+    for first, second in zip(tips, tips[1:]):
         steps = max(1, int(math.ceil(float(np.linalg.norm(second - first)))))
         for index in range(steps):
             samples.append(first + (second - first) * (index / steps))
-    if apexes:
-        samples.append(apexes[-1])
+    if tips:
+        samples.append(tips[-1])
     return samples
 
 
@@ -1034,7 +1300,7 @@ def _clear_line(length: float, start: np.ndarray, direction: np.ndarray) -> list
 
 
 def exit_moves(
-    apex: np.ndarray | Sequence[float],
+    tip: np.ndarray | Sequence[float],
     phi: float,
     theta: float,
     mesh: trimesh.Trimesh,
@@ -1045,8 +1311,8 @@ def exit_moves(
     """Non-rapid exit from a pitched cut: clear the body, re-pitch, then rise.
 
     With ``u = -sin(phi) e_r - cos(phi) e_z`` a slide along ``-u`` moves the
-    apex ``+s sin(phi)`` radially and ``+s cos(phi)`` upward, so candidate A
-    reaches ``clearance_target`` at ``s = (clear - r_apex) / sin(phi)`` when
+    tip ``+s sin(phi)`` radially and ``+s cos(phi)`` upward, so candidate A
+    reaches ``clearance_target`` at ``s = (clear - r_tip) / sin(phi)`` when
     ``sin(phi) > 0.05``.  Otherwise (or if A is still buried) candidate B lifts
     to ``H_stock + clearance`` and pulls straight out.
 
@@ -1060,9 +1326,14 @@ def exit_moves(
     at the clearance radius and then at the safe plane.
     """
 
-    apex = np.asarray(apex, dtype=np.float64)
+    tip = np.asarray(tip, dtype=np.float64)
     e_r = np.array([math.cos(theta), math.sin(theta), 0.0])
-    # Tool axis wrist -> apex.  As in kinematics.forward_kinematics (u(phi) =
+    signed_rs = float(tip[0] * e_r[0] + tip[1] * e_r[1])
+    sign = 1.0 if signed_rs >= 0.0 else -1.0
+    outward = e_r if signed_rs >= 0.0 else -e_r
+    safe_phi = _safe_radius(config, sign, phi)
+    safe_zero = _safe_radius(config, sign, 0.0)
+    # Tool axis wrist -> tip.  As in kinematics.forward_kinematics (u(phi) =
     # -sin(phi) e_r - cos(phi) e_z), +phi tilts the tip *inward*, so with a
     # negative phi the axis leans outboard and the body runs inboard.
     axis = -math.sin(phi) * e_r - np.array([0.0, 0.0, math.cos(phi)])
@@ -1070,9 +1341,9 @@ def exit_moves(
     clearance = float(config["stock"].get("retract_clearance_mm", 6.0))
     safe_z = height_stock + clearance
     p = float(config["pivot_to_tip_mm"])
-    r_apex = float(math.hypot(apex[0], apex[1]))
+    r_tip = float(math.hypot(tip[0], tip[1]))
 
-    # The apex of a CL pose sits ``tip_r + kerf`` off the surface, i.e. its
+    # The tip of a CL pose sits ``tip_r + kerf`` off the surface, i.e. its
     # *heater* is already in contact: a cone flank opens back towards the wrist
     # and lies on the face by construction.  Both candidates therefore skip the
     # first millimetre (that cut has just been made) and must clear from there.
@@ -1080,26 +1351,26 @@ def exit_moves(
     # Candidate 0: horizontal +e_r at constant phi.  Under a wide overhang
     # both the -u slide and a vertical lift rise into the slab, but pulling
     # straight out at the cut height stays under it.  This is tried first.
-    if clearance_target > r_apex:
+    if safe_phi > r_tip:
         candidates.append(
             _clear_line(
-                clearance_target - r_apex,
-                apex + e_r * min(1.0, clearance_target - r_apex),
-                e_r,
+                safe_phi - r_tip,
+                tip + outward * min(1.0, safe_phi - r_tip),
+                outward,
             )
         )
     if math.sin(phi) > 0.05:
         # Leaving the cut is -u; with u = -sin(phi) e_r - cos(phi) e_z the
-        # radius of the apex and of every body point grows by s sin(phi).
-        length = max(0.0, (clearance_target - r_apex) / math.sin(phi))
-        candidates.append(_clear_line(length, apex - axis * min(1.0, length), -axis))
-    lift = max(0.0, safe_z - float(apex[2]))
-    start = apex + np.array([0.0, 0.0, min(1.0, lift)])
-    top = apex + np.array([0.0, 0.0, lift])
-    radial = max(0.0, clearance_target - float(math.hypot(top[0], top[1])))
+        # radius of the tip and of every body point grows by s sin(phi).
+        length = max(0.0, (safe_phi - r_tip) / math.sin(phi))
+        candidates.append(_clear_line(length, tip - axis * min(1.0, length), -axis))
+    lift = max(0.0, safe_z - float(tip[2]))
+    start = tip + np.array([0.0, 0.0, min(1.0, lift)])
+    top = tip + np.array([0.0, 0.0, lift])
+    radial = max(0.0, safe_zero - float(math.hypot(top[0], top[1])))
     candidates.append(
         _clear_line(max(0.0, lift - 1.0), start, np.array([0.0, 0.0, 1.0]))
-        + _clear_line(radial, top, e_r)[1:]
+        + _clear_line(radial, top, outward)[1:]
     )
 
     # Candidate A ends pitched at the clearance radius; it re-pitches to
@@ -1109,31 +1380,38 @@ def exit_moves(
     upright = np.array([0.0, 0.0, -1.0])
     for candidate in candidates:
         samples = _sample_poses(candidate, axis)
-        if not _body_clear(mesh, samples, [axis] * len(samples), config):
+        if not _body_clear(mesh, samples, [axis] * len(samples), config, theta):
             continue
         clear = candidate[-1]
-        r_clear = max(float(math.hypot(clear[0], clear[1])), clearance_target)
+        r_clear = max(float(math.hypot(clear[0], clear[1])), safe_phi)
         z_clear = float(clear[2])
+        # Check the pitched clearance pose against the joint travel before
+        # emitting it; at_clear keeps the cut's pitch and is the worst case.
+        p = float(config["pivot_to_tip_mm"])
+        r_at_clear = sign * r_clear + p * math.sin(phi)
+        r_lo, r_hi = (float(v) for v in config["limits"]["r_limits_mm"])
+        if not (r_lo - 1e-9 <= r_at_clear <= r_hi + 1e-9):
+            continue
         reorient_z = z_clear + p * (1.0 - math.cos(phi))
         reorient = [
-            e_r * r_clear + np.array([0.0, 0.0, z])
+            outward * r_clear + np.array([0.0, 0.0, z])
             for z in np.linspace(z_clear, reorient_z, 8)
         ]
-        if not _body_clear(mesh, reorient, [upright] * len(reorient), config):
+        if not _body_clear(mesh, reorient, [upright] * len(reorient), config, theta):
             continue
-        # Wax apex poses, not joint radii: _joint would add p sin(phi).
-        at_clear = e_r * r_clear + np.array([0.0, 0.0, z_clear])
-        at_reorient = e_r * r_clear + np.array([0.0, 0.0, reorient_z])
-        at_safe = e_r * clearance_target + np.array([0.0, 0.0, safe_z])
+        # Wax tip poses, not joint radii: _joint would add p sin(phi).
+        at_clear = outward * r_clear + np.array([0.0, 0.0, z_clear])
+        at_reorient = outward * r_clear + np.array([0.0, 0.0, reorient_z])
+        at_safe = outward * safe_zero + np.array([0.0, 0.0, safe_z])
         return [
-            _apex_joint(at_clear, phi, theta, config, collector),
-            _apex_joint(at_reorient, 0.0, theta, config, collector),
-            _apex_joint(at_safe, 0.0, theta, config, collector),
+            _tip_joint(at_clear, phi, theta, config, collector),
+            _tip_joint(at_reorient, 0.0, theta, config, collector),
+            _tip_joint(at_safe, 0.0, theta, config, collector),
         ]
     collector.add(
         "UNREACHABLE_UNDERCUT_AREA",
         "warning",
-        f"no clear exit from the pitched cut at {np.round(apex, 3).tolist()}",
+        f"no clear exit from the pitched cut at {np.round(tip, 3).tolist()}",
         value=0.0,
     )
     return []
@@ -1150,7 +1428,7 @@ def entry_moves(
 
     The reverse of :func:`exit_moves`: from the safe plane at the clearance
     radius, descend, pitch to the cut's ``phi`` outside the stock, then slide
-    along ``-u`` onto the Contact-Point apex.  All non-rapid links.
+    along ``-u`` onto the Contact-Point tip.  All non-rapid links.
     """
 
     _ = mesh
@@ -1165,33 +1443,50 @@ def entry_moves(
     # pitch at r = 46) and pitch the tool at the wrong place.
     height_stock = float(config["stock"]["H_stock_mm"])
     clearance = float(config["stock"].get("retract_clearance_mm", 6.0))
-    apex = np.array([rs * math.cos(theta), rs * math.sin(theta), zs])
-    # Pitch outside the stock: the apex sits at the clearance radius while the
-    # wrist rotates, then the body slides along -u onto the contact point.
-    ref = e_r * clearance_target + np.array([0.0, 0.0, zs])
-    pitched = _apex_joint(ref, phi, theta, config, collector)
+    p = float(config["pivot_to_tip_mm"])
+    h_min = float(config["limits"]["h_limits_mm"][0])
+    tip = np.array([rs * math.cos(theta), rs * math.sin(theta), zs])
+    sign = 1.0 if rs >= 0.0 else -1.0
+    outward = e_r if rs >= 0.0 else -e_r
+    # Pitching about the pivot at the cut height can drop the pivot below the
+    # CAD Z-travel minimum (h = z + p cos(phi)). Pitch at the lowest height
+    # that keeps h valid, then slide down to the contact.
+    pitch_z = max(zs, h_min - p * math.cos(phi) + 1.0)
+    pitch_z = min(pitch_z, height_stock + clearance)
+    # Pitch outside the stock: the reference point sits at the clearance radius
+    # while the wrist rotates, then the tool slides onto the contact point.
+    ref = outward * _safe_radius(config, sign, phi) + np.array([0.0, 0.0, pitch_z])
+    pitched = _tip_joint(ref, phi, theta, config, collector)
     return [
-        _apex_joint(e_r * clearance_target + np.array([0.0, 0.0, height_stock + clearance]), 0.0, theta, config, collector),
-        _apex_joint(ref, 0.0, theta, config, collector),
+        _tip_joint(
+            outward * _safe_radius(config, sign, 0.0)
+            + np.array([0.0, 0.0, height_stock + clearance]),
+            0.0,
+            theta,
+            config,
+            collector,
+        ),
+        _tip_joint(ref, 0.0, theta, config, collector),
         pitched,
-        _apex_joint(apex, phi, theta, config, collector),
+        _tip_joint(tip, phi, theta, config, collector),
     ]
 
 
-def _apex_joint(
-    apex: np.ndarray,
+def _tip_joint(
+    tip: np.ndarray,
     phi: float,
     theta: float,
     config: Mapping[str, Any],
     collector: DiagnosticCollector | None = None,
 ) -> dict[str, float]:
-    """Joint for a wax-frame tip apex pose (inverse of the FK translation)."""
+    """Joint for a wax-frame tip tip pose (inverse of the FK translation)."""
 
     x = float(config["arm_radial_offset_mm"])
     h2 = float(config["arm_to_pivot_z_mm"])
     p = float(config["pivot_to_tip_mm"])
-    rs = float(math.hypot(apex[0], apex[1]))
-    return _joint_body(rs, theta, float(apex[2]), phi, x, h2, p, config, collector)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    rs = float(tip[0]) * cos_t + float(tip[1]) * sin_t
+    return _joint_body(rs, theta, float(tip[2]), phi, x, h2, p, config, collector)
 
 
 def _joint_body(
@@ -1205,7 +1500,7 @@ def _joint_body(
     config: Mapping[str, Any],
     collector: DiagnosticCollector | None,
 ) -> dict[str, float]:
-    """Raw joint from a wax apex pose (shared by _joint and _apex_joint)."""
+    """Raw joint from a wax tip pose (shared by _joint and _tip_joint)."""
 
     joint = {
         "r": rs + x + p * math.sin(phi),
@@ -1237,15 +1532,26 @@ def build_finishing(
 
     stock = config["stock"]
     radius_stock = float(stock["R_stock_mm"])
-    z_plinth = float(stock["z_plinth_mm"])
+    z_plinth = _reachable_floor(config)
     height_stock = float(stock["H_stock_mm"])
     clearance = float(params["rapid_clearance_mm"])
-    theta_grid = _theta_grid(float(params["theta_step_deg"]))
-    theta_step = TAU / len(theta_grid)
-    clearance_target = radius_stock + clearance
+    # Rapid clearance must cover the heated region at any wrist pitch, so use
+    # the largest support extent over the configured phi range.
+    phi_lo, phi_hi = (math.radians(float(v)) for v in config["limits"]["phi_limits_deg"])
+    extent = max(
+        tool_model.radial_support_extent(phi_lo, config),
+        tool_model.radial_support_extent(phi_hi, config),
+        tool_model.radial_support_extent(0.0, config),
+    )
+    clearance_target = radius_stock + clearance + extent
     safe_zs = height_stock + clearance
     # The polyline step honours the preset (never the azimuth grid).
     step = float(params["finish_z_step_mm"])
+    search_step = math.radians(float(params.get("finish_phi_search_step_deg", 5.0)))
+    max_candidates = int(math.ceil((phi_hi - phi_lo) / search_step)) + 1
+    offsets = [0]
+    for index in range(1, max_candidates + 1):
+        offsets.extend((index, -index))
 
     joints: list[dict[str, float]] = []
     rapid: list[bool] = []
@@ -1258,62 +1564,130 @@ def build_finishing(
         rapid.append(False)
         stages.append("finishing_link")
 
-    joints.append(_joint(clearance_target, float(theta_start), safe_zs, 0.0, config, diagnostics))
+    slices = _azimuth_passes(float(params["theta_step_deg"]), config)
+    joints.append(
+        _joint(clearance_target, slices[0][1], safe_zs, 0.0, config, diagnostics)
+    )
     rapid.append(True)
     stages.append("finishing")
 
-    for slice_index in range(len(theta_grid)):
-        theta_emit = theta_start + slice_index * theta_step
-        current_theta = theta_emit % TAU
-        polylines = section_polylines(mesh, current_theta, z_plinth, height_stock, step)
+    for azimuth, theta_emit, branch in slices:
+        e_r_tool = np.array([math.cos(theta_emit), math.sin(theta_emit), 0.0])
+        polylines = section_polylines(mesh, azimuth % TAU, z_plinth, height_stock, step)
         if not polylines:
             continue
 
-        # 1. Every point: pitch, cutter location, FK axis.  Reachability is
-        #    decided per point here; the body check is batched in step 2.
+        # 1. Contact points and their phi_ideal placement.
         pose_of: dict[int, dict[str, Any]] = {}
         flat: list[dict[str, Any]] = []
+
+        def place(item: dict[str, Any], phi: float) -> None:
+            point = item["point"]
+            normal = item["normal"]
+            tip = tool_model.place_on_contact(
+                point["point"],
+                normal,
+                tool_model.tool_pose(point["point"], theta_emit, phi, config),
+                config,
+            )
+            item["phi"] = phi
+            item["tip"] = tip
+            item["axis"] = np.array(
+                [
+                    -math.sin(phi) * math.cos(theta_emit),
+                    -math.sin(phi) * math.sin(theta_emit),
+                    -math.cos(phi),
+                ]
+            )
+            item["rs"] = float(tip[0] * e_r_tool[0] + tip[1] * e_r_tool[1])
+            item["zs"] = float(tip[2])
+            # A contact whose support-function CL lands on the far side of the
+            # axis does not belong to this slice's branch. Emitting it at this
+            # theta would place the tool on the wrong side of the axis; reject
+            # it instead of searching every pitch for it.
+            if item["rs"] * branch < 0.0:
+                item["valid"] = False
+                return
+            p = float(config["pivot_to_tip_mm"])
+            joint_diags = kinematics.validate_joints(
+                item["rs"] + p * math.sin(phi),
+                theta_emit,
+                item["zs"] + p * math.cos(phi),
+                phi,
+                config,
+            )
+            item["valid"] = not any(d.severity == "error" for d in joint_diags)
+            # The approach/reorient happens at the clearance radius with the
+            # same pitch. A cut whose pitch cannot also be held at clearance is
+            # not reachable by this machine, so reject it here instead of
+            # emitting an out-of-travel link. Use the tip's actual side: a
+            # near-axis CL can cross the axis even on a positive-azimuth slice.
+            sign_actual = 1.0 if item["rs"] >= 0.0 else -1.0
+            r_clear = (
+                sign_actual * _safe_radius(config, sign_actual, phi)
+                + p * math.sin(phi)
+            )
+            r_min, r_max = (float(v) for v in config["limits"]["r_limits_mm"])
+            if not (r_min - 1e-9 <= r_clear <= r_max + 1e-9):
+                item["valid"] = False
+
         for line in polylines:
             for point in line:
                 total_points += 1
-                n_r = float(point["n_r"])
+                n_r_azimuth = float(point["n_r"])
                 n_z = float(point["n_z"])
-                phi, reachable = finishing_phi(n_r, n_z, config)
-                item: dict[str, Any] = {"point": point, "phi": phi, "accepted": reachable}
-                if reachable:
-                    apex = cutter_location(point["point"], n_r, n_z, current_theta, config)
-                    if float(apex[2]) < z_plinth - EPS:
-                        item["accepted"] = False
-                    else:
-                        item["apex"] = apex
-                        item["axis"] = np.array(
-                            [
-                                -math.sin(phi) * math.cos(current_theta),
-                                -math.sin(phi) * math.sin(current_theta),
-                                -math.cos(phi),
-                            ]
-                        )
-                        item["rs"] = float(math.hypot(apex[0], apex[1]))
-                        item["zs"] = float(apex[2])
+                # The world normal is the same whichever side of the axis the
+                # tool sits on; only its projection into the tool's own e_r
+                # changes sign for the negative-r branch.
+                e_r_azimuth = np.array(
+                    [math.cos(azimuth), math.sin(azimuth), 0.0]
+                )
+                normal = n_r_azimuth * e_r_azimuth + n_z * np.array([0.0, 0.0, 1.0])
+                magnitude = float(np.linalg.norm(normal)) or 1.0
+                n_r_tool = branch * n_r_azimuth
+                phi_ideal, _ = finishing_phi(n_r_tool, n_z, config)
+                item: dict[str, Any] = {
+                    "point": point,
+                    "normal": normal / magnitude,
+                    "phi_ideal": phi_ideal,
+                    "accepted": False,
+                }
+                item["floor"] = float(point["point"][2]) < z_plinth - EPS
                 pose_of[id(point)] = item
                 flat.append(item)
 
-        # 2. One batched body check for the whole slice: the same geometry the
-        #    GOUGE diagnostic uses, so pre-filter and report cannot disagree.
-        accepted = [item for item in flat if item["accepted"]]
-        if accepted:
+        # 2. Search phi candidates ordered from phi_ideal, with early exit:
+        #    batch every still-blocked point at one candidate, keep the first
+        #    candidate that clears each point.
+        pending = [item for item in flat if not item["floor"]]
+        for offset in offsets:
+            if not pending:
+                break
+            batch: list[dict[str, Any]] = []
+            for item in pending:
+                phi = min(max(item["phi_ideal"] + offset * search_step, phi_lo), phi_hi)
+                if offset and abs(phi - item["phi_ideal"]) < 1e-12:
+                    continue  # clamped: this candidate adds nothing
+                place(item, phi)
+                if float(item["tip"][2]) < z_plinth - EPS or not item["valid"]:
+                    continue
+                batch.append(item)
+            if not batch:
+                continue
             penetrated = np.asarray(
                 tool_body_penetrates(
                     mesh,
-                    [item["apex"] for item in accepted],
-                    [item["axis"] for item in accepted],
+                    [item["tip"] for item in batch],
+                    [item["axis"] for item in batch],
                     config,
+                    [theta_emit] * len(batch),
                 ),
                 dtype=bool,
             )
-            for item, blocked in zip(accepted, penetrated):
-                if blocked:
-                    item["accepted"] = False
+            for item, blocked in zip(batch, penetrated):
+                if not blocked:
+                    item["accepted"] = True
+            pending = [item for item in pending if not item["accepted"]]
         unreachable_points += sum(1 for item in flat if not item["accepted"])
 
         # 3. Runs of consecutive accepted points, per polyline.  A rejected
@@ -1354,7 +1728,7 @@ def build_finishing(
                     stages.append("finishing")
                 last = run[-1]
                 exit_ = exit_moves(
-                    last["apex"], last["phi"], theta_emit, mesh, config, clearance_target, diagnostics
+                    last["tip"], last["phi"], theta_emit, mesh, config, clearance_target, diagnostics
                 )
                 if not exit_:
                     # The run cannot be left safely; drop its end point (counted
@@ -1367,6 +1741,10 @@ def build_finishing(
                 for move in exit_:
                     link(move)
 
+        # Reposition to the positive clearance plane at the over-stock safe
+        # height. The segment may cross the axis, but only at z = H + clearance,
+        # so it is a safe rapid (the rapid-clearance test accepts an over-stock
+        # z regardless of radial position).
         joints.append(_joint(clearance_target, theta_emit, safe_zs, 0.0, config, diagnostics))
         rapid.append(True)
         stages.append("finishing")
@@ -1450,16 +1828,49 @@ def generate_synthetic_carve_path(
 
     # Gouge checks run over every finishing cut pose, derived from the FK of
     # the frames actually emitted (not from pre-resampling target points).
-    cutting_poses = [
-        {
-            "tip_xyz_wax": frame["tip_xyz_wax"],
-            "tool_axis_wax": frame["tool_axis_wax"],
-        }
-        for frame, stage in zip(frames, stages)
-        if stage == "finishing" and not frame["is_rapid"]
-    ]
+    # Link stages are checked too (PATCH-02), sampled as defined by
+    # `gouge_sample_poses`; the tests use the same selection.
+    cutting_poses = gouge_sample_poses(frames, stages)
     for diag in detect_gouges(mesh, cutting_poses, cfg):
         collector.extend([diag])
+
+    # Feed-direction diagnostics over every cutting segment (roughing theta
+    # passes and finishing cuts). Link moves and rapids are not cuts.
+    broadside_length = 0.0
+    cutting_length = 0.0
+    first_offending: int | None = None
+    for index in range(1, len(frames)):
+        current = frames[index]
+        if current["is_rapid"] or current["stage"] not in ("roughing", "finishing"):
+            continue
+        previous = frames[index - 1]
+        direction = np.asarray(current["tip_xyz_wax"]) - np.asarray(
+            previous["tip_xyz_wax"]
+        )
+        length = float(np.linalg.norm(direction))
+        if length <= 1e-12:
+            continue
+        pose = tool_model.tool_pose(
+            current["tip_xyz_wax"], current["theta_s"], current["phi"], cfg
+        )
+        kind = tool_model.feed_class(direction, pose, cfg)
+        cutting_length += length
+        if kind == "broadside":
+            broadside_length += length
+            if first_offending is None:
+                first_offending = index
+    if broadside_length > 0.0 and cutting_length > 0.0:
+        fraction = broadside_length / cutting_length
+        collector.add(
+            "BLADE_BROADSIDE_FEED",
+            "warning",
+            (
+                f"{100.0 * fraction:.2f}% of cutting path length feeds the 6 mm "
+                f"blade face broadside; first offending frame {first_offending}"
+            ),
+            value=100.0 * fraction,
+            frame=first_offending,
+        )
 
     rough_count = sum(1 for stage in stages if stage == "roughing")
     finish_count = sum(1 for stage in stages if stage == "finishing")

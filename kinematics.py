@@ -1,21 +1,23 @@
 """Single-source-of-truth 4-DOF kinematics for the thermal wax carver.
 
 Machine frame (right-handed, ``mm``, ``+Z`` up):
-    origin (0, 0, 0) at the center of the rotary platter top surface
-    theta = 0 points along +X toward the Z-column / radial gantry
+    origin (0, 0, 0) on the orbit axis at the stock seat plane
+    theta = 0 when the column lies on machine +X
 
 Wax frame:
-    theta_s = theta = theta_ring - theta_platter (default single platter:
-    theta_ring = 0 -> theta = -theta_platter); the tool azimuth is theta_s.
+    the wax is static; the orbit ring carries the tool, so theta_s = theta.
 
 Joint symbols:
-    r      radial carriage datum (mm) measured outward from the platter axis
-    theta  rotary coordinate (rad)
-    h      arm datum height above the platter top (mm)
-    phi    wrist pitch (rad), +phi tilts the tip inward toward -r
+    r      signed radial carriage position (mm) to the tilt pivot axis along
+           e_r(theta); negative r places the pivot on the far side of the axis
+    theta  orbit-ring angle (rad)
+    h      tilt pivot height above the stock seat plane (mm)
+    phi    wrist pitch (rad), +phi tilts the reference point toward -e_r
 
-All trigonometric work for the viewer lives here. ``tip_xyz_wax`` and
-``tool_axis_wax`` are emitted per frame so the Three.js rig performs none.
+Dimensions come from ``machine_geometry.json`` (CAD-derived) merged under
+``machine_config.json``. All trigonometric work for the viewer lives here.
+``tip_xyz_wax`` and ``tool_axis_wax`` are emitted per frame so the Three.js rig
+performs none.
 """
 
 from __future__ import annotations
@@ -31,6 +33,31 @@ DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
 
 CONFIG_PATH = Path(__file__).resolve().with_name("machine_config.json")
+GEOMETRY_PATH = Path(__file__).resolve().with_name("machine_geometry.json")
+
+REMOVED_TOOL_KEYS = (
+    "tip_radius_mm",
+    "cone_half_angle_deg",
+    "engaged_length_mm",
+    "tip_width_mm",
+    "shank_radius_mm",
+    "shank_length_mm",
+)
+GEOMETRY_TOOL_KEYS = (
+    "blade_thickness_mm",
+    "blade_width_mm",
+    "blade_length_mm",
+    "shaft_radius_mm",
+    "shaft_span_mm",
+    "body_radius_mm",
+    "body_span_mm",
+    "head_clearance_mm",
+    "head_envelope",
+)
+
+
+class ConfigError(ValueError):
+    """Raised when machine configuration cannot produce a physical machine."""
 
 
 # ---------------------------------------------------------------------------
@@ -132,14 +159,158 @@ class DiagnosticCollector:
 # ---------------------------------------------------------------------------
 
 
+def _read_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _merge_limits(
+    limits: dict[str, Any], geometry: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Intersect configured limits with CAD travel; never widen past CAD.
+
+    A null CAD limit is unknown physical travel, not unlimited. It requires an
+    explicit configured fallback that is labelled unverified; otherwise the
+    configuration is rejected.
+    """
+
+    merged = dict(limits)
+    fallbacks = dict(merged.get("fallbacks", {}))
+    cad_pairs = (
+        ("r_limits_mm", geometry.get("r_travel_mm")),
+        ("h_limits_mm", geometry.get("h_travel_mm")),
+        ("theta_limits_deg", geometry.get("theta_travel_deg")),
+    )
+    for key, cad in cad_pairs:
+        configured = merged.get(key)
+        if cad is None:
+            if configured is None:
+                raise ConfigError(
+                    f"{key}: CAD travel is unknown and no explicit configured "
+                    "fallback is present; refusing to treat it as unlimited"
+                )
+            label = fallbacks.get(key)
+            if not isinstance(label, Mapping) or label.get("verified") is not False:
+                raise ConfigError(
+                    f"{key}: configured fallback must be labelled "
+                    "verified: false until measured or computed from CAD"
+                )
+            merged[key] = [float(v) for v in configured]
+            continue
+        cad_limits = [float(v) for v in cad]
+        if configured is None:
+            merged[key] = cad_limits
+            continue
+        narrowed = [
+            max(float(configured[0]), cad_limits[0]),
+            min(float(configured[1]), cad_limits[1]),
+        ]
+        if narrowed[0] > narrowed[1]:
+            raise ConfigError(f"{key}: configured limits do not overlap CAD travel")
+        merged[key] = narrowed
+    if fallbacks:
+        merged["fallbacks"] = fallbacks
+    return merged
+
+
+def merge_geometry(
+    config: Mapping[str, Any], geometry: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Merge CAD-derived geometry under the machine configuration."""
+
+    merged: dict[str, Any] = json.loads(json.dumps(config))
+    merged["geometry"] = json.loads(json.dumps(geometry))
+
+    tool = merged.setdefault("tool", {})
+    removed = [key for key in REMOVED_TOOL_KEYS if key in tool]
+    if removed:
+        raise ConfigError(
+            "removed cone tool keys are not configurable: " + ", ".join(removed)
+        )
+    geometry_tool = geometry.get("tool", {})
+    for key in GEOMETRY_TOOL_KEYS:
+        if key in geometry_tool:
+            tool[key] = json.loads(json.dumps(geometry_tool[key]))
+
+    merged["pivot_to_tip_mm"] = float(geometry["pivot_to_tip_mm"])
+    merged["arm_radial_offset_mm"] = float(geometry["pivot_radial_offset_mm"])
+    merged["arm_to_pivot_z_mm"] = 0.0
+    merged["cad_reference_pose"] = dict(geometry["cad_reference_pose"])
+    merged["limits"] = _merge_limits(merged.get("limits", {}), geometry)
+    merged["geometry_provenance"] = {
+        "step_sha256": geometry.get("step_sha256"),
+        "ocp_version": geometry.get("ocp_version"),
+        "source_length_unit": geometry.get("source_length_unit"),
+        "unassigned_parts": list(geometry.get("unassigned_parts", [])),
+        "stock_placeholder_parts": list(geometry.get("stock_placeholder_parts", [])),
+        "home_pose": geometry.get("home_pose"),
+        "cad_reference_pose": geometry.get("cad_reference_pose"),
+        "theta_limits_from_cad": geometry.get("theta_travel_deg") is not None,
+        "unverified_limits": sorted(
+            key
+            for key, label in merged["limits"].get("fallbacks", {}).items()
+            if label.get("verified") is False
+        ),
+    }
+    return merged
+
+
+def validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a merged configuration and return it unchanged."""
+
+    tool = config.get("tool")
+    if not isinstance(tool, Mapping):
+        raise ConfigError("config.tool is missing")
+    for key in ("blade_thickness_mm", "blade_width_mm", "blade_length_mm"):
+        if key not in tool:
+            raise ConfigError(f"config.tool.{key} is missing (blade dimensions are CAD-derived)")
+        if float(tool[key]) <= 0.0:
+            raise ConfigError(f"config.tool.{key} must be positive")
+    kerf = float(tool.get("melt_kerf_mm", -1.0))
+    if kerf < 0.0:
+        raise ConfigError("config.tool.melt_kerf_mm must be zero or positive")
+    heated = float(tool.get("heated_length_mm", tool["blade_length_mm"]))
+    if heated <= 0.0 or heated > float(tool["blade_length_mm"]) + 1e-9:
+        raise ConfigError(
+            "config.tool.heated_length_mm must be positive and no longer than the blade"
+        )
+    limits = config.get("limits")
+    if not isinstance(limits, Mapping):
+        raise ConfigError("config.limits is missing")
+    for key in ("r_limits_mm", "h_limits_mm", "phi_limits_deg", "theta_limits_deg"):
+        value = limits.get(key)
+        if value is None:
+            raise ConfigError(
+                f"config.limits.{key} is required; unknown travel is never unlimited"
+            )
+        lo, hi = (float(v) for v in value)
+        if not (math.isfinite(lo) and math.isfinite(hi)) or lo > hi:
+            raise ConfigError(f"config.limits.{key} is not an ordered finite range")
+    return dict(config)
+
+
 def load_config(path: str | Path | Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Load the machine configuration (or deep-copy an already loaded mapping)."""
+    """Load, merge and validate the machine configuration.
+
+    A mapping that already carries ``geometry`` is treated as merged and only
+    validated. Otherwise ``machine_geometry.json`` is merged under the raw
+    machine configuration. The config may narrow CAD travel but never widen it.
+    """
 
     if isinstance(path, Mapping):
-        return json.loads(json.dumps(path))
-    config_path = Path(path) if path is not None else CONFIG_PATH
-    with config_path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        data = json.loads(json.dumps(path))
+        if "geometry" in data:
+            return validate_config(data)
+        config_path = CONFIG_PATH
+    else:
+        config_path = Path(path) if path is not None else CONFIG_PATH
+        data = _read_json(config_path)
+
+    geometry_path = Path(data.get("geometry_path", GEOMETRY_PATH.name))
+    if not geometry_path.is_absolute():
+        geometry_path = config_path.parent / geometry_path
+    geometry = _read_json(geometry_path)
+    return validate_config(merge_geometry(data, geometry))
 
 
 def _finite(value: float, name: str) -> float:
@@ -183,10 +354,13 @@ def forward_kinematics(
     phi: float,
     config: Mapping[str, Any],
 ) -> ForwardKinematics:
-    """Evaluate conical-bevel tip apex pose in the wax frame.
+    """Evaluate the tool reference point pose in the wax frame.
 
     ``r``/``h`` are millimetres, ``theta``/``phi`` radians. ``+phi`` rotates
-    about the local azimuthal axis ``+e_theta`` and tilts the tip inward.
+    about the local azimuthal axis ``+e_theta`` and tilts the reference point
+    toward ``-e_r``. The equation form is unchanged from the MVP; only the
+    datums (orbit theta, signed r to the pivot, h to the pivot, p = 60, x = 0,
+    h2 = 0) changed.
     """
 
     r = _finite(r, "r")
@@ -365,8 +539,16 @@ def inverse_kinematics_with_policy(
     config: Mapping[str, Any],
     *,
     phi_preference_rad: float | None = None,
+    previous_theta_rad: float | None = None,
 ) -> InverseKinematics:
-    """Solve ``(r, theta, h, phi)`` for a tip-apex target and optional normal."""
+    """Solve ``(r, theta, h, phi)`` for a tool-reference-point target.
+
+    A target can be reached with either sign of ``r``: at ``(r, theta)`` or at
+    ``(-r, theta + pi)``. Both candidates are built, the normal is projected
+    into each candidate's own ``e_r``, and the feasible candidate nearest the
+    previous unwrapped theta wins. This keeps continuous motion inside the
+    orbit stops instead of forcing a 330-degree orbit swing.
+    """
 
     if isinstance(target, Mapping):
         r_s = _finite(target["r_s"], "r_s")
@@ -375,22 +557,47 @@ def inverse_kinematics_with_policy(
     else:
         r_s, theta_s, z_s = (_finite(v, "target") for v in target)
 
-    diagnostics: list[Diagnostic] = []
-    if phi_preference_rad is None:
-        phi, policy_diags = phi_selection_policy(normal, theta_s, config)
-        diagnostics.extend(policy_diags)
-    else:
-        phi = _finite(phi_preference_rad, "phi_preference_rad")
-
     x = float(config["arm_radial_offset_mm"])
     h2 = float(config["arm_to_pivot_z_mm"])
     p = float(config["pivot_to_tip_mm"])
 
-    theta = theta_s
-    r = r_s + x + p * math.sin(phi)
-    h = z_s + p * math.cos(phi) + h2
+    candidates: list[tuple[bool, float, float, float, float, list[Diagnostic]]] = []
+    for sign, theta in ((1.0, theta_s), (-1.0, theta_s + math.pi)):
+        if phi_preference_rad is None:
+            phi, policy_diags = phi_selection_policy(normal, theta, config)
+        else:
+            phi = _finite(phi_preference_rad, "phi_preference_rad")
+            policy_diags = []
+        r = sign * r_s + x + p * math.sin(phi)
+        h = z_s + p * math.cos(phi) + h2
+        diags = list(policy_diags)
+        diags.extend(validate_joints(r, theta, h, phi, config))
+        viable = not any(d.severity == "error" for d in diags)
+        candidates.append((viable, theta, r, h, phi, diags))
 
-    diagnostics.extend(validate_joints(r, theta, h, phi, config))
+    feasible = [candidate for candidate in candidates if candidate[0]]
+    if feasible:
+        if previous_theta_rad is None:
+            chosen = feasible[0]
+        else:
+            # Unwrapped theta: a candidate 330 degrees away is farther than
+            # one 150 degrees away, even though both wrap to valid angles.
+            chosen = min(
+                feasible, key=lambda candidate: abs(candidate[1] - previous_theta_rad)
+            )
+    else:
+        chosen = candidates[0]
+        # Keep the diagnostics of both branches so the caller can see both
+        # violated limits rather than only the preferred branch's.
+        for candidate in candidates[1:]:
+            for diag in candidate[5]:
+                if not any(
+                    existing.code == diag.code and existing.axis == diag.axis
+                    for existing in chosen[5]
+                ):
+                    chosen[5].append(diag)
+
+    _, theta, r, h, phi, diagnostics = chosen
     return InverseKinematics(r=r, theta=theta, h=h, phi=phi, diagnostics=diagnostics)
 
 
@@ -522,13 +729,30 @@ def build_trajectory(
             float(prev["r"]), float(prev["theta"]), float(prev["h"]), float(prev["phi"]), config
         )
         theta_dot = (float(curr["theta"]) - float(prev["theta"])) / dt
-        if min(prev_fk.r_s, fk.r_s) < r_s_min and abs(theta_dot) > theta_warn:
+        dtheta = float(curr["theta"]) - float(prev["theta"])
+        # The crossing test covers r_s = +x -> -x: both endpoints can be far
+        # from the axis while the straight segment passes through it.
+        crosses = (prev_fk.r_s > 0.0) != (fk.r_s > 0.0)
+        inside = min(abs(prev_fk.r_s), abs(fk.r_s)) < r_s_min
+        # Judge the singularity on the *required* orbit rate implied by the
+        # feed, before v_max_theta_s limits dt. With v_max_theta at 1 rad/s the
+        # limited rate can never exceed the 3 rad/s warning threshold, so
+        # testing the limited rate would silence the warning permanently.
+        feeds = config["feeds"]
+        feed = float(feeds["feed_rapid_mm_s"] if rapid else feeds["feed_cut_mm_s"])
+        drs = fk.r_s - prev_fk.r_s
+        dzs = fk.z_s - prev_fk.z_s
+        r_mean = 0.5 * (prev_fk.r_s + fk.r_s)
+        ds = math.sqrt(drs * drs + (r_mean * dtheta) ** 2 + dzs * dzs)
+        feed_dt = ds / feed if feed > 0.0 else 0.0
+        theta_dot_required = dtheta / feed_dt if feed_dt > 1e-12 else 0.0
+        if (inside or crosses) and abs(theta_dot_required) > theta_warn:
             collector.add(
                 "SINGULARITY_HIGH_THETA_DOT",
                 "warning",
                 (
-                    f"r_s={fk.r_s:.3f} mm < {r_s_min} mm with "
-                    f"theta_dot={theta_dot:.3f} rad/s > {theta_warn} rad/s"
+                    f"r_s={fk.r_s:.3f} mm < {r_s_min} mm with required "
+                    f"theta_dot={theta_dot_required:.3f} rad/s > {theta_warn} rad/s"
                 ),
                 value=fk.r_s,
                 frame=index,

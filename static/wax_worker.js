@@ -11,22 +11,43 @@
 
 import { WaxSDFCore, DEFAULT_TOOL } from './wax_sdf_core.js';
 
-/** Map backend tool config (mm) onto the SDF core's tool units. */
+/** Map backend blade config (mm) onto the SDF core's tool units. */
 function toolFromConfig(configTool) {
   const source = configTool || {};
-  const pick = (configKey, defaultKey) => {
+  const positive = (configKey, fallback) => {
     const value = Number(source[configKey]);
-    return Number.isFinite(value) && value > 0 ? value : DEFAULT_TOOL[defaultKey];
+    return Number.isFinite(value) && value > 0 ? value : fallback;
   };
+  const span = (configKey, fallback) => {
+    const value = source[configKey];
+    if (Array.isArray(value) && value.length === 2) {
+      const lo = Number(value[0]);
+      const hi = Number(value[1]);
+      if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) return [lo, hi];
+    }
+    return fallback;
+  };
+  const bladeLength = positive('blade_length_mm', DEFAULT_TOOL.bladeLength);
+  const heated = positive('heated_length_mm', bladeLength);
+  const kerf = Number(source.melt_kerf_mm);
+  const envelope = source.head_envelope || {};
+  const center = Array.isArray(envelope.center_mm) ? envelope.center_mm : null;
+  const half = Array.isArray(envelope.half_extents_mm) ? envelope.half_extents_mm : null;
   return {
-    tipRadius: pick('tip_radius_mm', 'tipRadius'),
-    coneHalfAngleDeg: pick('cone_half_angle_deg', 'coneHalfAngleDeg'),
-    engagedLength: pick('engaged_length_mm', 'engagedLength'),
-    meltKerf: Number.isFinite(Number(source.melt_kerf_mm))
-      ? Number(source.melt_kerf_mm)
-      : DEFAULT_TOOL.meltKerf,
-    shankRadius: pick('shank_radius_mm', 'shankRadius'),
-    shankLength: pick('shank_length_mm', 'shankLength'),
+    bladeThickness: positive('blade_thickness_mm', DEFAULT_TOOL.bladeThickness),
+    bladeWidth: positive('blade_width_mm', DEFAULT_TOOL.bladeWidth),
+    bladeLength,
+    heatedLength: Math.min(heated, bladeLength),
+    meltKerf: Number.isFinite(kerf) && kerf >= 0 ? kerf : DEFAULT_TOOL.meltKerf,
+    shaftRadius: positive('shaft_radius_mm', DEFAULT_TOOL.shaftRadius),
+    shaftSpan: span('shaft_span_mm', DEFAULT_TOOL.shaftSpan),
+    bodyRadius: positive('body_radius_mm', DEFAULT_TOOL.bodyRadius),
+    bodySpan: span('body_span_mm', DEFAULT_TOOL.bodySpan),
+    headClearance: positive('head_clearance_mm', DEFAULT_TOOL.headClearance),
+    headEnvelope:
+      center && half
+        ? { shape: envelope.shape || 'box', center: [...center], halfExtents: [...half] }
+        : DEFAULT_TOOL.headEnvelope,
   };
 }
 
@@ -35,6 +56,7 @@ let workerTool = { ...DEFAULT_TOOL };
 let poses = null;
 let rapid = null;
 let count = 0;
+let poseStride = 6;
 let current = 0;
 let snapshots = [];
 let snapshotEvery = 1000;
@@ -46,7 +68,7 @@ function post(message, transfer = []) {
 }
 
 function poseAt(index) {
-  const offset = index * 6;
+  const offset = index * poseStride;
   const axis = [
     poses[offset + 3],
     poses[offset + 4],
@@ -56,6 +78,7 @@ function poseAt(index) {
   return {
     tip: [poses[offset], poses[offset + 1], poses[offset + 2]],
     axis: [axis[0] / length, axis[1] / length, axis[2] / length],
+    theta: poseStride >= 7 ? poses[offset + 6] : 0,
   };
 }
 
@@ -108,17 +131,30 @@ function carveForward(target) {
       const result = core.checkRapid(previous, pose, workerTool);
       if (result.collision) {
         core.lastCollision = result;
-        post({ type: 'collision', code: 'RAPID_COLLISION', index, sdf: result.sdf });
+        post({
+          type: 'collision',
+          code: 'RAPID_COLLISION',
+          index,
+          body: result.body,
+          sdf: result.sdf,
+        });
         faulted = true;
         current = index;
         return index;
       }
     } else {
-      // The unheated shank is checked on every cutting frame: a vertical
-      // plunge can bury it in uncarved stock just as a tilted pass can.
+      // The unheated shaft, cartridge body and tilt-head envelope are checked
+      // on every cutting frame: a vertical plunge can bury them in uncarved
+      // stock just as a tilted pass can.
       const shank = core.checkShank(pose, workerTool);
       if (shank.collision) {
-        post({ type: 'collision', code: 'SHANK_COLLISION', index, sdf: shank.sdf });
+        post({
+          type: 'collision',
+          code: 'SHANK_COLLISION',
+          index,
+          body: shank.body,
+          sdf: shank.sdf,
+        });
         faulted = true;
         current = index;
         return index;
@@ -183,6 +219,7 @@ self.onmessage = (event) => {
     poses = data.poses;
     rapid = data.rapid;
     count = data.count;
+    poseStride = Number(data.stride) === 7 ? 7 : 6;
     current = 0;
     snapshots = [];
     faulted = false;

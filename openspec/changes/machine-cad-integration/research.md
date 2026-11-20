@@ -98,6 +98,7 @@ Result: both `(1)` files are byte-identical to the originals (see Verified facts
 | Orbit stop | `Stop_Block_PLA` + `Orbit_Limit_Switches` on the static side at CAD x ≈ −240 (θ ≈ 180° from the column) ⇒ orbit travel is bounded, not continuous | Placed bboxes | 2026-11-18 | decays |
 | Wax placeholder | 120 (X) × 56 (Y) × 100 (Z), bottom at y = 3.0, top at y = 59.0 | Placed bbox | 2026-11-18 | superseded for stock (owner: cylinder) |
 | Uploaded STL | Binary, 241,970 triangles, mm, Y-up, extents 770 × 601 × 700 | trimesh load | 2026-11-18 | stable |
+| MVP `demo` performance baseline | `main` at `98ac91d`. `generate_synthetic_carve_path(preset="demo")` on sliders `{nose:1.0, chin:0.6, brow:0.4, cheeks:0.4, jaw:0.3}`, enabled stages `roughing + finishing` (cone geometry): 138,201 frames (106,720 roughing + 8,752 finishing + 19,436 rapid), 12.159 % unreachable. Three runs: 167,278 / 164,297 / 173,184 ms; median 167,278 ms, best 164,297 ms (sculpting 33.8 ms, excluded). Environment: Linux 5.15.0-1081-oracle aarch64, Python 3.11.2, numpy/scipy/trimesh/manifold3d/fastapi from `requirements.txt`. | Timed in-process with `time.perf_counter` three times on the unmodified MVP code | 2026-11-19 | decays (code/CPU) |
 
 ## Unverified assumptions
 

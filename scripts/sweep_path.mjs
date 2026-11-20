@@ -16,13 +16,14 @@ import assert from 'node:assert/strict';
 
 import { WaxSDFCore, DEFAULT_TOOL } from '../static/wax_sdf_core.js';
 
-function poseAt(poses, index) {
-  const offset = index * 6;
+function poseAt(poses, index, stride) {
+  const offset = index * stride;
   const axis = [poses[offset + 3], poses[offset + 4], poses[offset + 5]];
   const length = Math.hypot(axis[0], axis[1], axis[2]) || 1;
   return {
     tip: [poses[offset], poses[offset + 1], poses[offset + 2]],
     axis: [axis[0] / length, axis[1] / length, axis[2] / length],
+    theta: stride >= 7 ? poses[offset + 6] : 0,
   };
 }
 
@@ -32,18 +33,34 @@ const payload = JSON.parse(fs.readFileSync(file, 'utf8'));
 const poses = new Float32Array(payload.poses);
 const rapid = new Uint8Array(payload.rapid);
 const count = payload.count;
-assert.equal(poses.length, count * 6, 'pose buffer length');
+const stride = Number(payload.stride) === 7 ? 7 : 6;
+assert.equal(poses.length, count * stride, 'pose buffer length');
 assert.equal(rapid.length, count, 'rapid buffer length');
 
 const configTool = payload.tool || {};
+const positive = (key, fallback) => {
+  const value = Number(configTool[key]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+};
+const span = (key, fallback) => {
+  const value = configTool[key];
+  if (Array.isArray(value) && value.length === 2) return [Number(value[0]), Number(value[1])];
+  return fallback;
+};
+const bladeLength = positive('blade_length_mm', DEFAULT_TOOL.bladeLength);
 const tool = {
   ...DEFAULT_TOOL,
-  tipRadius: configTool.tip_radius_mm ?? DEFAULT_TOOL.tipRadius,
-  coneHalfAngleDeg: configTool.cone_half_angle_deg ?? DEFAULT_TOOL.coneHalfAngleDeg,
-  engagedLength: configTool.engaged_length_mm ?? DEFAULT_TOOL.engagedLength,
-  meltKerf: configTool.melt_kerf_mm ?? DEFAULT_TOOL.meltKerf,
-  shankRadius: configTool.shank_radius_mm ?? DEFAULT_TOOL.shankRadius,
-  shankLength: configTool.shank_length_mm ?? DEFAULT_TOOL.shankLength,
+  bladeThickness: positive('blade_thickness_mm', DEFAULT_TOOL.bladeThickness),
+  bladeWidth: positive('blade_width_mm', DEFAULT_TOOL.bladeWidth),
+  bladeLength,
+  heatedLength: Math.min(positive('heated_length_mm', bladeLength), bladeLength),
+  meltKerf: Number.isFinite(Number(configTool.melt_kerf_mm))
+    ? Number(configTool.melt_kerf_mm)
+    : DEFAULT_TOOL.meltKerf,
+  shaftRadius: positive('shaft_radius_mm', DEFAULT_TOOL.shaftRadius),
+  shaftSpan: span('shaft_span_mm', DEFAULT_TOOL.shaftSpan),
+  bodyRadius: positive('body_radius_mm', DEFAULT_TOOL.bodyRadius),
+  bodySpan: span('body_span_mm', DEFAULT_TOOL.bodySpan),
 };
 const started = Date.now();
 const core = new WaxSDFCore({
@@ -58,8 +75,8 @@ let shankHits = 0;
 let cuttingChecked = 0;
 let first = null;
 for (let index = 1; index < count; index += 1) {
-  const pose = poseAt(poses, index);
-  const previous = poseAt(poses, index - 1);
+  const pose = poseAt(poses, index, stride);
+  const previous = poseAt(poses, index - 1, stride);
   if (rapid[index]) {
     const result = core.checkRapid(previous, pose, tool);
     if (result.collision) {
