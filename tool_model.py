@@ -327,8 +327,12 @@ def radial_support_extent(phi: float, config: Mapping[str, Any] | None = None) -
     """
 
     thickness, _, length, kerf = _heated_params(config)
-    return (
+    heated = (
         abs(length * math.sin(phi))
         + 0.5 * thickness * abs(math.cos(phi))
         + kerf
     )
+    # The unheated shaft is wider than the blade's radial reach at small phi;
+    # rapid clearance must clear both.
+    shaft = float(_tool(config).get("shaft_radius_mm", 0.0))
+    return max(heated, shaft)

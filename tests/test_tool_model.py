@@ -28,6 +28,14 @@ class TestToolFrame(unittest.TestCase):
     def setUpClass(cls):
         cls.config = kinematics.load_config()
 
+    def test_radial_support_extent_covers_the_unheated_shaft(self):
+        # Rapid clearance must keep the 2.5 mm shaft out of the stock too, not
+        # only the ~1 mm heated blade reach at phi = 0.
+        extent = tool_model.radial_support_extent(0.0, self.config)
+        self.assertGreaterEqual(
+            extent, float(self.config["tool"]["shaft_radius_mm"])
+        )
+
     def test_frame_at_zero_is_the_cad_blade_orientation(self):
         pose = tool_model.tool_pose([0.0, 0.0, 0.0], 0.0, 0.0, self.config)
         np.testing.assert_allclose(pose.a_n, -X, atol=1e-12)

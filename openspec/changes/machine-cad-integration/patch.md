@@ -147,3 +147,54 @@ No production code was edited in task group 1 beyond `requirements-cad.txt`
 | `test_approach_and_retract_never_drop_below_cut_height` | `r_s >= R_stock` across a phi change | `abs(r_s) >= R_stock` | same signed-r reason |
 | `test_unwrapped_theta_is_continuous_within_cut_runs` | every non-rapid frame | only cutting stages | a link move may switch branches (theta jumps by ~180°); cutting runs stay continuous |
 | `test_finishing_follows_planar_contours` | every sampled cut is buried no more than the allowance | tangency (min abs distance ≤ 0.75) plus a `GOUGE` diagnostic whenever a sample is buried deeper | the zero-burial guard was added by the implementation, not by a spec scenario; deeper burial is the deferred finishing-strategy limitation the spec requires to be *reported* |
+
+---
+
+### [PATCH-02] Sign-Aware Roughing Links, Shaft Rapid Extent, Gouge Depth Fidelity & Over-Stock Rapids
+
+- **Date**: 2026-11-20 15:23:00 UTC
+- **Feedback Source**: Code Review (PR #2 at `ec9a521` — `REQUEST CHANGES`)
+- **Feedback Summary**:
+  - **Critical (1)**:
+    1. `toolpath_sim.py:992-1042` (`build_roughing`): `for run in runs:` always links out/in using positive `+clearance_radius`. Switching between `r_s > 0` and `r_s < 0` drives the blade across `r_s = 0` at cutting height `level` (94 non-rapid crossings below `H_stock` on `demo`, 36 passing through the target head mesh).
+  - **Important (3)**:
+    2. `tool_model.py:321-334` (`radial_support_extent`): Computes only the heated blade's radial reach (~`1.0 mm` at `phi = 0`), omitting the `2.5 mm` unheated shaft radius required by the rapid-clearance spec.
+    3. `toolpath_sim.py:822-862` (`detect_gouges`): Samples only corners + 3 centreline points, under-reporting worst burial depth (`1.558 mm` reported vs `3.9 mm` actual on needle fixture), and omits `roughing_link` / `finishing_link` stages.
+    4. `toolpath_sim.py:1376-1380, 1523-1570` (`build_finishing`): Cross-axis reposition at `safe_zs = H_stock + clearance` was changed to non-rapid `finishing_link`, inflating `demo` from ~64k to ~98k frames; keep it `rapid=True` and accept `z_s >= H_stock + retract_clearance_mm` in the rapid-clearance test.
+  - **Nit (1)**:
+    5. `openspec/changes/machine-cad-integration/patch.md:57` vs stale `z_plinth_mm` bullet (ensure no contradictory `10 -> 12` claim remains).
+  - **Note on Owner Gates (`tasks.md:114-115`)**: `7.1` and `7.2` remain open owner sign-off gates before merge.
+- **Reported Issue / Raw Trace**:
+  ```
+  PR #2 Verdict: REQUEST CHANGES (ec9a521)
+  - toolpath_sim.py:997-1041: 94 non-rapid moves cross r_s = 0 below H_stock (36 through target head mesh)
+  - tool_model.py:321-334: radial_support_extent omits shaft radius (2.5 mm > 1.0 mm at phi = 0)
+  - toolpath_sim.py:822-862: detect_gouges reports 1.558 mm vs 3.9 mm actual burial; skips link stages
+  - toolpath_sim.py:1523-1570: safe_zs cross-axis move marked non-rapid, inflating frame count
+  ```
+- **Root Cause**:
+  - `build_roughing` did not track `last_sign` or lift above `H_stock + clearance` when switching `r_s` branch sign.
+  - `radial_support_extent` only evaluated `_heated_params` without `max(..., shaft_radius)`.
+  - `detect_gouges` used a coarser point set than the test's corners + face samples.
+- **Target Files**: `toolpath_sim.py`, `tool_model.py`, `tests/test_carver_sim.py`, `tests/test_tool_model.py`, `openspec/changes/machine-cad-integration/patch.md`
+- **Resolution Strategy**:
+  - Track `last_sign` in `build_roughing`: link out on `last_sign * clearance_radius`; if `new_sign != last_sign`, lift to `safe_zs = H_stock + clearance` as `rapid=True` before traversing `start_theta` and descending to `level` on `new_sign * clearance_radius`.
+  - Include `shaft_radius` in `tool_model.radial_support_extent`.
+  - Expand `detect_gouges` sampling to corners + face centers/midpoints (matching test sampling) and run it on `finishing`, `roughing_link`, and `finishing_link`.
+  - Keep `build_finishing` `safe_zs` cross-axis moves as `rapid=True`, and update `test_rapids_retract_outside_stock_and_tool_extent` to accept `z_s >= H_stock + retract_clearance_mm` as clear.
+- **Resolution**:
+  - `build_roughing` tracks `last_sign`. Links out on `last_sign * clearance_radius`; a branch switch lifts to `z = H_stock + clearance`, traverses theta there, crosses the axis above the stock as a rapid, and only then descends on the new branch. The new `test_no_cross_axis_move_below_the_stock_plane` fails any non-rapid roughing/finishing/link segment that changes `r_s` sign below `H_stock`.
+  - `tool_model.radial_support_extent` returns `max(heated_reach, shaft_radius_mm)`, so rapid clearance covers the 2.5 mm shaft at `phi = 0`. New test asserts `>= shaft_radius_mm`.
+  - `detect_gouges` samples corners, six face centres, twelve edge midpoints and the centreline. It reports the single deepest burial (not the first), and runs on finishing cuts plus `roughing_link`/`finishing_link` via `gouge_sample_poses` (finishing every 4th resampled frame, links every 50th). An AABB reject and a 0.1 mm-shrunk `contains` prefilter keep the signed-distance calls to genuine penetrations. The planarity test measures a subset of that same selection and requires the reported depth to be `>=` it.
+  - `build_finishing` keeps the `z = H_stock + clearance` cross-axis reposition as `rapid=True`; `test_rapids_retract_outside_stock_and_tool_extent` accepts `z_s >= H_stock + retract_clearance_mm` as clear.
+  - Rapids are resampled at 2.5 mm (cut moves keep `0.5 * (blade_thickness + 2*kerf)`). The bounded orbit makes every branch switch a ~173-degree ring rotation above the stock; at the cutting bound those rapids pushed `standard` past the 250k frame cap. Rapid frames stay on clearance/safe planes, so the coarser pitch only reduces collision-check density, not cut fidelity. Final: `demo` **84,831 frames / 194.6 s** (1.16x the 167.3 s baseline); `standard` **182,626 frames** (under the 250k cap).
+- **Status**: VERIFIED
+
+### PATCH-02 migrated assertions
+
+| Test | Old assertion | New assertion | Reason |
+| :--- | :--- | :--- | :--- |
+| `test_rapids_retract_outside_stock_and_tool_extent` | `abs(r_s) >= R + clearance + extent` for every rapid | the same **or** `z_s >= H_stock + retract_clearance_mm` | a rapid above the stock is clear regardless of radial position; branch switches use that plane |
+| `test_finishing_follows_planar_contours` | burial measured on every sampled finishing cut with corners+tip+mid | burial measured on a subset of `gouge_sample_poses` (the generator's own selection); reported depth must be `>=` it | guarantees the diagnostic cannot understate what is checked |
+| new `test_no_cross_axis_move_below_the_stock_plane` | — | no non-rapid segment in any stage changes `r_s` sign below `H_stock` | the critical finding |
+| new `test_radial_support_extent_covers_the_unheated_shaft` | — | `radial_support_extent(0) >= shaft_radius_mm` | rapid clearance must cover the shaft, not only the heated blade |

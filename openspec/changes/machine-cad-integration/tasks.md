@@ -131,3 +131,10 @@
 - [x] P01.3 Fix `toolpath_sim.py` (`_theta_grid` endpoint inclusion + negative-`r_s` sweep for `(theta_hi, theta_lo + 360°)` in roughing/finishing) and `tool_model.py` (`+ kerf` in `radial_support_extent`)
 - [x] P01.4 Update `package.json` (`test:node` with `--experimental-vm-modules` and all 3 `.mjs` suites) and `tests.md`
 - [x] P01.5 Run full Python + Node suites and `openspec validate machine-cad-integration --strict --json`, update `verification.md`, and mark `PATCH-01` `VERIFIED` in `patch.md` (keeping owner gates 7.1 and 7.2 open)
+
+## Patch 02: Sign-Aware Roughing Links, Shaft Rapid Extent, Gouge Depth & Over-Stock Rapids
+
+- [x] P02.1 Scaffold failing tests in `tests/test_carver_sim.py` and `tests/test_tool_model.py`: (a) zero non-rapid `roughing`/`finishing`/`*_link` segments cross `r_s = 0` below `H_stock`, (b) `detect_gouges` reported depth `>=` test-measured depth and checks `roughing_link`/`finishing_link`, (c) `radial_support_extent(0)` `>=` shaft radius (`2.5 mm`), and (d) `test_rapids_retract_outside_stock_and_tool_extent` accepts `z_s >= H_stock + retract_clearance_mm`
+- [x] P02.2 Fix `toolpath_sim.py`: sign-aware `last_sign * clearance_radius` link-out/in + over-stock (`H_stock + clearance`) branch switch in `build_roughing`; expand `detect_gouges` sampling (corners + face centers) and run across `finishing`, `roughing_link`, and `finishing_link`; keep `safe_zs` cross-axis finishing repositions `rapid=True`
+- [x] P02.3 Fix `tool_model.py`: include unheated shaft radius in `radial_support_extent`
+- [x] P02.4 Run full Python + Node suites + `openspec validate machine-cad-integration --strict --json`, update `verification.md`, and mark `PATCH-02` `VERIFIED` in `patch.md` (keeping owner gates 7.1 and 7.2 open)

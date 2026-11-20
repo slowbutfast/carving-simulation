@@ -32,7 +32,7 @@ Two owner gates stay open by design: task 7.1 (roles + joint-sweep sign-off) and
 
 | Suite | Command | Result |
 | :--- | :--- | :--- |
-| Python runtime | `.venv/bin/python -m unittest discover -s tests -v` | **99 tests, 0 failures, 5 skipped** (one hardware-pose fixture not recorded; four OCP-gated extractor tests) |
+| Python runtime | `.venv/bin/python -m unittest discover -s tests -v` | **101 tests, 0 failures, 5 skipped** (one hardware-pose fixture not recorded; four OCP-gated extractor tests) |
 | OCP extractor | `.venv-cad/bin/python -m unittest tests.test_machine_cad_extract -v` | **4 tests, 0 failures** |
 | Node | `node --experimental-vm-modules --test tests/test_wax_sdf.mjs tests/test_wax_worker.mjs tests/test_cad_rig.mjs` | **23 tests, 22 pass, 0 fail, 1 skipped (BENCH)** |
 
@@ -68,6 +68,7 @@ Two owner gates stay open by design: task 7.1 (roles + joint-sweep sign-off) and
 | Shaft collision at 2 mm vs 3 mm | `test_shaft_wall_at_two_mm_penetrates_at_three_does_not` | pass |
 | Head envelope comes from the geometry | `test_head_envelope_is_read_from_the_geometry` | pass |
 | Broadside / slice / plunge classification | `test_radial_feed_is_broadside_and_tangential_is_slice`, `test_threshold_comes_from_config` | pass |
+| Rapid clearance covers the unheated shaft | `test_radial_support_extent_covers_the_unheated_shaft` | pass |
 
 ### carver-kinematics
 
@@ -84,6 +85,7 @@ Two owner gates stay open by design: task 7.1 (roles + joint-sweep sign-off) and
 | Relative tip speed (pure orbit and combined) | `test_pure_turntable_rotation_reports_relative_tip_speed`, `test_combined_motion_uses_full_relative_tip_speed` | pass |
 | Singularity on both sides of the axis | `test_near_axis_fast_rotation_emits_singularity`, `test_axis_crossing_emits_singularity_on_both_sides` | pass |
 | Full 360-degree azimuth coverage behind the orbit stops | `test_every_azimuth_bin_receives_cutting_frames` | pass |
+| Branch switches stay above the stock | `test_no_cross_axis_move_below_the_stock_plane` | pass |
 | Default v_max_theta <= 1.0 | `test_config_declares_datums_tool_and_limits` | pass |
 
 ### face-sculpt-sim
@@ -154,10 +156,10 @@ Baseline (`main` at `98ac91d`, cone finishing): `demo` 138,201 frames,
 
 | Preset | Frames (CAD blade) | Wall time | Ratio to baseline |
 | :--- | ---: | ---: | ---: |
-| `demo` | 98,109 | 195.0 s | 1.17x (guard <= 1.5x) |
-| `standard` | denser than `demo`, under the 250k frame cap | suite pass | — |
+| `demo` | 84,831 | 194.6 s | 1.16x (guard <= 1.5x) |
+| `standard` | 182,626 | suite pass | under the 250k frame cap |
 
-The guard (<= 1.5x baseline for equivalent stages/inputs) passes: 195.0 s vs 250.9 s allowed.
+The guard (<= 1.5x baseline for equivalent stages/inputs) passes: 194.6 s vs 250.9 s allowed.
 The extra time over the first implementation is the full 360-degree azimuth
 coverage; `body_penetrates` culls samples outside the target mesh AABB to keep
 the cost inside the guard.
@@ -179,7 +181,7 @@ $ .venv/bin/python -m unittest discover -s tests -v
 ...
 test_frame_is_right_handed_orthonormal_across_the_grid (test_tool_model.TestToolFrame...) ... ok
 ----------------------------------------------------------------------
-Ran 99 tests in 1420.824s
+Ran 101 tests in 1400.340s
 
 OK (skipped=5)
 ```

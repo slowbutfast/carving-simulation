@@ -532,12 +532,40 @@ class TestSyntheticToolpaths(unittest.TestCase):
 
     def test_rapids_retract_outside_stock_and_tool_extent(self):
         clearance = self.config["stock"]["retract_clearance_mm"]
+        height = self.config["stock"]["H_stock_mm"]
         rapids = [f for f in self.result.frames if f["is_rapid"]]
         self.assertGreater(len(rapids), 0)
         for f in rapids:
             extent = tool_model.radial_support_extent(float(f["phi"]), self.config)
             limit = self.config["stock"]["R_stock_mm"] + clearance + extent
-            self.assertGreaterEqual(abs(f["r_s"]), limit - 1e-6)
+            # Above the stock plane a rapid is clear regardless of radius;
+            # cross-axis repositions use that safe plane.
+            clear = (
+                abs(f["r_s"]) >= limit - 1e-6
+                or f["z_s"] >= height + clearance - 1e-6
+            )
+            self.assertTrue(
+                clear,
+                f"rapid at r_s={f['r_s']:.3f}, z_s={f['z_s']:.3f} is not clear",
+            )
+
+    def test_no_cross_axis_move_below_the_stock_plane(self):
+        # Switching the signed-r branch must happen above H_stock, never at a
+        # cutting level; otherwise the blade sweeps through the head.
+        height = float(self.config["stock"]["H_stock_mm"])
+        stages = ("roughing", "finishing", "roughing_link", "finishing_link")
+        for prev, cur in zip(self.result.frames, self.result.frames[1:]):
+            if cur["is_rapid"] or cur["stage"] not in stages:
+                continue
+            if float(prev["r_s"]) * float(cur["r_s"]) < -1e-9:
+                self.assertGreaterEqual(
+                    min(float(prev["z_s"]), float(cur["z_s"])),
+                    height - 1e-6,
+                    (
+                        f"non-rapid {cur['stage']} crosses r_s=0 at "
+                        f"z={min(prev['z_s'], cur['z_s']):.2f} < {height}"
+                    ),
+                )
 
     def test_finishing_uses_phi_and_reports_unreachable_undercuts(self):
         finishing = [f for f in self.result.frames if f["stage"] == "finishing" and not f["is_rapid"]]
@@ -766,36 +794,47 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
             f for f in result.frames if f["stage"] == "finishing" and not f["is_rapid"]
         ]
         self.assertGreater(len(finishing), 40)
-        tool = self.config["tool"]
         allowance = float(self.config["stock"]["finish_allowance_mm"])
-        length = float(tool.get("heated_length_mm", tool["blade_length_mm"]))
         checked = 0
-        gouging = 0
         for frame in finishing[:: max(1, len(finishing) // 40)]:
             pose = tool_model.tool_pose(
                 frame["tip_xyz_wax"], frame["theta"], frame["phi"], self.config
             )
-            samples = np.vstack(
-                [
-                    tool_model.heated_corners(pose, self.config),
-                    pose.tip_xyz,
-                    pose.tip_xyz - pose.u * (0.5 * length),
-                ]
-            )
+            samples = toolpath_sim._heated_gouge_samples(pose, self.config)
             signed = np.asarray(self.needle.nearest.signed_distance(samples))
             # signed_distance is POSITIVE inside. A tangent blade touches the
             # surface: at least one sample sits near the surface. Deeper burial
             # elsewhere is the existing finishing-strategy limitation the spec
-            # reports as GOUGE (the strategy redesign is a follow-up change),
-            # so require the diagnostic rather than silently accepting it.
+            # reports as GOUGE (the strategy redesign is a follow-up change).
             self.assertLessEqual(float(np.min(np.abs(signed))), 0.75)
-            if float(np.max(signed)) > allowance + 1e-6:
-                gouging += 1
             checked += 1
         self.assertGreater(checked, 10)
-        if gouging:
-            codes = {d.code for d in result.diagnostics}
-            self.assertIn("GOUGE", codes)
+
+        # The reported depth must cover the same sampled poses the generator
+        # checks. Measure a subset of that selection (a subset cannot exceed
+        # the reported maximum).
+        stages = [frame["stage"] for frame in result.frames]
+        sample = toolpath_sim.gouge_sample_poses(result.frames, stages)
+        self.assertGreater(len(sample), 0)
+        measured = 0.0
+        for entry in sample[:: max(1, len(sample) // 40)]:
+            pose = toolpath_sim._pose_for_axis(
+                entry["tip_xyz_wax"], entry["tool_axis_wax"], entry["theta"], self.config
+            )
+            signed = np.asarray(
+                self.needle.nearest.signed_distance(
+                    toolpath_sim._heated_gouge_samples(pose, self.config)
+                )
+            )
+            measured = max(measured, float(np.max(signed)))
+        if measured > allowance + 1e-6:
+            gouges = [d for d in result.diagnostics if d.code == "GOUGE"]
+            self.assertTrue(gouges, "deep burial must be reported as GOUGE")
+            self.assertGreaterEqual(
+                max(float(d.value) for d in gouges),
+                measured - 1e-6,
+                "reported GOUGE depth must not understate the measured burial",
+            )
 
     # (b) reachability condition -------------------------------------------
 

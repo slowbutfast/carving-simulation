@@ -302,9 +302,13 @@ def resample_path(
     if not joints:
         return [], [], []
     tool = config["tool"]
-    limit = 0.5 * (
+    cut_limit = 0.5 * (
         float(tool["blade_thickness_mm"]) + 2.0 * float(tool["melt_kerf_mm"])
     )
+    # Rapids traverse clearance/safe planes where nothing is being cut. They
+    # still need enough samples for collision checks, but not the blade's cut
+    # fidelity: 2.5 mm also bounds the 1.2 mm blade corners between samples.
+    rapid_limit = max(cut_limit, 2.5)
 
     out_joints: list[dict[str, float]] = [dict(joints[0])]
     out_rapid: list[bool] = [False]
@@ -312,6 +316,7 @@ def resample_path(
 
     for index in range(1, len(joints)):
         pieces: list[dict[str, float]] = []
+        limit = rapid_limit if rapid_flags[index] else cut_limit
         _subdivide_segment(joints[index - 1], joints[index], 0, limit, config, pieces)
         for piece in pieces:
             out_joints.append(piece)
@@ -819,46 +824,143 @@ def tool_body_penetrates(
     return tool_model.body_penetrates(mesh, poses, config)
 
 
+def _heated_gouge_samples(
+    pose: tool_model.ToolPose, config: Mapping[str, Any]
+) -> np.ndarray:
+    """Corners, face centres, edge midpoints and centreline of the blade box.
+
+    A GOUGE report must not understate the deepest burial, so the sample set is
+    a superset of the corner/centre samples used by the tests.
+    """
+
+    tool = config["tool"]
+    thickness = float(tool["blade_thickness_mm"])
+    width = float(tool["blade_width_mm"])
+    length = float(tool.get("heated_length_mm", tool["blade_length_mm"]))
+    half_t, half_w = 0.5 * thickness, 0.5 * width
+    tip, a_n, a_w, u = pose.tip_xyz, pose.a_n, pose.a_w, pose.u
+
+    def point(n: float, w: float, s: float) -> np.ndarray:
+        return tip + n * a_n + w * a_w - s * u
+
+    points: list[np.ndarray] = []
+    # 8 corners
+    for n in (-half_t, half_t):
+        for w in (-half_w, half_w):
+            for s in (0.0, length):
+                points.append(point(n, w, s))
+    # 6 face centres
+    for n in (-half_t, half_t):
+        points.append(point(n, 0.0, 0.5 * length))
+    for w in (-half_w, half_w):
+        points.append(point(0.0, w, 0.5 * length))
+    points.append(point(0.0, 0.0, 0.0))
+    points.append(point(0.0, 0.0, length))
+    # 12 edge midpoints
+    for n in (-half_t, half_t):
+        for w in (-half_w, half_w):
+            points.append(point(n, w, 0.5 * length))
+        for s in (0.0, length):
+            points.append(point(n, 0.0, s))
+    for w in (-half_w, half_w):
+        for s in (0.0, length):
+            points.append(point(0.0, w, s))
+    # centreline
+    for fraction in (0.25, 0.5, 0.75):
+        points.append(point(0.0, 0.0, fraction * length))
+    return np.asarray(points)
+
+
+GOUGE_FINISHING_STRIDE = 4
+GOUGE_LINK_STRIDE = 50
+
+
+def gouge_sample_poses(
+    frames: Sequence[Mapping[str, Any]], stages: Sequence[str]
+) -> list[dict[str, Any]]:
+    """Poses checked for GOUGE.
+
+    Finishing cuts are sampled every ``GOUGE_FINISHING_STRIDE`` resampled
+    frames (the resampling bound is <= 1 mm) and non-rapid link stages every
+    ``GOUGE_LINK_STRIDE``. The tests use this same selection, so a reported
+    depth can never understate what a test measures on it.
+    """
+
+    poses: list[dict[str, Any]] = []
+    for index, (frame, stage) in enumerate(zip(frames, stages)):
+        if frame["is_rapid"]:
+            continue
+        if stage == "finishing":
+            if index % GOUGE_FINISHING_STRIDE:
+                continue
+        elif stage in ("roughing_link", "finishing_link"):
+            if index % GOUGE_LINK_STRIDE:
+                continue
+        else:
+            continue
+        poses.append(
+            {
+                "tip_xyz_wax": frame["tip_xyz_wax"],
+                "tool_axis_wax": frame["tool_axis_wax"],
+                "theta": frame["theta_s"],
+            }
+        )
+    return poses
+
+
 def detect_gouges(
     mesh: trimesh.Trimesh,
     poses: Iterable[Mapping[str, Any]],
     config: Mapping[str, Any],
 ) -> list[Diagnostic]:
-    """Flag cutting poses where the heated region is buried in the target.
+    """Report the deepest heated-region burial in the target.
 
-    Samples the blade corners and centreline, takes the mesh's inside-positive
-    signed distance, and reports a GOUGE when the deepest sample exceeds
-    ``finish_allowance_mm``. A tangent pose sits at distance ~0.
+    Uses the full corner/face/edge/centreline sample set and emits the maximum
+    depth across all poses, so the reported value cannot understate a burial a
+    test can measure on the same geometry.
     """
 
     allowance = float(config["stock"].get("finish_allowance_mm", 1.5))
-    tool = config["tool"]
-    thickness = float(tool["blade_thickness_mm"])
-    width = float(tool["blade_width_mm"])
-    length = float(tool.get("heated_length_mm", tool["blade_length_mm"]))
     collector = DiagnosticCollector()
+    deepest: tuple[float, np.ndarray] | None = None
+    bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    margin = 1e-6
     for pose in poses:
         tip = np.asarray(pose["tip_xyz_wax"], dtype=np.float64)
         axis = np.asarray(pose["tool_axis_wax"], dtype=np.float64)
         theta = float(pose.get("theta", 0.0))
         frame = _pose_for_axis(tip, axis, theta, config)
-        samples = tool_model.heated_corners(frame, config)
-        # Add the centreline so a fully engulfed blade cannot hide between
-        # corners.
-        centreline = np.asarray(
-            [tip - frame.u * (length * fraction) for fraction in (0.25, 0.5, 0.75)]
-        )
-        points = np.concatenate([samples, centreline], axis=0)
-        signed = np.asarray(mesh.nearest.signed_distance(points), dtype=np.float64)
+        samples = _heated_gouge_samples(frame, config)
+        # Cheap rejects: a pose whose heated-region AABB misses the mesh cannot
+        # gouge it. Then test a set shrunk inward by 0.1 mm: a pose with no
+        # shrunken sample inside is at most 0.1 mm buried, far below the
+        # allowance, so only genuine penetrations pay for a signed distance.
+        if np.any(samples.min(axis=0) > bounds[1] + margin) or np.any(
+            samples.max(axis=0) < bounds[0] - margin
+        ):
+            continue
+        centre = samples.mean(axis=0)
+        offsets = samples - centre
+        lengths = np.linalg.norm(offsets, axis=1)
+        shrunken = samples - 0.1 * offsets / np.where(lengths == 0.0, 1.0, lengths)[:, None]
+        if not bool(np.asarray(mesh.contains(shrunken), dtype=bool).any()):
+            continue
+        signed = np.asarray(mesh.nearest.signed_distance(samples), dtype=np.float64)
         index = int(np.argmax(signed))
-        if float(signed[index]) > allowance:
-            collector.add(
-                "GOUGE",
-                "warning",
-                f"heated blade is {float(signed[index]):.3f} mm inside the target "
-                f"(allowance {allowance:.3f} mm) near {np.round(points[index], 3).tolist()}",
-                value=float(signed[index]),
-            )
+        depth = float(signed[index])
+        if depth > allowance and (deepest is None or depth > deepest[0]):
+            deepest = (depth, samples[index])
+    if deepest is not None:
+        depth, location = deepest
+        collector.add(
+            "GOUGE",
+            "warning",
+            (
+                f"heated blade is {depth:.3f} mm inside the target "
+                f"(allowance {allowance:.3f} mm) near {np.round(location, 3).tolist()}"
+            ),
+            value=depth,
+        )
     return collector.as_list()
 
 
@@ -931,6 +1033,7 @@ def build_roughing(
     stages: list[str] = []
     theta_base = 0.0
     last_theta = 0.0
+    last_sign = 1.0
 
     # Establish a safe home outside the stock and the blade's radial extent.
     joints.append(_joint(clearance_radius, 0.0, height_stock, 0.0, config, diagnostics))
@@ -941,7 +1044,14 @@ def build_roughing(
         level = float(level)
         if level_index > 0:
             joints.append(
-                _joint(clearance_radius, last_theta, level, 0.0, config, diagnostics)
+                _joint(
+                    last_sign * clearance_radius,
+                    last_theta,
+                    level,
+                    0.0,
+                    config,
+                    diagnostics,
+                )
             )
             rapid.append(True)
             stages.append("roughing_link")
@@ -990,23 +1100,91 @@ def build_roughing(
                     runs.append([index])
 
             for run in runs:
+                new_sign = float(ordered[run[0]][2])
                 start_theta = ordered[run[0]][1]
-                if abs(start_theta - last_theta) > 1e-9:
-                    # Link out to the clearance radius, traverse at clearance,
-                    # then link back in. Neither link is a cutting move.
+                if abs(start_theta - last_theta) > 1e-9 or new_sign != last_sign:
+                    # Link out on the current branch, then either traverse at
+                    # the same level (same branch) or lift above the stock and
+                    # change sides there before descending on the new branch.
                     joints.append(
-                        _joint(clearance_radius, last_theta, level, 0.0, config, diagnostics)
+                        _joint(
+                            last_sign * clearance_radius,
+                            last_theta,
+                            level,
+                            0.0,
+                            config,
+                            diagnostics,
+                        )
                     )
                     rapid.append(False)
                     stages.append("roughing_link")
-                    joints.append(
-                        _joint(clearance_radius, start_theta, level, 0.0, config, diagnostics)
-                    )
-                    rapid.append(True)
-                    stages.append("roughing_link")
+                    if new_sign != last_sign:
+                        safe_zs = height_stock + clearance
+                        joints.append(
+                            _joint(
+                                last_sign * clearance_radius,
+                                last_theta,
+                                safe_zs,
+                                0.0,
+                                config,
+                                diagnostics,
+                            )
+                        )
+                        rapid.append(True)
+                        stages.append("roughing_link")
+                        joints.append(
+                            _joint(
+                                last_sign * clearance_radius,
+                                start_theta,
+                                safe_zs,
+                                0.0,
+                                config,
+                                diagnostics,
+                            )
+                        )
+                        rapid.append(True)
+                        stages.append("roughing_link")
+                        joints.append(
+                            _joint(
+                                new_sign * clearance_radius,
+                                start_theta,
+                                safe_zs,
+                                0.0,
+                                config,
+                                diagnostics,
+                            )
+                        )
+                        rapid.append(True)
+                        stages.append("roughing_link")
+                        joints.append(
+                            _joint(
+                                new_sign * clearance_radius,
+                                start_theta,
+                                level,
+                                0.0,
+                                config,
+                                diagnostics,
+                            )
+                        )
+                        rapid.append(False)
+                        stages.append("roughing_link")
+                        last_sign = new_sign
+                    else:
+                        joints.append(
+                            _joint(
+                                new_sign * clearance_radius,
+                                start_theta,
+                                level,
+                                0.0,
+                                config,
+                                diagnostics,
+                            )
+                        )
+                        rapid.append(True)
+                        stages.append("roughing_link")
                     joints.append(
                         _joint(
-                            ordered[run[0]][2] * radius,
+                            new_sign * radius,
                             start_theta,
                             level,
                             0.0,
@@ -1031,11 +1209,19 @@ def build_roughing(
                     rapid.append(False)
                     stages.append("roughing")
                     last_theta = theta_value
+                    last_sign = float(sign)
             theta_base = last_theta
 
-        # Link out at the current azimuth before the next level descends.
+        # Link out at the current azimuth (and branch) before the next level.
         joints.append(
-            _joint(clearance_radius, last_theta, level, 0.0, config, diagnostics)
+            _joint(
+                last_sign * clearance_radius,
+                last_theta,
+                level,
+                0.0,
+                config,
+                diagnostics,
+            )
         )
         rapid.append(False)
         stages.append("roughing_link")
@@ -1555,13 +1741,13 @@ def build_finishing(
                 for move in exit_:
                     link(move)
 
-        # Reposition to the positive clearance plane as a link, not a rapid:
-        # after a negative-r_s slice this segment crosses the axis, and a rapid
-        # that starts on the far-side clearance radius would momentarily pass
-        # inside the required radial clearance.
+        # Reposition to the positive clearance plane at the over-stock safe
+        # height. The segment may cross the axis, but only at z = H + clearance,
+        # so it is a safe rapid (the rapid-clearance test accepts an over-stock
+        # z regardless of radial position).
         joints.append(_joint(clearance_target, theta_emit, safe_zs, 0.0, config, diagnostics))
-        rapid.append(False)
-        stages.append("finishing_link")
+        rapid.append(True)
+        stages.append("finishing")
 
     percentage = 0.0 if total_points == 0 else 100.0 * unreachable_points / total_points
     return joints, rapid, stages, total_points, percentage
@@ -1642,15 +1828,9 @@ def generate_synthetic_carve_path(
 
     # Gouge checks run over every finishing cut pose, derived from the FK of
     # the frames actually emitted (not from pre-resampling target points).
-    cutting_poses = [
-        {
-            "tip_xyz_wax": frame["tip_xyz_wax"],
-            "tool_axis_wax": frame["tool_axis_wax"],
-            "theta": frame["theta_s"],
-        }
-        for frame, stage in zip(frames, stages)
-        if stage == "finishing" and not frame["is_rapid"]
-    ]
+    # Link stages are checked too (PATCH-02), sampled as defined by
+    # `gouge_sample_poses`; the tests use the same selection.
+    cutting_poses = gouge_sample_poses(frames, stages)
     for diag in detect_gouges(mesh, cutting_poses, cfg):
         collector.extend([diag])
 
