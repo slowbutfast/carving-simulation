@@ -17,7 +17,7 @@ export class VolumetricWaxGrid {
     rigRoot.add(this.group);
 
     this.material = new THREE.MeshStandardMaterial({
-      color: 0xe8d595,
+      color: 0xb91c1c,
       roughness: 0.58,
       metalness: 0.04,
       flatShading: false,

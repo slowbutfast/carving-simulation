@@ -23,7 +23,7 @@ const ROOT_ROTATION_X = -Math.PI / 2;
 const MODEL_LINKS = ['static', 'orbit', 'z', 'radial', 'tilt', 'unassigned'];
 
 export const SCENE_COLORS = Object.freeze({
-  wax: '#e8d595',
+  wax: '#b91c1c',
   static: '#4b5563',
   orbit: '#64748b',
   z: '#7c8796',
@@ -31,7 +31,9 @@ export const SCENE_COLORS = Object.freeze({
   tilt: '#cbd5e1',
   bladeHeated: '#f97316',
   unassignedGhost: '#a78bfa',
-  error: '#ef4444',
+  //: High-contrast cyan: the tool collision highlight reads at a glance against
+  //: the deep red wax, including for red-green colour-blind viewers.
+  collision: '#22d3ee',
   warning: '#f59e0b',
 });
 
@@ -76,8 +78,8 @@ export function createSceneMaterials() {
       emissiveIntensity: 0.25,
     }),
     fault: standard('fault', {
-      color: new THREE.Color(SCENE_COLORS.error),
-      emissive: new THREE.Color(SCENE_COLORS.error),
+      color: new THREE.Color(SCENE_COLORS.collision),
+      emissive: new THREE.Color(SCENE_COLORS.collision),
       emissiveIntensity: 0.6,
     }),
     warning: standard('warning', {
