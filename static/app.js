@@ -69,6 +69,9 @@ const state = {
   diagnostics: [],
   carvingToEnd: false,
   machineDetail: window.matchMedia('(min-width: 900px)').matches ? 'full' : 'tool',
+  slidersEnabled: true,
+  auditAll: false,
+  collisionLog: { backend: null, worker: [] },
 };
 
 const dom = {};
@@ -80,7 +83,8 @@ for (const id of [
   'tele-phi', 'tele-rs', 'tele-zs', 'tele-vtip', 'tele-stage', 'sculptBtn',
   'preset', 'showGhost', 'showStock', 'headerBadge', 'sculptHint',
   'telemetryGrid', 'machineDetailBtn', 'unassignedNote', 'provenanceStep',
-  'provenanceHome',
+  'provenanceHome', 'sliderNote', 'auditAll', 'copyJson', 'downloadJson',
+  'collisionCount',
 ]) {
   dom[id] = document.getElementById(id);
 }
@@ -346,6 +350,10 @@ function loadSimulation(body) {
   state.diagnostics = body.diagnostics || [];
   state.faultFrame = null;
   state.faultCode = null;
+  state.slidersEnabled = body.sliders_enabled !== false;
+  state.collisionLog = { backend: body.collision_log ?? null, worker: [] };
+  applySlidersEnabled();
+  renderCollisionLog();
 
   if (body.config) {
     rig.configure(body.config);
@@ -374,6 +382,7 @@ function loadSimulation(body) {
   rig.setTargetVisible(dom.showGhost.checked);
 
   wax.setPath(columns, state.frameCount);
+  wax.setAuditAll(state.auditAll);
   wax.seek(0);
 
   dom.scrub.max = '1000';
@@ -544,7 +553,108 @@ function showFault(code, body = null) {
   dom['hud-mode'].textContent = body ? `${code} · ${body}` : code;
 }
 
+function applySlidersEnabled() {
+  const enabled = state.slidersEnabled;
+  for (const id of sliderIds) {
+    const input = document.getElementById(id);
+    const output = document.getElementById(`${id}-value`);
+    const row = input ? input.closest('.slider-row') : null;
+    if (input) {
+      input.disabled = !enabled;
+      input.title = enabled
+        ? ''
+        : 'This target mesh has no landmark sidecar, so facial sliders are ignored.';
+    }
+    if (output) output.classList.toggle('disabled', !enabled);
+    if (row) row.classList.toggle('disabled', !enabled);
+  }
+  if (dom.sliderNote) dom.sliderNote.classList.toggle('hidden', enabled);
+}
+
+// ---------------------------------------------------------------------------
+// Collision log (backend `collision_log` + worker SDF runs)
+// ---------------------------------------------------------------------------
+
+/** Worker run -> the log shape the backend uses, plus the frame's joints. */
+function enrichCollisionRun(message) {
+  const range = message.frame_range || [message.index ?? 0, message.index ?? 0];
+  const frame = frameAt(message.worst_frame ?? range[0]);
+  return {
+    code: message.code,
+    body: message.body ?? null,
+    frame_range: [range[0], range[1]],
+    worst_frame: message.worst_frame ?? range[0],
+    worst_sdf_mm: typeof message.sdf === 'number' ? message.sdf : null,
+    post_fault: Boolean(message.post_fault),
+    pose: message.pose ?? null,
+    r: frame ? frame.r : null,
+    theta_deg: frame ? frame.theta_s * RAD_TO_DEG : null,
+    h: frame ? frame.h : null,
+    phi_deg: frame ? frame.phi * RAD_TO_DEG : null,
+    stage: frame ? (frame.is_rapid ? 'rapid' : 'cut') : null,
+    is_rapid: frame ? frame.is_rapid : null,
+  };
+}
+
+function renderCollisionLog() {
+  if (!dom.collisionCount) return;
+  const runs = state.collisionLog.worker.length;
+  const backend = state.collisionLog.backend?.events?.length ?? 0;
+  dom.collisionCount.textContent =
+    `${runs} worker run${runs === 1 ? '' : 's'} · ${backend} backend event${
+      backend === 1 ? '' : 's'
+    }`;
+}
+
+function collisionReport() {
+  return {
+    service: state.data?.service ?? null,
+    preset: state.data?.preset ?? null,
+    frames: state.frameCount,
+    sliders_enabled: state.slidersEnabled,
+    audit_all: state.auditAll,
+    backend: state.collisionLog.backend,
+    worker: { audit_all: state.auditAll, runs: state.collisionLog.worker },
+  };
+}
+
+async function copyCollisionJson() {
+  const text = JSON.stringify(collisionReport(), null, 2);
+  try {
+    await navigator.clipboard.writeText(text);
+    dom.copyJson.textContent = 'Copied';
+    window.setTimeout(() => {
+      dom.copyJson.textContent = 'Copy JSON';
+    }, 1200);
+  } catch (error) {
+    appendDiagnostic({
+      code: 'CLIPBOARD_UNAVAILABLE',
+      severity: 'warning',
+      message: `Could not copy the collision log: ${error.message || error}`,
+      count: 1,
+    });
+  }
+}
+
+function downloadCollisionJson() {
+  const blob = new Blob([JSON.stringify(collisionReport(), null, 2)], {
+    type: 'application/json',
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `collision_report_frame_${state.index}.json`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
 function handleCollision(message) {
+  if (state.auditAll) {
+    // Audit mode never halts: the run list is the artefact, not a fault badge.
+    return;
+  }
   pause();
   state.faultFrame = message.index;
   showFault(message.code, message.body || null);
@@ -562,6 +672,10 @@ function handleCollision(message) {
 function handleWaxStatus(message) {
   if (message.type === 'ready') {
     dom.meshInfo.textContent = `${message.gridN}³ · ${message.voxelSize.toFixed(2)} mm voxel`;
+  }
+  if (message.type === 'collisions') {
+    state.collisionLog.worker = (message.runs || []).map(enrichCollisionRun);
+    renderCollisionLog();
   }
   if (message.type === 'progress' && state.carvingToEnd) {
     state.index = Math.max(state.index, message.index);
@@ -668,6 +782,24 @@ dom.unassignedNote.addEventListener('click', () => {
   rig.setGhostVisible(!rig.ghostsVisible);
   updateUnassignedNote();
 });
+dom.auditAll.addEventListener('change', () => {
+  state.auditAll = dom.auditAll.checked;
+  state.faultCode = null;
+  state.faultFrame = null;
+  dom.faultBadge.classList.add('hidden');
+  if (rig) rig.setFault(null);
+  // The worker re-carves from frame 0: audit mode leaves collisions uncarved, so
+  // the wax state before the toggle cannot be reused.
+  state.collisionLog.worker = [];
+  renderCollisionLog();
+  if (wax) wax.setAuditAll(state.auditAll);
+  state.index = 0;
+  updateRigAt(0);
+  updateTelemetry(true);
+  if (state.frames) setStatus(state.auditAll ? 'AUDITING' : 'READY', state.auditAll ? 'playing' : 'ready');
+});
+dom.copyJson.addEventListener('click', copyCollisionJson);
+dom.downloadJson.addEventListener('click', downloadCollisionJson);
 
 dom.playBtn.disabled = true;
 dom.endBtn.disabled = true;

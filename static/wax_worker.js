@@ -2,54 +2,18 @@
  * Web Worker: off-thread volumetric wax subtraction + dirty-chunk meshing.
  *
  * Protocol
- *   -> { type: 'init', config }
- *   -> { type: 'path', poses: Float32Array(6N), rapid: Uint8Array(N), count }
- *   -> { type: 'seek', index }
+ *   -> { type: 'init', config, gridN, chunkSize }
+ *   -> { type: 'path', poses: Float32Array(7N), rapid: Uint8Array(N), count, stride, auditAll }
+ *   -> { type: 'seek', index, reason }
+ *   -> { type: 'audit', enabled }
  *   -> { type: 'reset' }
- *   <- { type: 'ready' | 'meshes' | 'status' | 'collision' }
+ *   <- { type: 'ready' | 'meshes' | 'status' | 'collision' | 'collisions' }
+ *
+ * The carve itself lives in `carveRange` (`wax_sdf_core.js`) so the headless
+ * `scripts/audit_collisions.mjs` audits exactly the loop the viewer runs.
  */
 
-import { WaxSDFCore, DEFAULT_TOOL } from './wax_sdf_core.js';
-
-/** Map backend blade config (mm) onto the SDF core's tool units. */
-function toolFromConfig(configTool) {
-  const source = configTool || {};
-  const positive = (configKey, fallback) => {
-    const value = Number(source[configKey]);
-    return Number.isFinite(value) && value > 0 ? value : fallback;
-  };
-  const span = (configKey, fallback) => {
-    const value = source[configKey];
-    if (Array.isArray(value) && value.length === 2) {
-      const lo = Number(value[0]);
-      const hi = Number(value[1]);
-      if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) return [lo, hi];
-    }
-    return fallback;
-  };
-  const bladeLength = positive('blade_length_mm', DEFAULT_TOOL.bladeLength);
-  const heated = positive('heated_length_mm', bladeLength);
-  const kerf = Number(source.melt_kerf_mm);
-  const envelope = source.head_envelope || {};
-  const center = Array.isArray(envelope.center_mm) ? envelope.center_mm : null;
-  const half = Array.isArray(envelope.half_extents_mm) ? envelope.half_extents_mm : null;
-  return {
-    bladeThickness: positive('blade_thickness_mm', DEFAULT_TOOL.bladeThickness),
-    bladeWidth: positive('blade_width_mm', DEFAULT_TOOL.bladeWidth),
-    bladeLength,
-    heatedLength: Math.min(heated, bladeLength),
-    meltKerf: Number.isFinite(kerf) && kerf >= 0 ? kerf : DEFAULT_TOOL.meltKerf,
-    shaftRadius: positive('shaft_radius_mm', DEFAULT_TOOL.shaftRadius),
-    shaftSpan: span('shaft_span_mm', DEFAULT_TOOL.shaftSpan),
-    bodyRadius: positive('body_radius_mm', DEFAULT_TOOL.bodyRadius),
-    bodySpan: span('body_span_mm', DEFAULT_TOOL.bodySpan),
-    headClearance: positive('head_clearance_mm', DEFAULT_TOOL.headClearance),
-    headEnvelope:
-      center && half
-        ? { shape: envelope.shape || 'box', center: [...center], halfExtents: [...half] }
-        : DEFAULT_TOOL.headEnvelope,
-  };
-}
+import { WaxSDFCore, DEFAULT_TOOL, carveRange, truncateRuns, toolFromConfig } from './wax_sdf_core.js';
 
 let core = null;
 let workerTool = { ...DEFAULT_TOOL };
@@ -57,10 +21,13 @@ let poses = null;
 let rapid = null;
 let count = 0;
 let poseStride = 6;
+let poseCache = [];
 let current = 0;
 let snapshots = [];
 let snapshotEvery = 1000;
 let faulted = false;
+let auditAll = false;
+let collisionRuns = [];
 const MAX_SNAPSHOTS = 5;
 
 function post(message, transfer = []) {
@@ -80,6 +47,12 @@ function poseAt(index) {
     axis: [axis[0] / length, axis[1] / length, axis[2] / length],
     theta: poseStride >= 7 ? poses[offset + 6] : 0,
   };
+}
+
+/** Materialise the flat pose columns once; `carveRange` reads objects. */
+function buildPoseCache() {
+  poseCache = new Array(count);
+  for (let index = 0; index < count; index += 1) poseCache[index] = poseAt(index);
 }
 
 function meshPayload() {
@@ -116,60 +89,99 @@ function restoreNearest(index) {
   if (!best) return 0;
   core.restore(best.data);
   snapshots = snapshots.filter((snapshot) => snapshot.index <= best.index);
+  // The wax is rewound, so a run that straddles the snapshot did not happen in
+  // full any more; runs past it will be re-carved (and re-logged).
+  collisionRuns = truncateRuns(collisionRuns, best.index);
   current = best.index;
   faulted = false;
   return best.index;
 }
 
+/**
+ * Append a run to the log, joining it to the previous one when the chunked
+ * carve split a single contiguous collision across two `carveRange` calls.
+ */
+function mergeRun(run) {
+  const previous = collisionRuns[collisionRuns.length - 1];
+  if (
+    previous &&
+    previous.code === run.code &&
+    previous.body === run.body &&
+    previous.post_fault === run.post_fault &&
+    previous.frame_range[1] === run.frame_range[0] - 1
+  ) {
+    previous.frame_range = [previous.frame_range[0], run.frame_range[1]];
+    previous.frames += run.frames;
+    if (run.worst_sdf_mm < previous.worst_sdf_mm) {
+      previous.worst_sdf_mm = run.worst_sdf_mm;
+      previous.worst_frame = run.worst_frame;
+      previous.pose = run.pose;
+    }
+    return previous;
+  }
+  collisionRuns.push(run);
+  return run;
+}
+
+/** A snapshot, not the live array: later merges must not rewrite old messages. */
+function runsSnapshot() {
+  return collisionRuns.map((run) => ({ ...run }));
+}
+
+function postCollisions() {
+  if (!auditAll) return;
+  post({ type: 'collisions', runs: runsSnapshot(), auditAll: true });
+}
+
 function carveForward(target) {
   const limit = Math.min(target, count - 1);
-  const threshold = -0.5 * core.voxelSize;
-  for (let index = current + 1; index <= limit; index++) {
-    const pose = poseAt(index);
-    const previous = poseAt(index - 1);
-    if (rapid && rapid[index]) {
-      const result = core.checkRapid(previous, pose, workerTool);
-      if (result.collision) {
-        core.lastCollision = result;
-        post({
-          type: 'collision',
-          code: 'RAPID_COLLISION',
-          index,
-          body: result.body,
-          sdf: result.sdf,
-        });
-        faulted = true;
-        current = index;
-        return index;
-      }
-    } else {
-      // The unheated shaft, cartridge body and tilt-head envelope are checked
-      // on every cutting frame: a vertical plunge can bury them in uncarved
-      // stock just as a tilted pass can.
-      const shank = core.checkShank(pose, workerTool);
-      if (shank.collision) {
-        post({
-          type: 'collision',
-          code: 'SHANK_COLLISION',
-          index,
-          body: shank.body,
-          sdf: shank.sdf,
-        });
-        faulted = true;
-        current = index;
-        return index;
-      }
-      core.subtractTool(pose, workerTool, { includeShank: false });
-      if (index % snapshotEvery === 0) snapshotAt(index);
+  while (current < limit) {
+    // Hand `carveRange` at most one snapshot interval so the snapshot cadence
+    // and the progress meshes stay where the viewer expects them.  The boundary
+    // calculation keeps those intervals aligned with `index % snapshotEvery`.
+    let step = Math.min(limit, current + snapshotEvery);
+    const boundary = Math.floor(current / snapshotEvery + 1) * snapshotEvery;
+    if (boundary > current && boundary < step) step = boundary;
+
+    const result = carveRange(core, poseCache, rapid, workerTool, {
+      from: current,
+      to: step,
+      auditAll,
+    });
+
+    for (const run of result.runs) {
+      const stored = mergeRun(run);
+      post({
+        type: 'collision',
+        code: stored.code,
+        index: stored.worst_frame,
+        body: stored.body,
+        sdf: stored.worst_sdf_mm,
+        pose: stored.pose,
+        frame_range: stored.frame_range,
+        post_fault: stored.post_fault,
+      });
     }
-    current = index;
-    if (index % 5000 === 0) {
+
+    current = result.current;
+    faulted = faulted || result.faulted;
+    if (current === step && step > 0 && step % snapshotEvery === 0) snapshotAt(step);
+    if (current === step && step > 0 && step % 5000 === 0) {
       const { meshes, transfer } = meshPayload();
       post(
-        { type: 'meshes', index, frames: count, meshes, reason: 'progress', faulted },
+        {
+          type: 'meshes',
+          index: step,
+          frames: count,
+          meshes,
+          reason: 'progress',
+          faulted: faulted && !auditAll,
+          auditAll,
+        },
         transfer
       );
     }
+    if (!auditAll && result.faulted) break;
   }
   return current;
 }
@@ -183,10 +195,25 @@ function flush(index, reason = 'seek') {
       frames: count,
       meshes,
       reason,
-      faulted,
+      faulted: faulted && !auditAll,
+      auditAll,
+      runs: auditAll ? runsSnapshot() : [],
     },
     transfer
   );
+}
+
+/** Back to an uncarved stock at frame 0 (path reset, reset, audit toggle). */
+function resetCarve() {
+  if (core) {
+    core._initialize();
+    core.modified = false;
+  }
+  current = 0;
+  snapshots = [];
+  collisionRuns = [];
+  faulted = false;
+  if (count > 0) snapshotAt(0);
 }
 
 self.onmessage = (event) => {
@@ -209,6 +236,7 @@ self.onmessage = (event) => {
         tool: workerTool,
         meshes,
         gridN: core.N,
+        auditAll,
       },
       transfer
     );
@@ -220,44 +248,69 @@ self.onmessage = (event) => {
     rapid = data.rapid;
     count = data.count;
     poseStride = Number(data.stride) === 7 ? 7 : 6;
-    current = 0;
-    snapshots = [];
-    faulted = false;
+    if (typeof data.auditAll === 'boolean') auditAll = data.auditAll;
+    buildPoseCache();
     snapshotEvery = Math.max(500, Math.ceil(count / 12));
+    resetCarve();
     if (core) {
-      core._initialize();
-      core.modified = false;
-      snapshotAt(0);
       const { meshes, transfer } = meshPayload();
-      post({ type: 'status', index: 0, frames: count, voxelSize: core.voxelSize });
-      post({ type: 'meshes', index: 0, frames: count, meshes, reason: 'reset' }, transfer);
+      post({ type: 'status', index: 0, frames: count, voxelSize: core.voxelSize, auditAll });
+      post(
+        {
+          type: 'meshes',
+          index: 0,
+          frames: count,
+          meshes,
+          reason: 'reset',
+          faulted: faulted && !auditAll,
+          auditAll,
+          runs: [],
+        },
+        transfer
+      );
     }
     return;
   }
 
   if (!core || !poses) return;
 
+  if (data.type === 'audit') {
+    const enabled = Boolean(data.enabled);
+    if (enabled === auditAll) {
+      postCollisions();
+      return;
+    }
+    auditAll = enabled;
+    // Toggling mid-playback changes what was carved (audit mode keeps going
+    // through collisions), so the only honest state is an uncarved frame 0.
+    resetCarve();
+    flush(0, 'reset');
+    postCollisions();
+    post({ type: 'status', index: 0, frames: count, voxelSize: core.voxelSize, auditAll });
+    return;
+  }
+
   if (data.type === 'seek') {
     const target = Math.max(0, Math.min(count - 1, Math.floor(data.index)));
     if (target < current) {
       restoreNearest(target);
+      // Expose the truncated run list at once: everything past the snapshot did
+      // not happen any more, so the viewer must stop showing it.
+      postCollisions();
     }
-    if (!faulted) {
+    if (!faulted || auditAll) {
       const carved = carveForward(target);
       flush(carved, data.reason || 'seek');
-      post({ type: 'status', index: carved, frames: count });
+      post({ type: 'status', index: carved, frames: count, auditAll });
+      postCollisions();
     }
     return;
   }
 
   if (data.type === 'reset') {
-    core._initialize();
-    core.modified = false;
-    current = 0;
-    snapshots = [];
-    faulted = false;
-    if (count > 0) snapshotAt(0);
+    resetCarve();
     flush(0, 'reset');
+    postCollisions();
     return;
   }
 };

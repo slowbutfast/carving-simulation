@@ -134,6 +134,11 @@
     .btn.primary:hover { background: var(--primary-hover); }
     .btn:disabled { opacity: 0.45; cursor: not-allowed; }
     .btn-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
+    .btn-row.two { grid-template-columns: 1fr 1fr; }
+    .slider-row.disabled { opacity: 0.45; }
+    .slider-row.disabled input[type="range"] { cursor: not-allowed; }
+    .slider-row output.disabled { color: var(--muted); }
+    .hint.hidden { display: none; }
 
     .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); }
     .switch { position: relative; width: 34px; height: 20px; flex: 0 0 auto; }
@@ -288,6 +293,7 @@
               <option value="standard">Standard (dense)</option>
             </select>
           </div>
+          <div class="hint hidden" id="sliderNote">This target mesh has no landmark sidecar; facial sliders are ignored.</div>
           <div class="btn-row">
             <button class="btn primary" id="sculptBtn" type="button">Sculpt &amp; Simulate</button>
           </div>
@@ -326,6 +332,15 @@
       <section class="panel">
         <div class="panel-head">Diagnostics <span class="hint" id="diagCount">0</span></div>
         <div class="panel-body">
+          <div class="toggle-row">
+            <span>Audit all collisions</span>
+            <label class="switch"><input id="auditAll" type="checkbox" /><span></span></label>
+          </div>
+          <div class="btn-row two">
+            <button class="btn" id="copyJson" type="button">Copy JSON</button>
+            <button class="btn" id="downloadJson" type="button">Download JSON</button>
+          </div>
+          <div class="hint" id="collisionCount">0 worker runs · 0 backend events</div>
           <div class="diagnostics" id="diagnostics">
             <div class="diag info"><code>READY</code> Load the demo to generate a toolpath.</div>
           </div>
