@@ -71,6 +71,222 @@ class ToolpathResult:
     finishing_frames: int = 0
     unreachable_percent: float = 0.0
     rapid_frames: int = 0
+    collision_events: list[dict[str, Any]] = field(default_factory=list)
+    #: The whole :class:`CollisionEventLog` payload (``codes``/``events``).
+    collision_log: dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Structured collision event log
+# ---------------------------------------------------------------------------
+
+#: Default cap on the runs kept per collision code (runs, not frames).
+MAX_EVENTS_PER_CODE = 200
+
+#: Sampling strides of the GOUGE pose set, in frames.
+GOUGE_FINISHING_STRIDE = 4
+GOUGE_LINK_STRIDE = 50
+GOUGE_STRIDE_BY_STAGE = {
+    "finishing": GOUGE_FINISHING_STRIDE,
+    "roughing_link": GOUGE_LINK_STRIDE,
+    "finishing_link": GOUGE_LINK_STRIDE,
+}
+
+
+@dataclass(frozen=True)
+class GougeReport:
+    """Run-grouped GOUGE events plus the single worst-depth diagnostic."""
+
+    diagnostics: list[Diagnostic] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
+
+
+class CollisionEventLog:
+    """Structured collision runs, capped per code by the deepest/worst runs.
+
+    ``DiagnosticCollector`` in ``kinematics.py`` deliberately stays as it is: it
+    deduplicates by ``code:axis`` and keeps a count, which is exactly what the
+    summary panel needs but throws away the frame ranges and joint geometry a
+    toolpath debugger needs.  This log keeps one entry per *run* instead, and
+    when a code overflows ``max_events_per_code`` it drops the shallowest runs
+    so the surviving sample is the worst of the path.
+    """
+
+    def __init__(self, max_events_per_code: int = MAX_EVENTS_PER_CODE) -> None:
+        self.max_events_per_code = max(1, int(max_events_per_code))
+        self._runs: dict[str, list[tuple[float, int, dict[str, Any]]]] = {}
+        self._order = 0
+
+    def add_run(
+        self, code: str, event: dict[str, Any], *, weight: float
+    ) -> dict[str, Any]:
+        """Record one run; ``weight`` decides what survives an overflow."""
+
+        bucket = self._runs.setdefault(code, [])
+        bucket.append((float(weight), self._order, event))
+        self._order += 1
+        return event
+
+    def as_dict(self) -> dict[str, Any]:
+        events: list[dict[str, Any]] = []
+        codes: dict[str, dict[str, Any]] = {}
+        for code, bucket in self._runs.items():
+            ranked = sorted(bucket, key=lambda item: (-item[0], item[1]))
+            kept = sorted(
+                ranked[: self.max_events_per_code], key=lambda item: item[1]
+            )
+            codes[code] = {
+                "runs": len(kept),
+                "truncated": len(kept) < len(ranked),
+                "dropped": len(ranked) - len(kept),
+            }
+            events.extend(item[2] for item in kept)
+        events.sort(
+            key=lambda event: (
+                (event.get("frame_range") or [0, 0])[0],
+                str(event.get("code")),
+            )
+        )
+        return {
+            "max_events_per_code": self.max_events_per_code,
+            "codes": codes,
+            "events": events,
+        }
+
+
+def _joints_of(frame: Mapping[str, Any]) -> dict[str, float]:
+    """Machine joints of a frame, in the units a debugger reads them in."""
+
+    return {
+        "r_mm": round(float(frame["r"]), 4),
+        "theta_deg": round(math.degrees(float(frame["theta"])), 4),
+        "h_mm": round(float(frame["h"]), 4),
+        "phi_deg": round(math.degrees(float(frame["phi"])), 4),
+    }
+
+
+def _pose_of(frame: Mapping[str, Any]) -> dict[str, list[float]]:
+    """Wax-frame tool pose of a frame."""
+
+    return {
+        "tip_xyz_wax": [round(float(v), 5) for v in frame["tip_xyz_wax"]],
+        "tool_axis_wax": [round(float(v), 6) for v in frame["tool_axis_wax"]],
+    }
+
+
+def _max_events_per_code(config: Mapping[str, Any]) -> int:
+    """``logging.max_events_per_code`` from the configuration, with a default."""
+
+    logging_cfg = config.get("logging") or {}
+    try:
+        return int(logging_cfg.get("max_events_per_code", MAX_EVENTS_PER_CODE))
+    except (TypeError, ValueError):
+        return MAX_EVENTS_PER_CODE
+
+
+def _collision_log_header(
+    log: CollisionEventLog, preset: str, frames: int
+) -> dict[str, Any]:
+    """The toolpath's collision log payload (the HTTP envelope is the server's)."""
+
+    payload = log.as_dict()
+    payload.update({"preset": preset, "frames": int(frames)})
+    return payload
+
+
+def _unreachable_event(
+    samples: Sequence[Mapping[str, float]],
+    config: Mapping[str, Any],
+    percent: float,
+) -> dict[str, Any]:
+    """Summary of the surface points no wrist pitch can reach."""
+
+    def span(key: str) -> list[float] | None:
+        if not samples:
+            return None
+        values = [float(sample[key]) for sample in samples]
+        return [round(min(values), 4), round(max(values), 4)]
+
+    limits = config["limits"]["phi_limits_deg"]
+    return {
+        "code": "UNREACHABLE_UNDERCUT_AREA",
+        "frame_range": None,
+        "count": len(samples),
+        "percent": round(float(percent), 4),
+        "z_range_mm": span("z_mm"),
+        "theta_deg_range": span("theta_deg"),
+        "required_phi_deg_range": span("required_phi_deg"),
+        "phi_limits_deg": [float(limits[0]), float(limits[1])],
+    }
+
+
+def _degrees_wrapped(radians: np.ndarray) -> np.ndarray:
+    """Radians -> degrees wrapped into ``[-180, 180)`` like ``validate_joints``."""
+
+    degrees = np.degrees(radians)
+    return np.mod(degrees + 180.0, 360.0) - 180.0
+
+
+def soft_limit_runs(
+    frames: Sequence[Mapping[str, Any]], config: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """``SOFT_LIMIT_EXCEEDED`` runs, from one vectorised pass over all frames.
+
+    ``kinematics.build_trajectory`` only validates the joints it builds, and
+    ``DiagnosticCollector`` collapses repeats into one ``code:axis`` entry.  This
+    post-pass re-checks every emitted frame against the same limits with numpy
+    masks and groups contiguous offending frames, so the log carries the exact
+    frame ranges for an agent to replay.
+    """
+
+    count = len(frames)
+    if count == 0:
+        return []
+    values = {
+        "r": np.fromiter((float(f["r"]) for f in frames), np.float64, count),
+        "h": np.fromiter((float(f["h"]) for f in frames), np.float64, count),
+        "phi": np.degrees(
+            np.fromiter((float(f["phi"]) for f in frames), np.float64, count)
+        ),
+        "theta": _degrees_wrapped(
+            np.fromiter((float(f["theta"]) for f in frames), np.float64, count)
+        ),
+    }
+    limits = config["limits"]
+    checks = (
+        ("r", values["r"], limits["r_limits_mm"]),
+        ("h", values["h"], limits["h_limits_mm"]),
+        ("phi", values["phi"], limits["phi_limits_deg"]),
+        ("theta", values["theta"], limits.get("theta_limits_deg")),
+    )
+    events: list[dict[str, Any]] = []
+    for axis, column, bounds in checks:
+        if bounds is None:
+            continue
+        low, high = (float(v) for v in bounds)
+        exceed = np.maximum(low - column, column - high)
+        mask = exceed > 1e-9
+        if not bool(mask.any()):
+            continue
+        padded = np.concatenate(([False], mask, [False]))
+        edges = np.flatnonzero(padded[1:] != padded[:-1])
+        for start, stop in zip(edges[::2], edges[1::2]):
+            window = exceed[int(start) : int(stop)]
+            worst = int(start) + int(np.argmax(window))
+            frame = frames[worst]
+            event: dict[str, Any] = {
+                "code": "SOFT_LIMIT_EXCEEDED",
+                "axis": axis,
+                "frame_range": [int(start), int(stop) - 1],
+                "value": round(float(window.max()), 4),
+                "limit": [low, high],
+                "joints": _joints_of(frame),
+            }
+            stage = frame.get("stage")
+            if stage is not None:
+                event["stage"] = str(stage)
+            events.append(event)
+    return events
 
 
 # ---------------------------------------------------------------------------
@@ -871,19 +1087,18 @@ def _heated_gouge_samples(
     return np.asarray(points)
 
 
-GOUGE_FINISHING_STRIDE = 4
-GOUGE_LINK_STRIDE = 50
-
 
 def gouge_sample_poses(
     frames: Sequence[Mapping[str, Any]], stages: Sequence[str]
 ) -> list[dict[str, Any]]:
-    """Poses checked for GOUGE.
+    """Poses checked for GOUGE, with the frame they came from.
 
     Finishing cuts are sampled every ``GOUGE_FINISHING_STRIDE`` resampled
     frames (the resampling bound is <= 1 mm) and non-rapid link stages every
     ``GOUGE_LINK_STRIDE``. The tests use this same selection, so a reported
-    depth can never understate what a test measures on it.
+    depth can never understate what a test measures on it.  Each entry carries
+    the source ``frame`` index, ``stage`` and ``joints`` so the collision log
+    can group consecutive samples back into frame ranges.
     """
 
     poses: list[dict[str, Any]] = []
@@ -900,12 +1115,72 @@ def gouge_sample_poses(
             continue
         poses.append(
             {
+                "frame": index,
+                "stage": stage,
+                "joints": _joints_of(frame),
                 "tip_xyz_wax": frame["tip_xyz_wax"],
                 "tool_axis_wax": frame["tool_axis_wax"],
                 "theta": frame["theta_s"],
             }
         )
     return poses
+
+
+def _gouge_at_pose(
+    mesh: trimesh.Trimesh,
+    pose: Mapping[str, Any],
+    config: Mapping[str, Any],
+    allowance: float,
+    bounds: np.ndarray | None = None,
+) -> tuple[float, np.ndarray, np.ndarray] | None:
+    """Deepest heated-sample burial of one pose, or ``None`` when it clears.
+
+    Returns ``(depth_mm, deepest_sample_xyz_wax, surface_point_xyz_wax)``.  The
+    surface point is the projection of the deepest sample onto the target, so a
+    logged event carries the actual contact geometry.
+    """
+
+    tip = np.asarray(pose["tip_xyz_wax"], dtype=np.float64)
+    axis = np.asarray(pose["tool_axis_wax"], dtype=np.float64)
+    theta = float(pose.get("theta", 0.0))
+    frame = _pose_for_axis(tip, axis, theta, config)
+    samples = _heated_gouge_samples(frame, config)
+    # Cheap rejects: a pose whose heated-region AABB misses the mesh cannot
+    # gouge it. Then test a set shrunk inward by 0.1 mm: a pose with no shrunken
+    # sample inside is at most 0.1 mm buried, far below the allowance, so only
+    # genuine penetrations pay for a signed distance.
+    if bounds is None:
+        bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    margin = 1e-6
+    if np.any(samples.min(axis=0) > bounds[1] + margin) or np.any(
+        samples.max(axis=0) < bounds[0] - margin
+    ):
+        return None
+    centre = samples.mean(axis=0)
+    offsets = samples - centre
+    lengths = np.linalg.norm(offsets, axis=1)
+    shrunken = samples - 0.1 * offsets / np.where(lengths == 0.0, 1.0, lengths)[:, None]
+    if not bool(np.asarray(mesh.contains(shrunken), dtype=bool).any()):
+        return None
+    signed = np.asarray(mesh.nearest.signed_distance(samples), dtype=np.float64)
+    index = int(np.argmax(signed))
+    depth = float(signed[index])
+    if depth <= allowance:
+        return None
+    surface = np.asarray(mesh.nearest.on_surface(samples[index : index + 1])[0][0])
+    return depth, samples[index], surface
+
+
+def _gouge_diagnostic(depth: float, location: np.ndarray, allowance: float) -> Diagnostic:
+    return Diagnostic(
+        code="GOUGE",
+        severity="warning",
+        message=(
+            f"heated blade is {depth:.3f} mm inside the target "
+            f"(allowance {allowance:.3f} mm) near {np.round(location, 3).tolist()}"
+        ),
+        value=depth,
+    )
 
 
 def detect_gouges(
@@ -921,47 +1196,109 @@ def detect_gouges(
     """
 
     allowance = float(config["stock"].get("finish_allowance_mm", 1.5))
+    bounds = np.asarray(mesh.bounds, dtype=np.float64)
     collector = DiagnosticCollector()
     deepest: tuple[float, np.ndarray] | None = None
-    bounds = np.asarray(mesh.bounds, dtype=np.float64)
-    margin = 1e-6
     for pose in poses:
-        tip = np.asarray(pose["tip_xyz_wax"], dtype=np.float64)
-        axis = np.asarray(pose["tool_axis_wax"], dtype=np.float64)
-        theta = float(pose.get("theta", 0.0))
-        frame = _pose_for_axis(tip, axis, theta, config)
-        samples = _heated_gouge_samples(frame, config)
-        # Cheap rejects: a pose whose heated-region AABB misses the mesh cannot
-        # gouge it. Then test a set shrunk inward by 0.1 mm: a pose with no
-        # shrunken sample inside is at most 0.1 mm buried, far below the
-        # allowance, so only genuine penetrations pay for a signed distance.
-        if np.any(samples.min(axis=0) > bounds[1] + margin) or np.any(
-            samples.max(axis=0) < bounds[0] - margin
-        ):
+        hit = _gouge_at_pose(mesh, pose, config, allowance, bounds)
+        if hit is None:
             continue
-        centre = samples.mean(axis=0)
-        offsets = samples - centre
-        lengths = np.linalg.norm(offsets, axis=1)
-        shrunken = samples - 0.1 * offsets / np.where(lengths == 0.0, 1.0, lengths)[:, None]
-        if not bool(np.asarray(mesh.contains(shrunken), dtype=bool).any()):
-            continue
-        signed = np.asarray(mesh.nearest.signed_distance(samples), dtype=np.float64)
-        index = int(np.argmax(signed))
-        depth = float(signed[index])
-        if depth > allowance and (deepest is None or depth > deepest[0]):
-            deepest = (depth, samples[index])
+        depth, location, _surface = hit
+        if deepest is None or depth > deepest[0]:
+            deepest = (depth, location)
     if deepest is not None:
         depth, location = deepest
-        collector.add(
-            "GOUGE",
-            "warning",
-            (
-                f"heated blade is {depth:.3f} mm inside the target "
-                f"(allowance {allowance:.3f} mm) near {np.round(location, 3).tolist()}"
-            ),
-            value=depth,
-        )
+        collector.extend([_gouge_diagnostic(depth, location, allowance)])
     return collector.as_list()
+
+
+def detect_gouges_detailed(
+    mesh: trimesh.Trimesh,
+    frames: Sequence[Mapping[str, Any]],
+    stages: Sequence[str],
+    config: Mapping[str, Any],
+) -> GougeReport:
+    """Run-grouped ``GOUGE`` events over the ``gouge_sample_poses`` set.
+
+    Consecutive *sampled* frames of the same stage whose indices differ by that
+    stage's stride are one run (``GOUGE_FINISHING_STRIDE`` / ``GOUGE_LINK_STRIDE``);
+    a clear sample, a stage change or a gap closes it.  The single worst-depth
+    diagnostic :func:`detect_gouges` emits is produced here too, from the same
+    scan, so the toolpath reports the same number either way.
+    """
+
+    allowance = float(config["stock"].get("finish_allowance_mm", 1.5))
+    bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    events: list[dict[str, Any]] = []
+    run: dict[str, Any] | None = None
+    previous: int | None = None
+    deepest: tuple[float, np.ndarray] | None = None
+
+    for pose in gouge_sample_poses(frames, stages):
+        index = int(pose["frame"])
+        stage = str(pose["stage"])
+        stride = GOUGE_STRIDE_BY_STAGE.get(stage)
+        hit = _gouge_at_pose(mesh, pose, config, allowance, bounds)
+        if hit is None:
+            if run is not None:
+                events.append(run)
+                run = None
+            previous = index
+            continue
+
+        depth, sample, surface = hit
+        if deepest is None or depth > deepest[0]:
+            deepest = (depth, sample)
+        continues = (
+            run is not None
+            and previous is not None
+            and stride is not None
+            and index - previous == stride
+            and run["stage"] == stage
+        )
+        if continues:
+            run["frame_range"][1] = index
+            run["samples"] += 1
+        else:
+            if run is not None:
+                events.append(run)
+            run = {
+                "code": "GOUGE",
+                "frame_range": [index, index],
+                "stage": stage,
+                "samples": 1,
+                "joints": dict(pose["joints"]),
+                "pose": _pose_of(
+                    {
+                        "tip_xyz_wax": pose["tip_xyz_wax"],
+                        "tool_axis_wax": pose["tool_axis_wax"],
+                    }
+                ),
+                "deepest_sample_xyz_wax": [round(float(v), 5) for v in sample],
+                "surface_point_xyz_wax": [round(float(v), 5) for v in surface],
+                "depth_mm": round(depth, 4),
+                "excess_mm": round(depth - allowance, 4),
+            }
+        if depth > float(run["depth_mm"]):
+            run["depth_mm"] = round(depth, 4)
+            run["excess_mm"] = round(depth - allowance, 4)
+            run["joints"] = dict(pose["joints"])
+            run["pose"] = _pose_of(
+                {
+                    "tip_xyz_wax": pose["tip_xyz_wax"],
+                    "tool_axis_wax": pose["tool_axis_wax"],
+                }
+            )
+            run["deepest_sample_xyz_wax"] = [round(float(v), 5) for v in sample]
+            run["surface_point_xyz_wax"] = [round(float(v), 5) for v in surface]
+        previous = index
+
+    if run is not None:
+        events.append(run)
+    diagnostics: list[Diagnostic] = []
+    if deepest is not None:
+        diagnostics.append(_gouge_diagnostic(deepest[0], deepest[1], allowance))
+    return GougeReport(diagnostics=diagnostics, events=events)
 
 
 # ---------------------------------------------------------------------------
@@ -1519,6 +1856,7 @@ def build_finishing(
     params: Mapping[str, Any],
     diagnostics: DiagnosticCollector,
     theta_start: float,
+    unreachable_samples: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, float]], list[bool], list[str], int, float]:
     """Undercut-capable finishing, composed from the unit-tested helpers.
 
@@ -1527,7 +1865,9 @@ def build_finishing(
     pre-filter -> split each polyline into runs of *consecutive accepted*
     points.  A rejected point ends a run and is never bridged: every run gets
     its own :func:`entry_moves`, its cuts and its :func:`exit_moves`.
-    Rejected points are counted into ``UNREACHABLE_UNDERCUT_AREA``.
+    Rejected points are counted into ``UNREACHABLE_UNDERCUT_AREA`` and, when
+    ``unreachable_samples`` is given, appended there as ``theta_deg``/``z_mm``/
+    ``required_phi_deg`` so the collision log can summarise the dead zone.
     """
 
     stock = config["stock"]
@@ -1689,6 +2029,21 @@ def build_finishing(
                     item["accepted"] = True
             pending = [item for item in pending if not item["accepted"]]
         unreachable_points += sum(1 for item in flat if not item["accepted"])
+        if unreachable_samples is not None:
+            for item in flat:
+                if item["accepted"]:
+                    continue
+                unreachable_samples.append(
+                    {
+                        "theta_deg": round(
+                            math.degrees(_wrap_angle(theta_emit)), 4
+                        ),
+                        "z_mm": round(float(item["point"]["z"]), 4),
+                        "required_phi_deg": round(
+                            math.degrees(float(item["phi_ideal"])), 4
+                        ),
+                    }
+                )
 
         # 3. Runs of consecutive accepted points, per polyline.  A rejected
         #    point ends a run; runs are never bridged by a straight cut.
@@ -1775,18 +2130,22 @@ def generate_synthetic_carve_path(
         cfg["stock"].get("retract_clearance_mm", params.get("rapid_clearance_mm", 6.0))
     )
 
+    log = CollisionEventLog(_max_events_per_code(cfg))
     collector = DiagnosticCollector()
 
     rough_joints, rough_rapid, rough_stage, rough_last_theta = build_roughing(
         mesh, cfg, params, collector
     )
+    unreachable_samples: list[dict[str, Any]] = []
     (
         finish_joints,
         finish_rapid,
         finish_stage,
         _finish_points,
         unreachable_percent,
-    ) = build_finishing(mesh, cfg, params, collector, rough_last_theta)
+    ) = build_finishing(
+        mesh, cfg, params, collector, rough_last_theta, unreachable_samples
+    )
 
     joints = rough_joints + finish_joints
     rapid_flags = rough_rapid + finish_rapid
@@ -1795,11 +2154,13 @@ def generate_synthetic_carve_path(
     if any(diag.severity == "error" for diag in collector.as_list()):
         # An out-of-bounds joint or stock already makes the path unproducible;
         # don't spend minutes resampling (and trip the frame cap) to say so.
+        # There is no trajectory, so there is nothing to log beyond the header.
         return ToolpathResult(
             frames=[],
             diagnostics=collector.as_list(),
             preset=preset,
             unreachable_percent=unreachable_percent,
+            collision_log=_collision_log_header(log, preset, 0),
         )
 
     joints, rapid_flags, stages = resample_path(joints, rapid_flags, stages, cfg)
@@ -1815,6 +2176,12 @@ def generate_synthetic_carve_path(
 
     collector.extend(trajectory_diagnostics)
 
+    # Vectorised post-pass: build_trajectory only validates what it builds and
+    # the collector deduplicates by `code:axis`, so re-check every emitted frame
+    # and log the exact out-of-travel frame ranges.
+    for event in soft_limit_runs(frames, cfg):
+        log.add_run(event["code"], event, weight=event["value"])
+
     if unreachable_percent > 0.0:
         collector.add(
             "UNREACHABLE_UNDERCUT_AREA",
@@ -1825,23 +2192,44 @@ def generate_synthetic_carve_path(
             ),
             value=unreachable_percent,
         )
+        log.add_run(
+            "UNREACHABLE_UNDERCUT_AREA",
+            _unreachable_event(unreachable_samples, cfg, unreachable_percent),
+            weight=unreachable_percent,
+        )
 
     # Gouge checks run over every finishing cut pose, derived from the FK of
     # the frames actually emitted (not from pre-resampling target points).
     # Link stages are checked too (PATCH-02), sampled as defined by
-    # `gouge_sample_poses`; the tests use the same selection.
-    cutting_poses = gouge_sample_poses(frames, stages)
-    for diag in detect_gouges(mesh, cutting_poses, cfg):
+    # `gouge_sample_poses`; the tests use the same selection.  The same scan
+    # groups the sampled poses back into run-grouped GOUGE events.
+    gouge_report = detect_gouges_detailed(mesh, frames, stages, cfg)
+    for diag in gouge_report.diagnostics:
         collector.extend([diag])
+    for event in gouge_report.events:
+        log.add_run(event["code"], event, weight=event["depth_mm"])
 
     # Feed-direction diagnostics over every cutting segment (roughing theta
     # passes and finishing cuts). Link moves and rapids are not cuts.
     broadside_length = 0.0
     cutting_length = 0.0
     first_offending: int | None = None
+    open_run: dict[str, Any] | None = None
+
+    def close_broadside_run() -> None:
+        nonlocal open_run
+        if open_run is None:
+            return
+        event = {
+            key: value for key, value in open_run.items() if not key.startswith("_")
+        }
+        log.add_run(event["code"], event, weight=float(event["length_mm"]))
+        open_run = None
+
     for index in range(1, len(frames)):
         current = frames[index]
         if current["is_rapid"] or current["stage"] not in ("roughing", "finishing"):
+            close_broadside_run()
             continue
         previous = frames[index - 1]
         direction = np.asarray(current["tip_xyz_wax"]) - np.asarray(
@@ -1849,16 +2237,44 @@ def generate_synthetic_carve_path(
         )
         length = float(np.linalg.norm(direction))
         if length <= 1e-12:
+            close_broadside_run()
             continue
         pose = tool_model.tool_pose(
             current["tip_xyz_wax"], current["theta_s"], current["phi"], cfg
         )
         kind = tool_model.feed_class(direction, pose, cfg)
         cutting_length += length
-        if kind == "broadside":
-            broadside_length += length
-            if first_offending is None:
-                first_offending = index
+        if kind != "broadside":
+            close_broadside_run()
+            continue
+        broadside_length += length
+        if first_offending is None:
+            first_offending = index
+        if (
+            open_run is not None
+            and open_run["_last_frame"] == index - 1
+            and open_run["stage"] == current["stage"]
+        ):
+            open_run["frame_range"][1] = index
+            open_run["length_mm"] = round(open_run["length_mm"] + length, 4)
+            if length > open_run["_worst_length"]:
+                open_run["_worst_length"] = length
+                open_run["joints"] = _joints_of(current)
+                open_run["pose"] = _pose_of(current)
+        else:
+            close_broadside_run()
+            open_run = {
+                "code": "BLADE_BROADSIDE_FEED",
+                "frame_range": [index, index],
+                "stage": current["stage"],
+                "length_mm": round(length, 4),
+                "joints": _joints_of(current),
+                "pose": _pose_of(current),
+                "_last_frame": index,
+                "_worst_length": length,
+            }
+        open_run["_last_frame"] = index
+    close_broadside_run()
     if broadside_length > 0.0 and cutting_length > 0.0:
         fraction = broadside_length / cutting_length
         collector.add(
@@ -1874,6 +2290,7 @@ def generate_synthetic_carve_path(
 
     rough_count = sum(1 for stage in stages if stage == "roughing")
     finish_count = sum(1 for stage in stages if stage == "finishing")
+    collision_log = _collision_log_header(log, preset, len(frames))
     return ToolpathResult(
         frames=frames,
         diagnostics=collector.as_list(),
@@ -1882,4 +2299,6 @@ def generate_synthetic_carve_path(
         finishing_frames=finish_count,
         unreachable_percent=unreachable_percent,
         rapid_frames=sum(1 for flag in rapid_flags if flag),
+        collision_events=collision_log["events"],
+        collision_log=collision_log,
     )
