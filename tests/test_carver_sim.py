@@ -14,6 +14,7 @@ import os
 import tempfile
 import unittest
 import unittest.mock
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +33,9 @@ import toolpath_sim  # noqa: E402
 from server import app  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
+
+from tests._fixtures import short_stock_config, short_stock_target  # noqa: E402
+from tests._tiers import ReleasesClassFixtures, heavy  # noqa: E402
 
 CONFIG_PATH = ROOT / "machine_config.json"
 HW_FIXTURE = ROOT / "tests" / "fixtures" / "hardware_poses.json"
@@ -421,7 +425,9 @@ class TestTipSpeedTimingAndSingularity(unittest.TestCase):
             self.assertGreater(cur["theta_s"], prev["theta_s"])
 
 
-class TestFacialSculpting(unittest.TestCase):
+class TestFacialSculpting(ReleasesClassFixtures, unittest.TestCase):
+    _class_fixtures = ("base", "landmarks")
+
     @classmethod
     def setUpClass(cls):
         # Pinned to the analytic ellipsoid preset: `machine_config.json` points
@@ -486,17 +492,23 @@ class TestFacialSculpting(unittest.TestCase):
         self.assertEqual(err.severity, "error")
 
 
-class TestSyntheticToolpaths(unittest.TestCase):
+class TestSyntheticToolpaths(ReleasesClassFixtures, unittest.TestCase):
+    """The toolpath invariants on the 40 mm short-stock fixture (default tier)."""
+
+    _class_fixtures = ("mesh", "sculpt", "result")
+
     @classmethod
     def setUpClass(cls):
         # Ellipsoid preset again: the committed `head_2` target is exercised by
         # TestHead2Target and by the API tests below, which load the default
-        # configuration.
-        cls.config = load_config(target_mesh=None)
-        cls.mesh = face_sculpt.load_base_head(cls.config)
-        cls.sculpt = face_sculpt.apply_facial_modifications(
-            cls.mesh, {"nose": 1.0, "chin": 0.6, "brow": 0.4}, cls.config
-        ).mesh
+        # configuration. The short stock keeps this class inside the default
+        # memory budget; TestSyntheticToolpathsFullTarget keeps the real-scale
+        # copy in the heavy tier.
+        cls.config = short_stock_config()
+        cls.mesh = short_stock_target(
+            cls.config, {"nose": 1.0, "chin": 0.6, "brow": 0.4}
+        )
+        cls.sculpt = cls.mesh
         cls.result = toolpath_sim.generate_synthetic_carve_path(
             cls.sculpt, cls.config, preset="demo"
         )
@@ -641,9 +653,9 @@ class TestSyntheticToolpaths(unittest.TestCase):
 
     def test_gouge_detection_flags_tool_inside_target(self):
         # Construct a deliberately bad CL pose that buries the tool in the target.
-        cc = np.array([20.0, 0.0, 50.0])
+        centre = np.asarray(self.mesh.bounds, dtype=float).mean(axis=0)
         normal = np.array([1.0, 0.0, 0.0])
-        bad_tip = cc - normal * 4.0
+        bad_tip = centre - normal * 4.0
         pose = {
             "tip_xyz_wax": tuple(float(v) for v in bad_tip),
             "tool_axis_wax": (1.0, 0.0, 0.0),
@@ -684,22 +696,151 @@ class TestSyntheticToolpaths(unittest.TestCase):
         )
 
 
-class TestHead2Target(unittest.TestCase):
+@heavy
+class TestSyntheticToolpathsFullTarget(TestSyntheticToolpaths):
+    """Heavy tier: the same assertions on the full-size sculpted base head."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load_config(target_mesh=None)
+        cls.mesh = face_sculpt.load_base_head(cls.config)
+        cls.sculpt = face_sculpt.apply_facial_modifications(
+            cls.mesh, {"nose": 1.0, "chin": 0.6, "brow": 0.4}, cls.config
+        ).mesh
+        cls.result = toolpath_sim.generate_synthetic_carve_path(
+            cls.sculpt, cls.config, preset="demo"
+        )
+
+
+class TestResampleFrameCap(unittest.TestCase):
+    """D4: `resample_path` stops as soon as the frame cap is exceeded."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load_config(target_mesh=None)
+
+    @staticmethod
+    def _path(segments: int, step: float):
+        joints = [
+            {"r": 30.0, "theta": index * step, "h": 100.0, "phi": 0.0}
+            for index in range(segments)
+        ]
+        return joints, [False] * segments, ["roughing"] * segments
+
+    def test_aborts_at_the_cap_with_bounded_overshoot(self):
+        joints, rapid, stages = self._path(20, 1.0)
+        full, _, _ = toolpath_sim.resample_path(joints, rapid, stages, self.config)
+        self.assertGreater(len(full), 500)
+        with self.assertRaises(toolpath_sim.FrameCapExceededError) as caught:
+            toolpath_sim.resample_path(
+                joints, rapid, stages, self.config, max_frames=500
+            )
+        error = caught.exception
+        self.assertEqual(error.max_frames, 500)
+        self.assertGreater(error.frames, 500)
+        self.assertLessEqual(error.frames, 500 + 2**11)
+        self.assertEqual(error.diagnostic().code, "FRAME_CAP_EXCEEDED")
+
+    def test_paths_under_the_cap_are_identical(self):
+        joints, rapid, stages = self._path(5, 0.1)
+        capped = toolpath_sim.resample_path(
+            joints, rapid, stages, self.config, max_frames=1000
+        )
+        uncapped = toolpath_sim.resample_path(joints, rapid, stages, self.config)
+        self.assertEqual(capped, uncapped)
+
+
+class TestTiers(unittest.TestCase):
+    """D1: `heavy` skips full-generation tests unless RUN_HEAVY_TESTS=1."""
+
+    def test_heavy_skip_reason_matches_the_documented_flag(self):
+        class Probe(unittest.TestCase):
+            @heavy
+            def test_probe(self):
+                pass
+
+        result = unittest.TestResult()
+        Probe("test_probe").run(result)
+        if os.environ.get("RUN_HEAVY_TESTS") == "1":
+            self.assertEqual(result.skipped, [])
+            self.assertEqual(result.testsRun, 1)
+        else:
+            self.assertEqual(
+                result.skipped,
+                [(Probe("test_probe"), "heavy test: set RUN_HEAVY_TESTS=1")],
+            )
+
+    def test_default_tier_sample_never_generates_on_a_real_target(self):
+        real = []
+        for name in ("base_head.stl", "head_2.stl"):
+            mesh = trimesh.load(ROOT / "presets" / name, force="mesh")
+            real.append((len(mesh.vertices), np.asarray(mesh.bounds, dtype=float)))
+
+        def is_real_target(mesh) -> bool:
+            bounds = np.asarray(mesh.bounds, dtype=float)
+            return any(
+                len(mesh.vertices) == count and np.allclose(bounds, expected, atol=1.0)
+                for count, expected in real
+            )
+
+        config = short_stock_config()
+        mesh = short_stock_target(config, {"nose": 1.0, "chin": 0.6, "brow": 0.4})
+        seen = []
+        original = toolpath_sim.generate_synthetic_carve_path
+
+        def probe(target, *args, **kwargs):
+            seen.append(target)
+            return original(target, *args, **kwargs)
+
+        with unittest.mock.patch.object(
+            toolpath_sim, "generate_synthetic_carve_path", side_effect=probe
+        ):
+            result = toolpath_sim.generate_synthetic_carve_path(
+                mesh, config, preset="demo"
+            )
+
+        self.assertGreater(len(result.frames), 0)
+        self.assertTrue(seen)
+        self.assertFalse([target for target in seen if is_real_target(target)])
+
+
+class TestFixtureRelease(unittest.TestCase):
+    """D3: `ReleasesClassFixtures` drops every cached fixture and collects."""
+
+    def test_class_fixture_is_dead_after_tear_down(self):
+        class Cached(ReleasesClassFixtures, unittest.TestCase):
+            _class_fixtures = ("result", "mesh")
+
+            def test_noop(self):
+                pass
+
+        Cached.result = trimesh.creation.icosphere(subdivisions=1)
+        Cached.mesh = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+        ref = weakref.ref(Cached.result)
+        Cached.tearDownClass()
+        self.assertFalse(hasattr(Cached, "result"))
+        self.assertFalse(hasattr(Cached, "mesh"))
+        self.assertIsNone(ref())
+
+
+class TestHead2Target(ReleasesClassFixtures, unittest.TestCase):
     """The committed `presets/head_2.stl` default target mesh.
 
     `machine_config.json` points `target_mesh.path` at the pre-normalized head,
     so `load_base_head` / `POST /api/sculpt-and-sim` carve it by default.  The
     analytic ellipsoid classes above stay pinned to `target_mesh=None`.
+
+    Geometry, landmark and slider checks need only the mesh, so this class never
+    generates a toolpath; the heavy tier keeps the real `demo` baseline.
     """
+
+    _class_fixtures = ("mesh", "landmarks")
 
     @classmethod
     def setUpClass(cls):
         cls.config = load_config()
         cls.mesh = face_sculpt.load_base_head(cls.config)
         cls.landmarks = face_sculpt.load_landmarks(cls.config)
-        cls.result = toolpath_sim.generate_synthetic_carve_path(
-            cls.mesh, cls.config, preset="demo"
-        )
 
     # -- geometry ----------------------------------------------------------
 
@@ -776,7 +917,34 @@ class TestHead2Target(unittest.TestCase):
         quiet = face_sculpt.apply_facial_modifications(self.mesh, {}, self.config)
         self.assertEqual(quiet.diagnostics, [])
 
-    # -- demo toolpath -----------------------------------------------------
+    # -- early returns -----------------------------------------------------
+
+    def test_early_return_paths_report_no_collision_events(self):
+        config = copy.deepcopy(self.config)
+        config["stock"]["H_stock_mm"] = 300.0
+        block = trimesh.creation.box(extents=(30.0, 30.0, 40.0))
+        block.apply_translation([0.0, 0.0, 30.0])
+        result = toolpath_sim.generate_synthetic_carve_path(
+            block, config, preset="demo"
+        )
+        self.assertEqual(result.frames, [])
+        self.assertEqual(result.collision_events, [])
+        self.assertTrue(any(d.severity == "error" for d in result.diagnostics))
+
+@heavy
+class TestHead2ToolpathBaseline(ReleasesClassFixtures, unittest.TestCase):
+    """Heavy tier: the real head_2 `demo` baseline and its collision log."""
+
+    _class_fixtures = ("mesh", "landmarks", "result")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load_config()
+        cls.mesh = face_sculpt.load_base_head(cls.config)
+        cls.landmarks = face_sculpt.load_landmarks(cls.config)
+        cls.result = toolpath_sim.generate_synthetic_carve_path(
+            cls.mesh, cls.config, preset="demo"
+        )
 
     def test_demo_baseline_keeps_its_expected_warnings(self):
         # Intended baseline of the committed mesh: zero errors, ~20.6% of surface
@@ -799,20 +967,6 @@ class TestHead2Target(unittest.TestCase):
         self.assertEqual(codes["GOUGE"].severity, "warning")
         self.assertGreater(codes["GOUGE"].value, allowance)
         self.assertLess(codes["GOUGE"].value, 25.0)
-
-    def test_early_return_paths_report_no_collision_events(self):
-        config = copy.deepcopy(self.config)
-        config["stock"]["H_stock_mm"] = 300.0
-        block = trimesh.creation.box(extents=(30.0, 30.0, 40.0))
-        block.apply_translation([0.0, 0.0, 30.0])
-        result = toolpath_sim.generate_synthetic_carve_path(
-            block, config, preset="demo"
-        )
-        self.assertEqual(result.frames, [])
-        self.assertEqual(result.collision_events, [])
-        self.assertTrue(any(d.severity == "error" for d in result.diagnostics))
-
-    # -- collision event log ----------------------------------------------
 
     def test_collision_events_carry_frame_ranges_and_contact_geometry(self):
         events = self.result.collision_events
@@ -922,8 +1076,10 @@ class TestCollisionEventLog(unittest.TestCase):
         )
 
 
-class TestSampledGougeRuns(unittest.TestCase):
+class TestSampledGougeRuns(ReleasesClassFixtures, unittest.TestCase):
     """`detect_gouges_detailed` groups consecutive *sampled* frames into runs."""
+
+    _class_fixtures = ("mesh",)
 
     @classmethod
     def setUpClass(cls):
@@ -1037,7 +1193,37 @@ class TestSoftLimitPostPass(unittest.TestCase):
         self.assertEqual(toolpath_sim.soft_limit_runs(frames, self.config), [])
 
 
-class TestSimulationAPI(unittest.TestCase):
+def _stub_toolpath_result(config, *, frames_count: int = 60):
+    """A small *real* `ToolpathResult` for API contract tests.
+
+    Built with `kinematics.build_trajectory`, not a hand-made dict, so the HTTP
+    envelope is exercised against the production frame shape. Provenance comes
+    from the config, so no real path is needed.
+    """
+
+    theta = np.linspace(0.0, math.radians(90.0), frames_count)
+    joints = [
+        {"r": 30.0, "theta": float(value), "h": 100.0, "phi": 0.0}
+        for value in theta
+    ]
+    frames, diagnostics = kinematics.build_trajectory(
+        joints, [False] * frames_count, config
+    )
+    for frame in frames:
+        frame["stage"] = "roughing"
+    return toolpath_sim.ToolpathResult(
+        frames=frames,
+        diagnostics=list(diagnostics),
+        preset="demo",
+        roughing_frames=frames_count,
+        finishing_frames=0,
+        rapid_frames=0,
+    )
+
+
+class TestSimulationAPI(ReleasesClassFixtures, unittest.TestCase):
+    _class_fixtures = ("client",)
+
     @classmethod
     def setUpClass(cls):
         cls.client = TestClient(app)
@@ -1050,13 +1236,17 @@ class TestSimulationAPI(unittest.TestCase):
         self.assertIn("version", body)
 
     def test_sculpt_and_sim_columnar_contract(self):
-        response = self.client.post(
-            "/api/sculpt-and-sim",
-            json={
-                "sliders": {"nose": 0.8, "brow": 0.4},
-                "preset": "demo",
-            },
-        )
+        stub = _stub_toolpath_result(kinematics.load_config())
+        with unittest.mock.patch.object(
+            toolpath_sim, "generate_synthetic_carve_path", return_value=stub
+        ):
+            response = self.client.post(
+                "/api/sculpt-and-sim",
+                json={
+                    "sliders": {"nose": 0.8, "brow": 0.4},
+                    "preset": "demo",
+                },
+            )
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertEqual(body["preset"], "demo")
@@ -1078,7 +1268,7 @@ class TestSimulationAPI(unittest.TestCase):
 
         traj = body["trajectory"]
         self.assertLessEqual(traj["frame_count"], 250_000)
-        self.assertGreater(traj["frame_count"], 100)
+        self.assertGreaterEqual(traj["frame_count"], 50)
         columns = traj["columns"]
         for name in (
             "t", "r", "theta", "h", "phi", "r_s", "theta_s", "z_s",
@@ -1099,6 +1289,17 @@ class TestSimulationAPI(unittest.TestCase):
         expanded = body["diagnostics"]
         self.assertIsInstance(expanded, list)
 
+    @heavy
+    def test_demo_post_end_to_end_generates_the_real_target(self):
+        response = self.client.post(
+            "/api/sculpt-and-sim", json={"sliders": {}, "preset": "demo"}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertGreater(body["trajectory"]["frame_count"], 50_000)
+        self.assertEqual(body["collision_log"]["status"], "ok")
+        self.assertGreater(body["target_mesh"]["face_count"], 100)
+
 
 class _FakeNeedle(trimesh.Trimesh):
     """Probe mesh: a vertical spike whose side panels share the section plane.
@@ -1118,11 +1319,23 @@ class _FakeNeedle(trimesh.Trimesh):
         return mesh
 
 
-class TestPatch10ToolpathRegressions(unittest.TestCase):
+class TestPatch10ToolpathRegressions(ReleasesClassFixtures, unittest.TestCase):
+    _class_fixtures = ("needle", "_needle_result")
+
     @classmethod
     def setUpClass(cls):
         cls.config = load_config()
         cls.needle = _FakeNeedle.build()
+
+    @classmethod
+    def needle_result(cls):
+        """One `demo` run on the needle, shared by every assertion that needs it."""
+
+        if not hasattr(cls, "_needle_result"):
+            cls._needle_result = toolpath_sim.generate_synthetic_carve_path(
+                cls.needle, cls.config, preset="demo"
+            )
+        return cls._needle_result
 
     # (a) planar r-Z sections ------------------------------------------------
 
@@ -1148,9 +1361,7 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
         # Machine-cad-integration exit criterion: the PATCH-10f expectedFailure
         # is gone. Every finishing cut must place the *heated blade* on the
         # target surface (support-function CL), not one cone standoff away.
-        result = toolpath_sim.generate_synthetic_carve_path(
-            self.needle, self.config, preset="demo"
-        )
+        result = self.needle_result()
         finishing = [
             f for f in result.frames if f["stage"] == "finishing" and not f["is_rapid"]
         ]
@@ -1224,9 +1435,7 @@ class TestPatch10ToolpathRegressions(unittest.TestCase):
     # (c) safe three-step approach/retract ---------------------------------
 
     def test_approach_and_retract_never_drop_below_cut_height(self):
-        result = toolpath_sim.generate_synthetic_carve_path(
-            self.needle, self.config, preset="demo"
-        )
+        result = self.needle_result()
         frames = result.frames
         stock_top = float(self.config["stock"]["H_stock_mm"])
         clearance = float(self.config["stock"]["retract_clearance_mm"])
@@ -1577,7 +1786,9 @@ def _tool_body_points(mesh, config, tip, axis):
     return tool_model.heated_corners(pose, config)
 
 
-class TestPatch10APIRegressions(unittest.TestCase):
+class TestPatch10APIRegressions(ReleasesClassFixtures, unittest.TestCase):
+    _class_fixtures = ("client",)
+
     @classmethod
     def setUpClass(cls):
         cls.client = TestClient(app)
@@ -1606,10 +1817,14 @@ class TestPatch10APIRegressions(unittest.TestCase):
         self.assertIn("heated_length_mm", response.text)
 
     def test_demo_response_carries_geometry_provenance(self):
-        response = self.client.post(
-            "/api/sculpt-and-sim",
-            json={"sliders": {}, "preset": "demo"},
-        )
+        stub = _stub_toolpath_result(kinematics.load_config())
+        with unittest.mock.patch.object(
+            toolpath_sim, "generate_synthetic_carve_path", return_value=stub
+        ):
+            response = self.client.post(
+                "/api/sculpt-and-sim",
+                json={"sliders": {}, "preset": "demo"},
+            )
         self.assertEqual(response.status_code, 200, response.text)
         provenance = response.json()["config"]["geometry_provenance"]
         self.assertEqual(
@@ -1619,30 +1834,37 @@ class TestPatch10APIRegressions(unittest.TestCase):
         self.assertIsNone(provenance["home_pose"])
 
     def test_max_frames_exceedance_maps_to_422(self):
-        response = self.client.post(
-            "/api/sculpt-and-sim",
-            json={
-                "sliders": {},
-                "preset": "demo",
-                "stock_cfg": {"H_stock_mm": 600.0},
-            },
-        )
+        # D4 makes this fail inside resampling, so 500 frames is enough to keep
+        # the test bounded while still exercising the real generator.
+        config = load_config()
+        config["api"]["max_frames"] = 500
+        with unittest.mock.patch.object(
+            kinematics,
+            "load_config",
+            side_effect=lambda *args, **kwargs: copy.deepcopy(config),
+        ), unittest.mock.patch.object(
+            face_sculpt, "load_base_head", return_value=_FakeNeedle.build()
+        ):
+            response = self.client.post(
+                "/api/sculpt-and-sim",
+                json={"sliders": {}, "preset": "demo"},
+            )
         self.assertEqual(response.status_code, 422, response.text)
         detail = response.json()["detail"]
         codes = {d["code"] for d in detail["diagnostics"]}
-        self.assertTrue(
-            "FRAME_CAP_EXCEEDED" in codes or "SOFT_LIMIT_EXCEEDED" in codes, codes
-        )
+        self.assertIn("FRAME_CAP_EXCEEDED", codes, codes)
 
 
-class TestCollisionLogAPI(unittest.TestCase):
+class TestCollisionLogAPI(ReleasesClassFixtures, unittest.TestCase):
     """`POST /api/sculpt-and-sim` returns and persists the collision log.
 
     The trajectory generator is patched so these assertions are deterministic
     and fast: what is under test is the HTTP envelope, the atomic file write,
     and the `mesh_path` / `sliders_enabled` plumbing, not the toolpath itself
-    (TestHead2Target covers the real `head_2` run).
+    (TestHead2ToolpathBaseline covers the real `head_2` run).
     """
+
+    _class_fixtures = ("client",)
 
     @classmethod
     def setUpClass(cls):

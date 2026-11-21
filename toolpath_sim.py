@@ -47,7 +47,7 @@ class FrameCapExceededError(RuntimeError):
 
     def __init__(self, frames: int, max_frames: int) -> None:
         super().__init__(
-            f"trajectory needs {frames} frames which exceeds max_frames={max_frames}; "
+            f"trajectory needs at least {frames} frames which exceeds max_frames={max_frames}; "
             "choose a coarser preset or raise api.max_frames"
         )
         self.frames = int(frames)
@@ -512,8 +512,15 @@ def resample_path(
     rapid_flags: Sequence[bool],
     stages: Sequence[str],
     config: Mapping[str, Any],
+    max_frames: int | None = None,
 ) -> tuple[list[dict[str, float]], list[bool], list[str]]:
-    """Adaptively subdivide until the heated-region corner bound is satisfied."""
+    """Adaptively subdivide until the heated-region corner bound is satisfied.
+
+    ``max_frames`` fails early: the resampled count is checked after each input
+    segment, so a path over ``api.max_frames`` raises before the rest of the
+    path (and the trajectory) is materialised. One segment's subdivision is the
+    most that can overshoot the cap.
+    """
 
     if not joints:
         return [], [], []
@@ -538,6 +545,8 @@ def resample_path(
             out_joints.append(piece)
             out_rapid.append(bool(rapid_flags[index]))
             out_stage.append(stages[index])
+        if max_frames is not None and len(out_joints) > max_frames:
+            raise FrameCapExceededError(len(out_joints), max_frames)
     return out_joints, out_rapid, out_stage
 
 
@@ -2163,9 +2172,11 @@ def generate_synthetic_carve_path(
             collision_log=_collision_log_header(log, preset, 0),
         )
 
-    joints, rapid_flags, stages = resample_path(joints, rapid_flags, stages, cfg)
-
     max_frames = int(cfg.get("api", {}).get("max_frames", 250_000))
+    joints, rapid_flags, stages = resample_path(
+        joints, rapid_flags, stages, cfg, max_frames=max_frames
+    )
+
     if len(joints) > max_frames:
         # Fail loudly instead of truncating mid-stock with the tool buried.
         raise FrameCapExceededError(len(joints), max_frames)

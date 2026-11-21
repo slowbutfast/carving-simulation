@@ -22,12 +22,19 @@ MODELS = ROOT / "static" / "models"
 
 RUNTIME_MODULES = ("server.py", "kinematics.py", "toolpath_sim.py", "tool_model.py")
 
+try:  # noqa: E402
+    from tests._tiers import ReleasesClassFixtures
+except ImportError:  # direct `python tests/test_machine_cad.py`
+    from _tiers import ReleasesClassFixtures
+
 
 def load_geometry() -> dict:
     return json.loads(GEOMETRY.read_text(encoding="utf-8"))
 
 
-class TestCadArtifact(unittest.TestCase):
+class TestCadArtifact(ReleasesClassFixtures, unittest.TestCase):
+    _class_fixtures = ("geometry",)
+
     @classmethod
     def setUpClass(cls):
         cls.geometry = load_geometry()
@@ -144,7 +151,9 @@ class TestCadArtifact(unittest.TestCase):
         self.assertEqual(len(envelope["half_extents_mm"]), 3)
 
 
-class TestLinkMeshes(unittest.TestCase):
+class TestLinkMeshes(ReleasesClassFixtures, unittest.TestCase):
+    _class_fixtures = ("trimesh", "geometry", "paths", "scenes")
+
     @classmethod
     def setUpClass(cls):
         import trimesh

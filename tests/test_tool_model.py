@@ -18,12 +18,19 @@ if str(ROOT) not in sys.path:
 import kinematics  # noqa: E402
 import tool_model  # noqa: E402
 
+try:  # noqa: E402
+    from tests._tiers import ReleasesClassFixtures
+except ImportError:  # direct `python tests/test_tool_model.py`
+    from _tiers import ReleasesClassFixtures
+
 X = np.array([1.0, 0.0, 0.0])
 Y = np.array([0.0, 1.0, 0.0])
 Z = np.array([0.0, 0.0, 1.0])
 
 
-class TestToolFrame(unittest.TestCase):
+class TestToolFrame(ReleasesClassFixtures, unittest.TestCase):
+    _class_fixtures = ("config",)
+
     @classmethod
     def setUpClass(cls):
         cls.config = kinematics.load_config()
@@ -62,8 +69,10 @@ class TestToolFrame(unittest.TestCase):
                 )
 
 
-class TestHeatedSdf(unittest.TestCase):
+class TestHeatedSdf(ReleasesClassFixtures, unittest.TestCase):
     """All distances are negative inside the heated region."""
+
+    _class_fixtures = ("config", "kerf", "length", "pose")
 
     @classmethod
     def setUpClass(cls):
@@ -95,7 +104,16 @@ class TestHeatedSdf(unittest.TestCase):
         self.assertGreater(values[1], 0.0)
 
 
-class TestSupportPlacement(unittest.TestCase):
+class TestSupportPlacement(ReleasesClassFixtures, unittest.TestCase):
+    _class_fixtures = (
+        "config",
+        "tool",
+        "kerf",
+        "length",
+        "half_thickness",
+        "half_width",
+    )
+
     @classmethod
     def setUpClass(cls):
         cls.config = kinematics.load_config()
@@ -154,12 +172,14 @@ class TestSupportPlacement(unittest.TestCase):
         self.assertGreater(float(np.linalg.norm(cl - naive)), 1.0)
 
 
-class TestBodyCollision(unittest.TestCase):
+class TestBodyCollision(ReleasesClassFixtures, unittest.TestCase):
     """trimesh's signed distance / contains is POSITIVE inside a mesh.
 
     The wax SDF is the opposite (negative inside). Every addition that touches
     both conventions must state which one it is using.
     """
+
+    _class_fixtures = ("config",)
 
     @classmethod
     def setUpClass(cls):
@@ -192,7 +212,9 @@ class TestBodyCollision(unittest.TestCase):
         self.assertTrue(bool(tool_model.body_penetrates(slab, [pose], self.config)[0]))
 
 
-class TestFeedClass(unittest.TestCase):
+class TestFeedClass(ReleasesClassFixtures, unittest.TestCase):
+    _class_fixtures = ("config",)
+
     @classmethod
     def setUpClass(cls):
         cls.config = kinematics.load_config()

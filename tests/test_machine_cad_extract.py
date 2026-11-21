@@ -34,9 +34,16 @@ try:
 except Exception:  # pragma: no cover - depends on the dev environment
     HAVE_OCP = False
 
+try:  # noqa: E402
+    from tests._tiers import ReleasesClassFixtures
+except ImportError:  # direct `python tests/test_machine_cad_extract.py`
+    from _tiers import ReleasesClassFixtures
+
 
 @unittest.skipUnless(HAVE_OCP, "cadquery-ocp is not installed (dev-only)")
-class TestExtraction(unittest.TestCase):
+class TestExtraction(ReleasesClassFixtures, unittest.TestCase):
+    _class_fixtures = ("module", "committed")
+
     @classmethod
     def setUpClass(cls):
         cls.module = load_extractor()
