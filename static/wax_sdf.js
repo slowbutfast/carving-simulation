@@ -17,13 +17,14 @@ export class VolumetricWaxGrid {
     rigRoot.add(this.group);
 
     this.material = new THREE.MeshStandardMaterial({
-      color: 0xe8d595,
+      color: 0xb91c1c,
       roughness: 0.58,
       metalness: 0.04,
       flatShading: false,
     });
     this.chunkMeshes = new Map();
     this.ready = false;
+    this.auditAll = false;
     this.voxelSize = null;
     this.currentIndex = 0;
     this.frameCount = 0;
@@ -72,6 +73,10 @@ export class VolumetricWaxGrid {
     }
     if (message.type === 'collision') {
       this.onCollision(message);
+      return;
+    }
+    if (message.type === 'collisions') {
+      this.onStatus(message);
       return;
     }
     if (message.type === 'progress') {
@@ -130,9 +135,20 @@ export class VolumetricWaxGrid {
         rapid: rapidCopy,
         count: frameCount,
         stride: 7,
+        auditAll: this.auditAll,
       },
       [poses.buffer]
     );
+  }
+
+  /**
+   * Toggle the audit-all carve. The worker re-carves from frame 0, because a
+   * collision is left uncarved and its wax state cannot be reused.
+   */
+  setAuditAll(enabled) {
+    this.auditAll = Boolean(enabled);
+    this.currentIndex = 0;
+    this.worker.postMessage({ type: 'audit', enabled: this.auditAll });
   }
 
   seek(index, reason = 'seek') {

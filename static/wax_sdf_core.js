@@ -43,6 +43,49 @@ export const DEFAULT_TOOL = Object.freeze({
   }),
 });
 
+/**
+ * Map the backend's blade config (snake_case millimetres) onto tool units.
+ * Shared by the worker and the headless audit CLI so both audit the same tool.
+ */
+export function toolFromConfig(configTool) {
+  const source = configTool || {};
+  const positive = (configKey, fallback) => {
+    const value = Number(source[configKey]);
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+  };
+  const span = (configKey, fallback) => {
+    const value = source[configKey];
+    if (Array.isArray(value) && value.length === 2) {
+      const lo = Number(value[0]);
+      const hi = Number(value[1]);
+      if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) return [lo, hi];
+    }
+    return fallback;
+  };
+  const bladeLength = positive('blade_length_mm', DEFAULT_TOOL.bladeLength);
+  const heated = positive('heated_length_mm', bladeLength);
+  const kerf = Number(source.melt_kerf_mm);
+  const envelope = source.head_envelope || {};
+  const center = Array.isArray(envelope.center_mm) ? envelope.center_mm : null;
+  const half = Array.isArray(envelope.half_extents_mm) ? envelope.half_extents_mm : null;
+  return {
+    bladeThickness: positive('blade_thickness_mm', DEFAULT_TOOL.bladeThickness),
+    bladeWidth: positive('blade_width_mm', DEFAULT_TOOL.bladeWidth),
+    bladeLength,
+    heatedLength: Math.min(heated, bladeLength),
+    meltKerf: Number.isFinite(kerf) && kerf >= 0 ? kerf : DEFAULT_TOOL.meltKerf,
+    shaftRadius: positive('shaft_radius_mm', DEFAULT_TOOL.shaftRadius),
+    shaftSpan: span('shaft_span_mm', DEFAULT_TOOL.shaftSpan),
+    bodyRadius: positive('body_radius_mm', DEFAULT_TOOL.bodyRadius),
+    bodySpan: span('body_span_mm', DEFAULT_TOOL.bodySpan),
+    headClearance: positive('head_clearance_mm', DEFAULT_TOOL.headClearance),
+    headEnvelope:
+      center && half
+        ? { shape: envelope.shape || 'box', center: [...center], halfExtents: [...half] }
+        : DEFAULT_TOOL.headEnvelope,
+  };
+}
+
 /** Exact Euclidean signed distance to a capped cylinder (negative inside). */
 export function cylinderSDF(x, y, z, R, H) {
   const dr = Math.hypot(x, y) - R;
@@ -829,4 +872,143 @@ export class WaxSDFCore {
     }
     return meshes;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Shared carve loop (worker + headless audit CLI)
+// ---------------------------------------------------------------------------
+
+/**
+ * Carve `poses[from + 1 .. to]` into `core`, stopping at the first fault.
+ *
+ * `poses` is an array of `{ tip, axis, theta }`; `rapidFlags[index]` selects
+ * `checkRapid` (moved into frame `index`) over `checkShank` (the unheated bodies
+ * at `index`).  A cutting frame that clears the bodies is subtracted.
+ *
+ * With `auditAll: false` (the default) the loop is byte-for-byte the original
+ * worker behaviour: it halts on the first fault, leaves that frame uncarved, and
+ * returns it as `current`.  With `auditAll: true` it never halts: contiguous
+ * `(code, body)` collisions are grouped into runs and every run that begins
+ * after the first fault carries `post_fault: true`, which is what makes the
+ * "how far does this path go wrong" audit possible.
+ *
+ * @returns {{ current: number, runs: object[], faulted: boolean }}
+ */
+export function carveRange(
+  core,
+  poses,
+  rapidFlags,
+  tool = DEFAULT_TOOL,
+  { from = 0, to = poses.length - 1, auditAll = false } = {}
+) {
+  const last = poses.length - 1;
+  const start = Math.max(0, Math.min(Number.isFinite(from) ? Math.floor(from) : 0, last));
+  const limit = Math.max(start, Math.min(Number.isFinite(to) ? Math.floor(to) : last, last));
+  const poseOf = (index) => ({
+    tip: poses[index].tip,
+    axis: poses[index].axis,
+    theta: poses[index].theta,
+  });
+
+  const runs = [];
+  let current = start;
+  let faulted = false;
+  let run = null;
+
+  const close = () => {
+    if (run === null) return;
+    const { end, ...event } = run;
+    runs.push(event);
+    run = null;
+  };
+
+  for (let index = start + 1; index <= limit; index++) {
+    const pose = poses[index];
+    let hit = null;
+    if (rapidFlags && rapidFlags[index]) {
+      const result = core.checkRapid(poses[index - 1], pose, tool);
+      if (result.collision) {
+        hit = {
+          code: 'RAPID_COLLISION',
+          body: result.body,
+          sdf: result.sdf,
+          pose: { ...poseOf(index), previous: poseOf(index - 1) },
+        };
+      }
+    } else {
+      const shank = core.checkShank(pose, tool);
+      if (shank.collision) {
+        hit = {
+          code: 'SHANK_COLLISION',
+          body: shank.body,
+          sdf: shank.sdf,
+          pose: poseOf(index),
+        };
+      }
+    }
+
+    if (hit !== null) {
+      const continues =
+        run !== null &&
+        run.code === hit.code &&
+        run.body === hit.body &&
+        run.end === index - 1;
+      if (!continues) {
+        close();
+        run = {
+          code: hit.code,
+          body: hit.body,
+          frame_range: [index, index],
+          frames: 1,
+          worst_sdf_mm: hit.sdf,
+          worst_frame: index,
+          pose: hit.pose,
+          post_fault: faulted,
+          end: index,
+        };
+      } else {
+        run.frame_range[1] = index;
+        run.frames += 1;
+        if (hit.sdf < run.worst_sdf_mm) {
+          run.worst_sdf_mm = hit.sdf;
+          run.worst_frame = index;
+          run.pose = hit.pose;
+        }
+      }
+      run.end = index;
+      faulted = true;
+      current = index;
+      if (!auditAll) break;
+      continue;
+    }
+
+    core.subtractTool(pose, tool, { includeShank: false });
+    current = index;
+  }
+  close();
+  return { current, runs, faulted };
+}
+
+/**
+ * Clamp a run list to a restored playback index.
+ *
+ * `restoreNearest` rewinds the wax to a snapshot, so a run that straddles that
+ * index no longer happened in full: it is cut back, and runs starting after it
+ * are dropped (carving forward re-creates them).
+ */
+export function truncateRuns(runs, index) {
+  const kept = [];
+  for (const run of runs) {
+    if (run.frame_range[0] > index) continue;
+    if (run.frame_range[1] <= index) {
+      kept.push(run);
+      continue;
+    }
+    kept.push({
+      ...run,
+      frame_range: [run.frame_range[0], index],
+      frames: Math.max(1, index - run.frame_range[0] + 1),
+    });
+  }
+  return kept;
 }

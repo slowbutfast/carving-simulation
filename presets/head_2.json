@@ -1,0 +1,48 @@
+{
+  "mesh": "head_2.stl",
+  "source": {
+    "archive": "head_2.zip",
+    "entry": "scene.gltf",
+    "sha256": "3c6da9c70dfa95de94f57fe8065032dba450c40b1421c0879bb6207d8b15aad2"
+  },
+  "transform": {
+    "rotation": [
+      "Z",
+      "X",
+      "Y"
+    ],
+    "center_xy_mm": [
+      2.247481533179041,
+      0.0
+    ],
+    "scale": 0.08785264146747764,
+    "footprint_radius_mm": 364.2463045558642,
+    "max_radius_mm": 32.0,
+    "z_plinth_mm": 10.0,
+    "wall_margin_mm": 0.5,
+    "neck_loop_edges": 14,
+    "ear_loop_edges": [
+      6,
+      6
+    ]
+  },
+  "geometry": {
+    "vertices": 135,
+    "faces": 258,
+    "volume_mm3": 110674.143652,
+    "bounds_mm": [
+      [
+        -32.0,
+        -27.659998,
+        10.0
+      ],
+      [
+        31.897494,
+        27.659998,
+        87.610969
+      ]
+    ],
+    "watertight": true,
+    "winding_consistent": true
+  }
+}

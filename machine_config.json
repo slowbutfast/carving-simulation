@@ -2,6 +2,10 @@
   "schema_version": 2,
   "units": "mm",
   "geometry_path": "machine_geometry.json",
+  "target_mesh": {
+    "path": "presets/head_2.stl",
+    "note": "Pre-normalized, watertight head imported by scripts/import_head_mesh.py; presets/head_2.json records its source and transform. Set to null to carve the analytic ellipsoid preset instead."
+  },
   "frames": {
     "machine": "right-handed, +Z up, origin on the orbit axis at the stock seat plane, theta=0 when the column is on +X",
     "wax": "right-handed cylindrical, wax static, theta_s = theta = orbit-ring angle"
@@ -82,5 +86,9 @@
   },
   "api": {
     "max_frames": 250000
+  },
+  "logging": {
+    "collision_log_path": "logs/last_collision_report.json",
+    "max_events_per_code": 200
   }
 }

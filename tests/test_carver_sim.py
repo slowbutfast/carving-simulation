@@ -11,7 +11,9 @@ import copy
 import json
 import math
 import os
+import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import numpy as np
@@ -422,7 +424,10 @@ class TestTipSpeedTimingAndSingularity(unittest.TestCase):
 class TestFacialSculpting(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.config = load_config()
+        # Pinned to the analytic ellipsoid preset: `machine_config.json` points
+        # `target_mesh.path` at the pre-normalized `head_2`, which has no
+        # landmark sidecar (see TestHead2Target).
+        cls.config = load_config(target_mesh=None)
         cls.base = face_sculpt.load_base_head(cls.config)
         cls.landmarks = face_sculpt.load_landmarks(cls.config)
 
@@ -484,7 +489,10 @@ class TestFacialSculpting(unittest.TestCase):
 class TestSyntheticToolpaths(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.config = load_config()
+        # Ellipsoid preset again: the committed `head_2` target is exercised by
+        # TestHead2Target and by the API tests below, which load the default
+        # configuration.
+        cls.config = load_config(target_mesh=None)
         cls.mesh = face_sculpt.load_base_head(cls.config)
         cls.sculpt = face_sculpt.apply_facial_modifications(
             cls.mesh, {"nose": 1.0, "chin": 0.6, "brow": 0.4}, cls.config
@@ -674,6 +682,359 @@ class TestSyntheticToolpaths(unittest.TestCase):
         self.assertLessEqual(
             len(standard.frames), self.config["api"]["max_frames"]
         )
+
+
+class TestHead2Target(unittest.TestCase):
+    """The committed `presets/head_2.stl` default target mesh.
+
+    `machine_config.json` points `target_mesh.path` at the pre-normalized head,
+    so `load_base_head` / `POST /api/sculpt-and-sim` carve it by default.  The
+    analytic ellipsoid classes above stay pinned to `target_mesh=None`.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load_config()
+        cls.mesh = face_sculpt.load_base_head(cls.config)
+        cls.landmarks = face_sculpt.load_landmarks(cls.config)
+        cls.result = toolpath_sim.generate_synthetic_carve_path(
+            cls.mesh, cls.config, preset="demo"
+        )
+
+    # -- geometry ----------------------------------------------------------
+
+    def test_configured_target_mesh_is_head_2(self):
+        resolved = face_sculpt.resolve_mesh_path(self.config)
+        self.assertEqual(resolved.name, "head_2.stl")
+        self.assertEqual(resolved.parent.resolve(), (ROOT / "presets").resolve())
+        self.assertNotEqual(
+            resolved, face_sculpt.resolve_mesh_path(load_config(target_mesh=None))
+        )
+
+    def test_head_2_is_watertight_flat_seated_and_within_stock(self):
+        mesh = self.mesh
+        delta = 1e-3
+        self.assertTrue(mesh.is_watertight)
+        self.assertTrue(mesh.is_winding_consistent)
+        self.assertGreater(float(mesh.volume), 0.0)
+        z_plinth = float(self.config["stock"]["z_plinth_mm"])
+        self.assertAlmostEqual(float(mesh.bounds[0][2]), z_plinth, delta=delta)
+        max_r = float(np.max(np.linalg.norm(mesh.vertices[:, :2], axis=1)))
+        self.assertLessEqual(max_r, 32.0 + delta)
+        # The flat extruded base is a real face of the mesh, not a clipping
+        # artefact: enough vertices sit exactly on the plinth datum.
+        on_plinth = np.isclose(mesh.vertices[:, 2], z_plinth, atol=delta)
+        self.assertGreaterEqual(int(np.count_nonzero(on_plinth)), 7)
+
+    def test_sidecar_records_the_source_digest_and_transform(self):
+        sidecar = json.loads(
+            (ROOT / "presets" / "head_2.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(sidecar["mesh"], "head_2.stl")
+        self.assertEqual(len(sidecar["source"]["sha256"]), 64)
+        transform = sidecar["transform"]
+        self.assertEqual(transform["rotation"], ["Z", "X", "Y"])
+        self.assertAlmostEqual(transform["z_plinth_mm"], 10.0, places=9)
+        self.assertAlmostEqual(transform["max_radius_mm"], 32.0, places=9)
+        self.assertEqual(transform["neck_loop_edges"], 14)
+        self.assertEqual(sorted(transform["ear_loop_edges"]), [6, 6])
+        self.assertGreater(float(transform["scale"]), 0.0)
+        self.assertEqual(len(transform["center_xy_mm"]), 2)
+        self.assertTrue(sidecar["geometry"]["watertight"])
+        credit = (ROOT / "presets" / "head_2_license.txt").read_text(encoding="utf-8")
+        self.assertIn("CC-BY-4.0", credit)
+
+    # -- mesh-keyed landmarks ---------------------------------------------
+
+    def test_landmarks_are_keyed_to_the_active_mesh(self):
+        self.assertIsNone(self.landmarks)
+        self.assertFalse(face_sculpt.sliders_enabled(self.config))
+        sidecar = face_sculpt.landmarks_path(self.config)
+        self.assertEqual(sidecar.name, "head_2_landmarks.json")
+        self.assertFalse(sidecar.exists())
+        ellipsoid = load_config(target_mesh=None)
+        self.assertTrue(face_sculpt.sliders_enabled(ellipsoid))
+        self.assertEqual(
+            face_sculpt.landmarks_path(ellipsoid).name, "base_head_landmarks.json"
+        )
+        for name in ("nose", "brow", "cheeks", "jaw", "chin"):
+            self.assertIn(name, face_sculpt.load_landmarks(ellipsoid))
+
+    def test_non_zero_sliders_emit_sculpt_sliders_ignored(self):
+        result = face_sculpt.apply_facial_modifications(
+            self.mesh, {"nose": 0.8}, self.config
+        )
+        self.assertEqual(result.max_displacement_mm, 0.0)
+        self.assertTrue(result.ok, [d.as_dict() for d in result.diagnostics])
+        np.testing.assert_array_equal(result.mesh.vertices, self.mesh.vertices)
+        diag = next(
+            d for d in result.diagnostics if d.code == "SCULPT_SLIDERS_IGNORED"
+        )
+        self.assertEqual(diag.severity, "info")
+        self.assertIn("head_2", diag.message)
+        # Zero sliders do not even warn.
+        quiet = face_sculpt.apply_facial_modifications(self.mesh, {}, self.config)
+        self.assertEqual(quiet.diagnostics, [])
+
+    # -- demo toolpath -----------------------------------------------------
+
+    def test_demo_baseline_keeps_its_expected_warnings(self):
+        # Intended baseline of the committed mesh: zero errors, ~20.6% of surface
+        # points require an unreachable pitch, and the blade buries ~12.7 mm in
+        # the target.  This asserts the character of the baseline (it must not be
+        # "fixed" to zero) rather than pinning float-exact values.
+        result = self.result
+        self.assertEqual(
+            [d.as_dict() for d in result.diagnostics if d.severity == "error"], []
+        )
+        self.assertGreater(len(result.frames), 50_000)
+        codes = {d.code: d for d in result.diagnostics}
+        self.assertIn("UNREACHABLE_UNDERCUT_AREA", codes)
+        unreachable = codes["UNREACHABLE_UNDERCUT_AREA"].value
+        self.assertEqual(codes["UNREACHABLE_UNDERCUT_AREA"].severity, "warning")
+        self.assertGreater(unreachable, 5.0)
+        self.assertLess(unreachable, 50.0)
+        allowance = float(self.config["stock"]["finish_allowance_mm"])
+        self.assertIn("GOUGE", codes)
+        self.assertEqual(codes["GOUGE"].severity, "warning")
+        self.assertGreater(codes["GOUGE"].value, allowance)
+        self.assertLess(codes["GOUGE"].value, 25.0)
+
+    def test_early_return_paths_report_no_collision_events(self):
+        config = copy.deepcopy(self.config)
+        config["stock"]["H_stock_mm"] = 300.0
+        block = trimesh.creation.box(extents=(30.0, 30.0, 40.0))
+        block.apply_translation([0.0, 0.0, 30.0])
+        result = toolpath_sim.generate_synthetic_carve_path(
+            block, config, preset="demo"
+        )
+        self.assertEqual(result.frames, [])
+        self.assertEqual(result.collision_events, [])
+        self.assertTrue(any(d.severity == "error" for d in result.diagnostics))
+
+    # -- collision event log ----------------------------------------------
+
+    def test_collision_events_carry_frame_ranges_and_contact_geometry(self):
+        events = self.result.collision_events
+        self.assertTrue(events, "the demo baseline must log its warnings")
+        self.assertEqual(self.result.collision_log["events"], events)
+        self.assertEqual(
+            set(self.result.collision_log["codes"]),
+            {event["code"] for event in events},
+        )
+        for code, summary in self.result.collision_log["codes"].items():
+            self.assertEqual(summary["runs"], sum(1 for e in events if e["code"] == code))
+            self.assertIn("truncated", summary)
+            self.assertIn("dropped", summary)
+
+        gouges = [event for event in events if event["code"] == "GOUGE"]
+        self.assertTrue(gouges)
+        for event in gouges:
+            self.assertEqual(
+                set(event["joints"]), {"r_mm", "theta_deg", "h_mm", "phi_deg"}
+            )
+            self.assertEqual(
+                set(event["pose"]), {"tip_xyz_wax", "tool_axis_wax"}
+            )
+            self.assertEqual(len(event["pose"]["tip_xyz_wax"]), 3)
+            self.assertEqual(len(event["pose"]["tool_axis_wax"]), 3)
+            self.assertEqual(len(event["frame_range"]), 2)
+            self.assertGreaterEqual(event["frame_range"][1], event["frame_range"][0])
+            self.assertEqual(len(event["deepest_sample_xyz_wax"]), 3)
+            self.assertEqual(len(event["surface_point_xyz_wax"]), 3)
+            self.assertGreater(event["excess_mm"], 0.0)
+            self.assertGreater(event["depth_mm"], event["excess_mm"])
+            self.assertIn(
+                event["stage"], ("finishing", "finishing_link", "roughing_link")
+            )
+            # The reported surface point really is on the target surface and the
+            # deepest sample really is buried below it.
+            surface = float(
+                self.mesh.nearest.signed_distance([event["surface_point_xyz_wax"]])[0]
+            )
+            self.assertAlmostEqual(surface, 0.0, delta=1e-3)
+            buried = float(
+                self.mesh.nearest.signed_distance([event["deepest_sample_xyz_wax"]])[0]
+            )
+            self.assertAlmostEqual(buried, event["depth_mm"], delta=1e-2)
+
+        summary = next(
+            event for event in events if event["code"] == "UNREACHABLE_UNDERCUT_AREA"
+        )
+        self.assertGreater(summary["count"], 0)
+        self.assertLess(
+            summary["z_range_mm"][0], summary["z_range_mm"][1] + 1e-9
+        )
+        self.assertLess(
+            summary["theta_deg_range"][0], summary["theta_deg_range"][1] + 1e-9
+        )
+        self.assertEqual(len(summary["required_phi_deg_range"]), 2)
+        self.assertEqual(
+            summary["phi_limits_deg"],
+            [float(v) for v in self.config["limits"]["phi_limits_deg"]],
+        )
+
+
+class TestCollisionEventLog(unittest.TestCase):
+    """Unit tests for the run-capped collision log and its post-pass helpers."""
+
+    def _run(self, frame: int, depth: float) -> dict:
+        return {"code": "GOUGE", "frame_range": [frame, frame], "depth_mm": depth}
+
+    def test_deepest_runs_are_kept_and_overflow_is_recorded(self):
+        log = toolpath_sim.CollisionEventLog(max_events_per_code=2)
+        for depth, frame in ((5.0, 1), (9.0, 2), (7.0, 3), (11.0, 4), (3.0, 5)):
+            log.add_run("GOUGE", self._run(frame, depth), weight=depth)
+        payload = log.as_dict()
+        self.assertEqual(payload["max_events_per_code"], 2)
+        self.assertEqual(
+            payload["codes"]["GOUGE"], {"runs": 2, "truncated": True, "dropped": 3}
+        )
+        self.assertEqual(
+            sorted(event["depth_mm"] for event in payload["events"]), [9.0, 11.0]
+        )
+        # Kept runs stay chronological, not ranked.
+        self.assertEqual(
+            [event["frame_range"][0] for event in payload["events"]], [2, 4]
+        )
+
+    def test_no_overflow_means_no_truncation(self):
+        log = toolpath_sim.CollisionEventLog(max_events_per_code=3)
+        log.add_run("GOUGE", self._run(1, 4.0), weight=4.0)
+        payload = log.as_dict()
+        self.assertEqual(
+            payload["codes"]["GOUGE"], {"runs": 1, "truncated": False, "dropped": 0}
+        )
+
+    def test_mixed_codes_are_capped_independently(self):
+        log = toolpath_sim.CollisionEventLog(max_events_per_code=1)
+        log.add_run("GOUGE", self._run(1, 4.0), weight=4.0)
+        log.add_run(
+            "BLADE_BROADSIDE_FEED",
+            {"code": "BLADE_BROADSIDE_FEED", "frame_range": [9, 20], "length_mm": 12.0},
+            weight=12.0,
+        )
+        payload = log.as_dict()
+        self.assertEqual(payload["codes"]["GOUGE"]["dropped"], 0)
+        self.assertEqual(payload["codes"]["BLADE_BROADSIDE_FEED"]["runs"], 1)
+        self.assertEqual(
+            [event["frame_range"][0] for event in payload["events"]], [1, 9]
+        )
+
+
+class TestSampledGougeRuns(unittest.TestCase):
+    """`detect_gouges_detailed` groups consecutive *sampled* frames into runs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load_config(target_mesh=None)
+        block = trimesh.creation.box(extents=(30.0, 30.0, 40.0))
+        block.apply_translation([0.0, 0.0, 30.0])
+        cls.mesh = block
+        cls.buried = ([0.0, 0.0, 30.0], (0.0, 0.0, -1.0))
+        cls.clear = ([0.0, 0.0, 200.0], (0.0, 0.0, -1.0))
+
+    def _frames(self, buried: set[int], count: int = 260) -> tuple[list, list]:
+        frames = []
+        stages = []
+        for index in range(count):
+            tip, axis = self.buried if index in buried else self.clear
+            frames.append(
+                {
+                    "r": 60.0,
+                    "theta": 0.0,
+                    "h": 90.0,
+                    "phi": 0.0,
+                    "r_s": 60.0,
+                    "theta_s": 0.0,
+                    "z_s": float(tip[2]),
+                    "v_tip": 1.0,
+                    "is_rapid": False,
+                    "tip_xyz_wax": tip,
+                    "tool_axis_wax": axis,
+                }
+            )
+            stages.append("finishing" if index < 40 else "finishing_link")
+        return frames, stages
+
+    def test_finishing_stride_4_and_link_stride_50_group_separately(self):
+        frames, stages = self._frames({0, 4, 8, 12, 100, 150})
+        report = toolpath_sim.detect_gouges_detailed(self.mesh, frames, stages, self.config)
+        ranges = [event["frame_range"] for event in report.events]
+        self.assertEqual(ranges, [[0, 12], [100, 150]])
+        self.assertEqual([event["stage"] for event in report.events],
+                         ["finishing", "finishing_link"])
+        self.assertEqual([event["samples"] for event in report.events], [4, 2])
+        self.assertTrue(all(event["code"] == "GOUGE" for event in report.events))
+        # The single worst-depth diagnostic is still produced for the log.
+        self.assertEqual(len(report.diagnostics), 1)
+        worst = max(event["depth_mm"] for event in report.events)
+        self.assertAlmostEqual(float(report.diagnostics[0].value), worst, places=6)
+
+    def test_unsampled_frames_break_a_run(self):
+        frames, stages = self._frames({0, 4, 12})  # frame 8 is clean
+        report = toolpath_sim.detect_gouges_detailed(self.mesh, frames, stages, self.config)
+        self.assertEqual(
+            [event["frame_range"] for event in report.events], [[0, 4], [12, 12]]
+        )
+
+    def test_detect_gouges_keeps_its_public_contract(self):
+        frames, stages = self._frames({0})
+        poses = toolpath_sim.gouge_sample_poses(frames, stages)
+        self.assertEqual(poses[0]["frame"], 0)
+        self.assertEqual(poses[0]["stage"], "finishing")
+        self.assertEqual(
+            set(poses[0]["joints"]), {"r_mm", "theta_deg", "h_mm", "phi_deg"}
+        )
+        diagnostics = toolpath_sim.detect_gouges(self.mesh, poses, self.config)
+        self.assertIsInstance(diagnostics, list)
+        self.assertTrue(all(d.code == "GOUGE" for d in diagnostics))
+
+
+class TestSoftLimitPostPass(unittest.TestCase):
+    """The vectorized SOFT_LIMIT_EXCEEDED post-pass over built frames."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load_config(target_mesh=None)
+
+    def _frame(self, r=60.0, degrees=0.0, h=100.0, phi_deg=0.0) -> dict:
+        return {
+            "r": r,
+            "theta": math.radians(degrees),
+            "h": h,
+            "phi": math.radians(phi_deg),
+        }
+
+    def test_runs_are_grouped_per_axis_with_joint_context(self):
+        frames = [self._frame() for _ in range(10)]
+        frames[3]["h"] = 400.0
+        frames[4]["h"] = 450.0
+        frames[5]["h"] = 500.0
+        frames[7]["phi"] = math.radians(80.0)
+        events = toolpath_sim.soft_limit_runs(frames, self.config)
+        by_axis = {event["axis"]: event for event in events}
+        self.assertEqual(set(by_axis), {"h", "phi"})
+        vertical = by_axis["h"]
+        self.assertEqual(vertical["frame_range"], [3, 5])
+        self.assertEqual(vertical["code"], "SOFT_LIMIT_EXCEEDED")
+        h_lo, h_hi = (float(v) for v in self.config["limits"]["h_limits_mm"])
+        self.assertAlmostEqual(vertical["value"], 500.0 - h_hi, places=6)
+        self.assertEqual(vertical["limit"], [h_lo, h_hi])
+        self.assertAlmostEqual(vertical["joints"]["h_mm"], 500.0, places=6)
+        self.assertEqual(by_axis["phi"]["frame_range"], [7, 7])
+
+    def test_theta_is_compared_wrapped_to_pm_180(self):
+        # theta_limits_deg is [-170, 170]; 185 deg wraps to -175 deg and is
+        # therefore out of range, exactly like kinematics.validate_joints.
+        frames = [self._frame(degrees=185.0), self._frame(degrees=10.0)]
+        events = toolpath_sim.soft_limit_runs(frames, self.config)
+        self.assertEqual([event["frame_range"] for event in events], [[0, 0]])
+        self.assertEqual(events[0]["axis"], "theta")
+
+    def test_clean_frames_produce_no_events(self):
+        frames = [self._frame() for _ in range(50)]
+        self.assertEqual(toolpath_sim.soft_limit_runs(frames, self.config), [])
 
 
 class TestSimulationAPI(unittest.TestCase):
@@ -1271,6 +1632,142 @@ class TestPatch10APIRegressions(unittest.TestCase):
         codes = {d["code"] for d in detail["diagnostics"]}
         self.assertTrue(
             "FRAME_CAP_EXCEEDED" in codes or "SOFT_LIMIT_EXCEEDED" in codes, codes
+        )
+
+
+class TestCollisionLogAPI(unittest.TestCase):
+    """`POST /api/sculpt-and-sim` returns and persists the collision log.
+
+    The trajectory generator is patched so these assertions are deterministic
+    and fast: what is under test is the HTTP envelope, the atomic file write,
+    and the `mesh_path` / `sliders_enabled` plumbing, not the toolpath itself
+    (TestHead2Target covers the real `head_2` run).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.log_path = Path(self.tempdir.name) / "nested" / "last_collision_report.json"
+        config = load_config()
+        config["logging"]["collision_log_path"] = str(self.log_path)
+        patcher = unittest.mock.patch.object(
+            kinematics, "load_config", side_effect=lambda *a, **k: copy.deepcopy(config)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _stub(self, *, error: bool = False, events: list | None = None):
+        diagnostics = []
+        if error:
+            diagnostics = [
+                kinematics.Diagnostic(
+                    code="SOFT_LIMIT_EXCEEDED",
+                    severity="error",
+                    message="radial joint r=200.000 mm outside [-51.0, 135.0] mm",
+                    axis="r",
+                    value=200.0,
+                    frame=3,
+                )
+            ]
+        events = events or []
+        log = {
+            "max_events_per_code": 200,
+            "codes": {
+                event["code"]: {"runs": 1, "truncated": False, "dropped": 0}
+                for event in events
+            },
+            "events": events,
+        }
+        return toolpath_sim.ToolpathResult(
+            frames=[],
+            diagnostics=diagnostics,
+            preset="demo",
+            collision_events=events,
+            collision_log=log,
+        )
+
+    def _post(self, payload: dict, stub):
+        with unittest.mock.patch.object(
+            toolpath_sim, "generate_synthetic_carve_path", return_value=stub
+        ):
+            return self.client.post("/api/sculpt-and-sim", json=payload)
+
+    def test_200_returns_and_writes_the_collision_log(self):
+        events = [
+            {"code": "GOUGE", "frame_range": [10, 22], "depth_mm": 4.5},
+            {"code": "UNREACHABLE_UNDERCUT_AREA", "count": 12},
+        ]
+        response = self._post({"preset": "demo"}, self._stub(events=events))
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertFalse(body["sliders_enabled"])
+        self.assertEqual(body["collision_log"]["events"], events)
+        self.assertEqual(body["collision_log"]["status"], "ok")
+        self.assertEqual(body["collision_log"]["preset"], "demo")
+        written = json.loads(self.log_path.read_text(encoding="utf-8"))
+        self.assertEqual(written, body["collision_log"])
+        self.assertEqual(
+            sorted(p.name for p in self.log_path.parent.iterdir()),
+            ["last_collision_report.json"],
+            "the log is written by atomic replace, not a leftover temp file",
+        )
+
+    def test_trajectory_422_returns_and_writes_the_collision_log(self):
+        events = [{"code": "SOFT_LIMIT_EXCEEDED", "axis": "r", "frame_range": [3, 3]}]
+        response = self._post({"preset": "demo"}, self._stub(error=True, events=events))
+        self.assertEqual(response.status_code, 422, response.text)
+        detail = response.json()["detail"]
+        self.assertEqual(detail["status"], "error")
+        self.assertEqual(detail["collision_log"]["events"], events)
+        self.assertEqual(detail["collision_log"]["status"], "error")
+        self.assertTrue(
+            any(d["code"] == "SOFT_LIMIT_EXCEEDED" for d in detail["diagnostics"])
+        )
+        written = json.loads(self.log_path.read_text(encoding="utf-8"))
+        self.assertEqual(written, detail["collision_log"])
+
+    def test_non_trajectory_422_returns_a_null_collision_log(self):
+        response = self.client.post(
+            "/api/sculpt-and-sim", json={"tool_cfg": {"heated_length_mm": 99.0}}
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        detail = response.json()["detail"]
+        self.assertIsNone(detail["collision_log"])
+        self.assertEqual(detail["diagnostics"][0]["code"], "TOOL_CFG_INVALID")
+        self.assertFalse(self.log_path.exists())
+
+    def test_frame_cap_422_returns_a_null_collision_log(self):
+        with unittest.mock.patch.object(
+            toolpath_sim,
+            "generate_synthetic_carve_path",
+            side_effect=toolpath_sim.FrameCapExceededError(300_000, 250_000),
+        ):
+            response = self.client.post("/api/sculpt-and-sim", json={"preset": "demo"})
+        self.assertEqual(response.status_code, 422, response.text)
+        detail = response.json()["detail"]
+        self.assertIsNone(detail["collision_log"])
+        self.assertEqual(detail["diagnostics"][0]["code"], "FRAME_CAP_EXCEEDED")
+
+    def test_mesh_path_traversal_is_rejected(self):
+        for value in ("../machine_config.json", "/etc/passwd", "sub/../../machine_config.json"):
+            response = self.client.post(
+                "/api/sculpt-and-sim", json={"preset": "demo", "mesh_path": value}
+            )
+            self.assertEqual(response.status_code, 422, f"{value}: {response.text}")
+            self.assertIsNone(response.json()["detail"]["collision_log"])
+
+    def test_mesh_path_selects_the_mesh_keyed_landmarks(self):
+        response = self._post(
+            {"preset": "demo", "mesh_path": "base_head.stl"}, self._stub()
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["sliders_enabled"])
+        self.assertEqual(
+            response.json()["config"]["target_mesh"]["path"], "presets/base_head.stl"
         )
 
 
