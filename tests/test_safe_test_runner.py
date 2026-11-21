@@ -10,6 +10,7 @@ from __future__ import annotations
 import fcntl
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -230,6 +231,44 @@ class RunnerTest(unittest.TestCase):
         )
         self.assertEqual(process.returncode, 0, self.output(process))
         self.assertIn("available_mb=7000", self.output(process))
+
+    def test_floor_cannot_drop_below_the_address_space_cap(self):
+        env = self.env(
+            SAFE_TEST_MIN_AVAIL_MB="0",
+            SAFE_TEST_AS_KB=str(4 * 1024 * 1024),
+            SAFE_TEST_MEMINFO=str(self.write_meminfo(3000)),
+        )
+        process = self.run_runner(f"tests/{PROBE_MODULE}.py", env=env)
+        self.assertEqual(process.returncode, 75, self.output(process))
+        self.assertIn("threshold_mb=4608", self.output(process))
+        self.assertFalse(self.probe_log.exists(), "the cap-coupled floor must refuse")
+
+    def test_floor_is_coupled_to_a_larger_address_space_cap(self):
+        env = self.env(
+            SAFE_TEST_MIN_AVAIL_MB="4096",
+            SAFE_TEST_AS_KB=str(6 * 1024 * 1024),
+            SAFE_TEST_MEMINFO=str(self.write_meminfo(6000)),
+        )
+        process = self.run_runner(f"tests/{PROBE_MODULE}.py", env=env)
+        self.assertEqual(process.returncode, 75, self.output(process))
+        self.assertIn("threshold_mb=6656", self.output(process))
+        self.assertFalse(self.probe_log.exists())
+
+    def test_missing_virtualenv_exits_1(self):
+        repo = self.dir / "no-venv"
+        (repo / "scripts").mkdir(parents=True)
+        script = repo / "scripts" / "safe-test.sh"
+        shutil.copy2(RUNNER, script)
+        process = subprocess.run(
+            [str(script)],
+            cwd=repo,
+            env=self.env(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(process.returncode, 1, self.output(process))
+        self.assertIn(".venv/bin/python", self.output(process))
 
     def test_low_memory_refuses_and_releases_the_lock(self):
         low = self.env(

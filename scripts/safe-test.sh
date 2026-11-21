@@ -37,6 +37,25 @@ for argument in "$@"; do
     esac
 done
 
+if [ ! -x .venv/bin/python ]; then
+    echo "safe-test: .venv/bin/python is missing or not executable; create the virtualenv first" >&2
+    exit 1
+fi
+
+if ! [[ "$AS_KB" =~ ^[0-9]+$ && "$MIN_AVAIL_MB" =~ ^[0-9]+$ ]]; then
+    echo "safe-test: SAFE_TEST_AS_KB and SAFE_TEST_MIN_AVAIL_MB must be integers" >&2
+    exit 1
+fi
+
+# A run may not start with less headroom than its own address-space cap (plus
+# a small margin for the interpreter and fixtures), however low
+# SAFE_TEST_MIN_AVAIL_MB is set.
+CAP_FLOOR_MB=$(( AS_KB / 1024 + 512 ))
+EFFECTIVE_FLOOR_MB=$MIN_AVAIL_MB
+if [ "$CAP_FLOOR_MB" -gt "$EFFECTIVE_FLOOR_MB" ]; then
+    EFFECTIVE_FLOOR_MB=$CAP_FLOOR_MB
+fi
+
 if ! exec 9>"$LOCK"; then
     echo "safe-test: cannot open lock $LOCK" >&2
     exit 75
@@ -115,9 +134,9 @@ if ! [[ "$AVAIL_MB" =~ ^[0-9]+$ ]]; then
     exit 75
 fi
 
-echo "safe-test: available_mb=${AVAIL_MB} threshold_mb=${MIN_AVAIL_MB}"
-if [ "$AVAIL_MB" -lt "$MIN_AVAIL_MB" ]; then
-    echo "safe-test: only ${AVAIL_MB} MiB available (< ${MIN_AVAIL_MB} MiB); refusing to run" >&2
+echo "safe-test: available_mb=${AVAIL_MB} threshold_mb=${EFFECTIVE_FLOOR_MB}"
+if [ "$AVAIL_MB" -lt "$EFFECTIVE_FLOOR_MB" ]; then
+    echo "safe-test: only ${AVAIL_MB} MiB available (< ${EFFECTIVE_FLOOR_MB} MiB); refusing to run" >&2
     exit 75
 fi
 

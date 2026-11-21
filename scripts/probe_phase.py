@@ -1,13 +1,17 @@
 """One-shot phase probe for the sculpted base_head `demo` spike (D7 / task 2.1).
 
-Not part of discovery (the module name does not match ``test*.py``) and skipped
-unless ``RUN_PHASE_PROBE=1``. Run it once through the guarded runner:
+Tooling, not a test: it is excluded from discovery and skipped unless
+``RUN_PHASE_PROBE=1``. It runs the same phase sequence as
+``generate_synthetic_carve_path`` and writes per-phase wall time and peak RSS to
+``PHASE_PROBE_OUT`` (JSON) plus stdout.
 
-    RUN_PHASE_PROBE=1 SAFE_TEST_AS_KB=6291456 SAFE_TEST_MIN_AVAIL_MB=2048 \
-      SAFE_TEST_BUDGET_MB=8192 scripts/safe-test.sh tests/_phase_probe.py
+Contain it with an explicit cap (the runner only accepts ``tests/`` targets):
 
-It runs the same phase sequence as ``generate_synthetic_carve_path`` and writes
-per-phase wall time and peak RSS to ``PHASE_PROBE_OUT`` (JSON) plus stdout.
+    ( ulimit -S -v 6291456; RUN_PHASE_PROBE=1 \
+        .venv/bin/python scripts/probe_phase.py )
+
+``scripts/safe-test.sh`` was used for the recorded 2.1 evidence while the probe
+lived under ``tests/``; the numbers are in ``patch.md``.
 """
 
 from __future__ import annotations
@@ -16,15 +20,19 @@ import gc
 import json
 import os
 import resource
+import sys
 import time
 import unittest
 from pathlib import Path
 
-import kinematics
-import face_sculpt
-import toolpath_sim
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import kinematics  # noqa: E402
+import face_sculpt  # noqa: E402
+import toolpath_sim  # noqa: E402
+
 OUT = Path(
     os.environ.get(
         "PHASE_PROBE_OUT",

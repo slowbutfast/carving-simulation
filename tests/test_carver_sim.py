@@ -495,7 +495,7 @@ class TestFacialSculpting(ReleasesClassFixtures, unittest.TestCase):
 class TestSyntheticToolpaths(ReleasesClassFixtures, unittest.TestCase):
     """The toolpath invariants on the 40 mm short-stock fixture (default tier)."""
 
-    _class_fixtures = ("mesh", "sculpt", "result")
+    _class_fixtures = ("config", "mesh", "sculpt", "result")
 
     @classmethod
     def setUpClass(cls):
@@ -771,6 +771,9 @@ class TestTiers(unittest.TestCase):
             )
 
     def test_default_tier_sample_never_generates_on_a_real_target(self):
+        # Run the actual default-tier classes, not a synthetic self-call. The
+        # short-stock fixture reuses the analytic head's topology, so the vertex
+        # count alone cannot tell it apart from `base_head.stl`; the bounds do.
         real = []
         for name in ("base_head.stl", "head_2.stl"):
             mesh = trimesh.load(ROOT / "presets" / name, force="mesh")
@@ -783,8 +786,6 @@ class TestTiers(unittest.TestCase):
                 for count, expected in real
             )
 
-        config = short_stock_config()
-        mesh = short_stock_target(config, {"nose": 1.0, "chin": 0.6, "brow": 0.4})
         seen = []
         original = toolpath_sim.generate_synthetic_carve_path
 
@@ -792,16 +793,29 @@ class TestTiers(unittest.TestCase):
             seen.append(target)
             return original(target, *args, **kwargs)
 
+        cases = (
+            TestSyntheticToolpaths,
+            TestHead2Target,
+            TestSimulationAPI,
+            TestPatch10APIRegressions,
+        )
+        suite = unittest.TestSuite(
+            unittest.defaultTestLoader.loadTestsFromTestCase(case) for case in cases
+        )
+
         with unittest.mock.patch.object(
             toolpath_sim, "generate_synthetic_carve_path", side_effect=probe
         ):
-            result = toolpath_sim.generate_synthetic_carve_path(
-                mesh, config, preset="demo"
-            )
+            result = unittest.TestResult()
+            suite.run(result)
 
-        self.assertGreater(len(result.frames), 0)
-        self.assertTrue(seen)
-        self.assertFalse([target for target in seen if is_real_target(target)])
+        self.assertTrue(result.wasSuccessful(), (result.failures, result.errors))
+        self.assertTrue(seen, "the default sample generated no toolpaths at all")
+        self.assertEqual(
+            [target for target in seen if is_real_target(target)],
+            [],
+            "the default tier generated on a real target mesh",
+        )
 
 
 class TestFixtureRelease(unittest.TestCase):
@@ -1853,6 +1867,42 @@ class TestPatch10APIRegressions(ReleasesClassFixtures, unittest.TestCase):
         detail = response.json()["detail"]
         codes = {d["code"] for d in detail["diagnostics"]}
         self.assertIn("FRAME_CAP_EXCEEDED", codes, codes)
+
+    def test_soft_limit_exceeded_maps_to_422(self):
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        config = load_config()
+        config["logging"]["collision_log_path"] = str(
+            Path(tempdir.name) / "last_collision_report.json"
+        )
+        stub = _stub_toolpath_result(config)
+        stub.diagnostics = [
+            kinematics.Diagnostic(
+                code="SOFT_LIMIT_EXCEEDED",
+                severity="error",
+                message="radial joint r=200.000 mm outside [-51.0, 135.0] mm",
+                axis="r",
+                value=200.0,
+                frame=1,
+            )
+        ]
+        with unittest.mock.patch.object(
+            kinematics,
+            "load_config",
+            side_effect=lambda *args, **kwargs: copy.deepcopy(config),
+        ), unittest.mock.patch.object(
+            toolpath_sim, "generate_synthetic_carve_path", return_value=stub
+        ):
+            response = self.client.post(
+                "/api/sculpt-and-sim", json={"sliders": {}, "preset": "demo"}
+            )
+        self.assertEqual(response.status_code, 422, response.text)
+        detail = response.json()["detail"]
+        self.assertEqual(detail["status"], "error")
+        self.assertIn(
+            "SOFT_LIMIT_EXCEEDED", {d["code"] for d in detail["diagnostics"]}
+        )
+        self.assertEqual(detail["collision_log"]["status"], "error")
 
 
 class TestCollisionLogAPI(ReleasesClassFixtures, unittest.TestCase):

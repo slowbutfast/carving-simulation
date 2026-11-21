@@ -29,6 +29,14 @@
 
 - [x] 4.1 `scripts/safe-test.sh` (default tier, no args): all pass, `peak_rss_mb <= 1536`, `wall_s <= 600`; record the summary line verbatim
 - [x] 4.2 `scripts/safe-test.sh --node`: 32 pass / 0 fail / 1 skip
-- [x] 4.3 Heavy tier once, serialised: `RUN_HEAVY_TESTS=1 SAFE_TEST_AS_KB=8388608 SAFE_TEST_MIN_AVAIL_MB=9216 SAFE_TEST_BUDGET_MB=8192 scripts/safe-test.sh`; record the outcome (pass, or a clean `MemoryError` tied to the 2.1 follow-up)
+- [ ] 4.3 Heavy tier once, serialised: `RUN_HEAVY_TESTS=1 SAFE_TEST_AS_KB=8388608 SAFE_TEST_MIN_AVAIL_MB=9216 SAFE_TEST_BUDGET_MB=8192 scripts/safe-test.sh`; record the outcome (pass, or a clean `MemoryError` tied to the 2.1 follow-up)
 - [x] 4.4 Confirm every assertion removed from the default tier is covered by a `@heavy` test or a fixture-based equivalent; list the mapping in `verification.md`
 - [x] 4.5 `openspec validate test-memory-scoping --strict`; populate `verification.md` (Requirement Adherence Matrix, the 2.1 phase table, before/after peak RSS and wall time against `rss.log`, verbatim runner summary lines)
+
+## Patch 01: PR #5 Review Fixes (Real-Suite Tier Probe, Floor-to-Cap Coupling & Verification Reconciliation)
+
+- [x] P01.1 Scaffold failing tests in `tests/test_safe_test_runner.py` (floor clamped to `max(MIN_AVAIL_MB, AS_KB/1024 + 512)`, missing `.venv` exits `1`) and `tests/test_carver_sim.py` (stubbed HTTP 422 `SOFT_LIMIT_EXCEEDED`; `TestTiers` runs `TestSyntheticToolpaths`, `TestHead2Target`, `TestSimulationAPI`, `TestPatch10APIRegressions` under probe)
+- [x] P01.2 Fix `scripts/safe-test.sh` (enforce `effective_floor = max(MIN_AVAIL_MB, AS_KB / 1024 + 512)`, hard-fail `exit 1` on missing `.venv/bin/python`) and update `AGENTS.md` (`Never` forbids lowering `SAFE_TEST_MIN_AVAIL_MB`)
+- [x] P01.3 Fix `tests/test_carver_sim.py` (`TestTiers` real-suite probe matching by vertex count, `"config"` in `TestSyntheticToolpaths._class_fixtures`, stubbed 422 `SOFT_LIMIT_EXCEEDED`) and move `tests/_phase_probe.py` to `scripts/probe_phase.py`
+- [x] P01.4 Run `scripts/safe-test.sh` (default tier), `scripts/safe-test.sh --node`, and (if `>= 9216 MiB` available) Task 4.3 with the prescribed `9216 MiB` floor; otherwise keep 4.3 unchecked/marked headroom-blocked
+- [x] P01.5 Fix `verification.md` wording (`2048` vs `4521`), update execution logs and `openspec validate test-memory-scoping --strict --json`, and mark `PATCH-01` `VERIFIED` in `patch.md`
