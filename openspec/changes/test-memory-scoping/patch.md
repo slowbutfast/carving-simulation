@@ -6,12 +6,19 @@ Run once, through the guarded runner, on the sculpted analytic base head
 (`{"nose": 1.0, "chin": 0.6, "brow": 0.4}`, `target_mesh=None`, preset `demo`):
 
 ```bash
-# Recorded while the probe lived under tests/ and ran through the runner.
-# PATCH-01 moved it to scripts/probe_phase.py; run it there with an explicit
-# cap: ( ulimit -S -v 6291456; RUN_PHASE_PROBE=1 \
-#          .venv/bin/python scripts/probe_phase.py )
+# HISTORICAL / EXPLORATORY — do not rerun.
+# Recorded before the cap-coupled floor existed. SAFE_TEST_MIN_AVAIL_MB=2048 is
+# now clamped up to AS_KB/1024 + 512 (6,656 MiB for this 6 GiB cap), so the
+# runner refuses that command on the shared container.
 RUN_PHASE_PROBE=1 SAFE_TEST_AS_KB=6291456 SAFE_TEST_MIN_AVAIL_MB=2048 \
   SAFE_TEST_BUDGET_MB=8192 scripts/safe-test.sh tests/_phase_probe.py
+```
+
+Current guarded invocation (probe lives under `tests/` again):
+
+```bash
+RUN_PHASE_PROBE=1 SAFE_TEST_AS_KB=6291456 \
+  scripts/safe-test.sh tests/_phase_probe.py
 ```
 
 Reference container: cgroup v1, 12 GiB limit, 3 vCPU; 3,094 MiB available by the
@@ -113,4 +120,49 @@ frames, and roughing/finishing/rapid stages are all populated.
   - Task 4.3 attempted with the prescribed `SAFE_TEST_MIN_AVAIL_MB=9216` floor:
     refused at 4,889 MiB available (exit `75`). **4.3 remains unchecked** and is
     documented as headroom-blocked in `verification.md`.
+  - `openspec validate test-memory-scoping --strict`: valid, 0 issues.
+
+---
+
+### [PATCH-02] Height-Based `is_real_target` Matcher, Restore Probe Under Runner & Task 4.3 Disposition
+
+- **Date**: 2026-11-22 00:16:00 UTC
+- **Feedback Source**: Code Review (PR #5 at `b7979d24` — `REQUEST CHANGES`)
+- **Feedback Summary**:
+  - **Important (3)**:
+    1. `tests/test_carver_sim.py:773-805` (`is_real_target`): Checking all 3D bounds within `1.0 mm` returns `False` when facial sliders shift `base_head` extremes (`max-x` moves `5.6 mm` on `nose=1.0, chin=0.6, brow=0.4`), hiding the exact 3.5 GB OOM case. Match on `(len(vertices), extents[2] within 10%)` and self-test `is_real_target` against sculpted `base_head` (`True`), `head_2` (`True`), and `short_stock_target` (`False`).
+    2. `scripts/probe_phase.py:8-14`: Moving the probe out of `tests/` put it outside `scripts/safe-test.sh`, causing its docstring to instruct a raw `ulimit` invocation without `flock` or the memory floor. Move it back to `tests/_phase_probe.py` (gated on `RUN_PHASE_PROBE=1`) and restore the `scripts/safe-test.sh` docstring command.
+    3. `openspec/changes/test-memory-scoping/tasks.md:32` & `verification.md`: Task 4.3 remains blocked at `4,889 MiB` vs `9,216 MiB` floor; either run 4.3 if `>= 9,216 MiB` is available, or formally record its waiver/deferral to `toolpath-memory` in `verification.md` (and `architecture.md`/`tasks.md`).
+  - **Nit (1)**:
+    4. `openspec/changes/test-memory-scoping/patch.md:8-11`: Label the historical `SAFE_TEST_MIN_AVAIL_MB=2048` phase-probe command clearly as historical/exploratory (do not rerun).
+- **Reported Issue / Raw Trace**:
+  ```
+  PR #5 Verdict: REQUEST CHANGES (b7979d24)
+  - tests/test_carver_sim.py:782-787: is_real_target returns False for sculpted base_head (max-x shifts 5.6 mm)
+  - scripts/probe_phase.py:8-14: raw ulimit invocation skips flock and memory floor
+  - tasks.md:32 (Task 4.3): blocked at 4,889 MiB vs 9,216 MiB floor
+  ```
+- **Root Cause**:
+  - `is_real_target` compared full `mesh.bounds` with `atol=1.0`, which breaks under facial slider deformations.
+  - Moving `_phase_probe.py` to `scripts/` bypassed `scripts/safe-test.sh` (which only accepts `tests/` targets).
+- **Target Files**: `tests/test_carver_sim.py`, `tests/_phase_probe.py` (moved from `scripts/probe_phase.py`), `openspec/changes/test-memory-scoping/patch.md`, `openspec/changes/test-memory-scoping/verification.md`, `openspec/changes/test-memory-scoping/tasks.md`
+- **Resolution Strategy**:
+  - Update `is_real_target` to match `(len(mesh.vertices), float(mesh.extents[2]))` with `abs(height - expected_h) < 0.1 * expected_h`, and assert `is_real_target` on sculpted `base_head`, `head_2`, and `short_stock_target`.
+  - Move `scripts/probe_phase.py` back to `tests/_phase_probe.py` and restore `scripts/safe-test.sh tests/_phase_probe.py` in its docstring.
+  - Mark the historical `2048` command in `patch.md` as exploratory/do-not-rerun, and either execute Task 4.3 with `9216 MiB` if free or record its formal deferral to `toolpath-memory` in `verification.md`.
+- **Status**: VERIFIED
+- **Verification (2026-11-22)**:
+  - 3-mesh self-test reproduced the defect first: the bounds matcher returned
+    `False` for the sculpted `base_head`; `(vertex count, extents[2])` within
+    10% returns `True` for sculpted `base_head` and `head_2`, `False` for the
+    short-stock fixture.
+  - `scripts/safe-test.sh tests/test_carver_sim.py`: `158 tests, OK
+    (skipped=19)`, `peak_rss_mb=356 wall_s=254`, exit 0.
+  - `scripts/safe-test.sh --node`: 32 pass / 0 fail / 1 skip.
+  - Task 4.3 attempted with the prescribed `SAFE_TEST_MIN_AVAIL_MB=9216` floor:
+    refused at 4,784 MiB available (exit `75`). Formally deferred to
+    `toolpath-memory` and documented in `verification.md`; 4.3 stays unchecked.
+  - `tests/_phase_probe.py` restored under `tests/` with the
+    `scripts/safe-test.sh` invocation; the historical `2048` command is labelled
+    do-not-rerun in `patch.md`.
   - `openspec validate test-memory-scoping --strict`: valid, 0 issues.

@@ -29,7 +29,7 @@
 
 - [x] 4.1 `scripts/safe-test.sh` (default tier, no args): all pass, `peak_rss_mb <= 1536`, `wall_s <= 600`; record the summary line verbatim
 - [x] 4.2 `scripts/safe-test.sh --node`: 32 pass / 0 fail / 1 skip
-- [ ] 4.3 Heavy tier once, serialised: `RUN_HEAVY_TESTS=1 SAFE_TEST_AS_KB=8388608 SAFE_TEST_MIN_AVAIL_MB=9216 SAFE_TEST_BUDGET_MB=8192 scripts/safe-test.sh`; record the outcome (pass, or a clean `MemoryError` tied to the 2.1 follow-up)
+- [ ] 4.3 Heavy tier once, serialised: `RUN_HEAVY_TESTS=1 SAFE_TEST_AS_KB=8388608 SAFE_TEST_MIN_AVAIL_MB=9216 SAFE_TEST_BUDGET_MB=8192 scripts/safe-test.sh`; record the outcome (pass, or a clean `MemoryError` tied to the 2.1 follow-up). **Deferred to the `toolpath-memory` follow-up change: headroom-blocked on the shared container (4,889 MiB available < 9,216 MiB floor) unless `>= 9,216 MiB` is available.**
 - [x] 4.4 Confirm every assertion removed from the default tier is covered by a `@heavy` test or a fixture-based equivalent; list the mapping in `verification.md`
 - [x] 4.5 `openspec validate test-memory-scoping --strict`; populate `verification.md` (Requirement Adherence Matrix, the 2.1 phase table, before/after peak RSS and wall time against `rss.log`, verbatim runner summary lines)
 
@@ -40,3 +40,10 @@
 - [x] P01.3 Fix `tests/test_carver_sim.py` (`TestTiers` real-suite probe matching by vertex count, `"config"` in `TestSyntheticToolpaths._class_fixtures`, stubbed 422 `SOFT_LIMIT_EXCEEDED`) and move `tests/_phase_probe.py` to `scripts/probe_phase.py`
 - [x] P01.4 Run `scripts/safe-test.sh` (default tier), `scripts/safe-test.sh --node`, and (if `>= 9216 MiB` available) Task 4.3 with the prescribed `9216 MiB` floor; otherwise keep 4.3 unchecked/marked headroom-blocked
 - [x] P01.5 Fix `verification.md` wording (`2048` vs `4521`), update execution logs and `openspec validate test-memory-scoping --strict --json`, and mark `PATCH-01` `VERIFIED` in `patch.md`
+
+## Patch 02: Height-Based Tier Matcher, Probe Under Runner & Task 4.3 Disposition
+
+- [x] P02.1 Scaffold failing self-test assertions in `tests/test_carver_sim.py` (`TestTiers`) checking `is_real_target(sculpted_base_head) is True`, `is_real_target(head_2) is True`, and `is_real_target(short_stock_target) is False`
+- [x] P02.2 Update `is_real_target` in `tests/test_carver_sim.py` to match `(len(mesh.vertices), extents[2])` within `10%` height tolerance, and move `scripts/probe_phase.py` back to `tests/_phase_probe.py` with `scripts/safe-test.sh tests/_phase_probe.py` docstring
+- [x] P02.3 Label the historical `SAFE_TEST_MIN_AVAIL_MB=2048` command in `patch.md` as exploratory/do-not-rerun, and document Task 4.3's deferral to `toolpath-memory` in `verification.md` (or run 4.3 if `>= 9,216 MiB` is available)
+- [x] P02.4 Run `scripts/safe-test.sh` (default tier), `scripts/safe-test.sh --node`, and `openspec validate test-memory-scoping --strict --json`; mark `PATCH-02` `VERIFIED` in `patch.md`

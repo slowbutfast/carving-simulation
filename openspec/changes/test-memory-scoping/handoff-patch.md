@@ -1,71 +1,58 @@
-# Surgical Patch Handoff: OpenSpec Change 'test-memory-scoping' [PATCH-01]
+# Surgical Patch Handoff: OpenSpec Change 'test-memory-scoping' [PATCH-02]
 
 ## 1. Executive Objective & Diagnostic Feedback
 - **Change Name**: `test-memory-scoping`
-- **Patch ID**: `PATCH-01`
-- **Objective**: Fix the 3 Important and 4 Nit PR #5 review findings across `tests/test_carver_sim.py`, `scripts/safe-test.sh`, `tests/test_safe_test_runner.py`, `AGENTS.md`, `scripts/probe_phase.py`, `verification.md`, and `tasks.md`—without touching production code.
+- **Patch ID**: `PATCH-02`
+- **Objective**: Fix `is_real_target` in `tests/test_carver_sim.py` to match `(len(vertices), extents[2])` with a 3-mesh self-test, move `scripts/probe_phase.py` back to `tests/_phase_probe.py` under `scripts/safe-test.sh`, label the historical `2048` probe command in `patch.md` as exploratory/do-not-rerun, and document Task 4.3's deferral to `toolpath-memory` in `verification.md` (unless `>= 9,216 MiB` is available).
 - **Feedback & Diagnostic Trace**:
   ```
-  PR #5 Verdict: REQUEST CHANGES (d5def8f)
-  Important:
-  1. tests/test_carver_sim.py:773-805 (TestTiers.test_default_tier_sample_never_generates_on_a_real_target):
-     Patches generator and calls it directly with short-stock mesh; never runs default-tier classes
-     under the probe (and wastes ~26 s).
-  2. scripts/safe-test.sh:19-25,118-122 & AGENTS.md:46-51:
-     SAFE_TEST_MIN_AVAIL_MB was lowered to 2048 under 6 GiB / 8 GiB AS_KB caps (heavy tier peaked
-     at 5,919 MiB with 4,521 MiB available). Enforce effective_floor = max(MIN_AVAIL_MB, AS_KB/1024 + 512)
-     and forbid lowering SAFE_TEST_MIN_AVAIL_MB in AGENTS.md.
-  3. openspec/changes/test-memory-scoping/verification.md:27-48 & tasks.md:32:
-     Task 4.3 was ticked [x] despite the 9,216 MiB floor refusing to run at 4,521 MiB headroom, and
-     verification.md misstated 2048 as "above the measured page-cache-excluded headroom".
-  Nits:
-  4. tests/test_carver_sim.py:1836+: Restore HTTP 422 SOFT_LIMIT_EXCEEDED coverage via stubbed test.
-  5. scripts/safe-test.sh:53-55: Missing .venv/bin/python should exit 1 (hard fail), not 75.
-  6. tests/test_carver_sim.py:498: Add "config" to TestSyntheticToolpaths._class_fixtures.
-  7. Move tests/_phase_probe.py to scripts/probe_phase.py.
+  PR #5 Verdict: REQUEST CHANGES (b7979d24)
+  1. tests/test_carver_sim.py:782-787 (is_real_target): comparing full mesh.bounds with atol=1.0
+     returns False on sculpted base_head (max-x shifts 5.6 mm on nose=1.0, chin=0.6, brow=0.4).
+  2. scripts/probe_phase.py:8-14: moving probe out of tests/ led to a raw ulimit docstring
+     that bypasses flock and the memory floor.
+  3. patch.md:8-11: still shows historical tests/_phase_probe.py + SAFE_TEST_MIN_AVAIL_MB=2048
+     command without labelling it as historical/do-not-rerun.
+  4. tasks.md:32 (Task 4.3): blocked at 4,889 MiB vs 9,216 MiB floor; document formal deferral
+     to toolpath-memory in verification.md (or run 4.3 if >= 9,216 MiB is available).
   ```
 - **Root Cause Analysis**:
-  - `TestTiers` tested a synthetic self-call rather than loading and running the actual default-tier classes via `unittest.defaultTestLoader`.
-  - `scripts/safe-test.sh` checked `MIN_AVAIL_MB` independently of `AS_KB` and did not pre-check `.venv/bin/python`.
-  - `verification.md` / `tasks.md` 4.3 recorded a floor-overridden heavy run as if it satisfied the prescribed 9,216 MiB command.
+  - `is_real_target` used 3D bounding-box equality (`atol=1.0`), which breaks when facial sliders displace vertices radially/laterally.
+  - `scripts/probe_phase.py` was moved outside `tests/`, which `scripts/safe-test.sh` requires for target paths.
 
 ## 2. Strict Target Context Map
 | File Path (relative to repo root) | Target Lines | Modification Summary |
 |---|---|---|
-| `scripts/safe-test.sh` | `L19-L25, L52-L56, L118-L122` | Check `[ -x .venv/bin/python ]` before the memory probe and exit `1` with an explicit error if missing. Compute `effective_floor = max(MIN_AVAIL_MB, AS_KB / 1024 + 512)` and enforce `AVAIL_MB -lt effective_floor` (printing `effective_floor` as `threshold_mb`). |
-| `tests/test_safe_test_runner.py` | `[APPEND]` | Add tests proving: (1) lowering `SAFE_TEST_MIN_AVAIL_MB` below `AS_KB/1024 + 512` is clamped up to `AS_KB/1024 + 512` and refuses with exit `75`, and (2) missing `.venv/bin/python` exits `1` (not `75`). |
-| `AGENTS.md` | `L46-L53` | Add `- Lowering SAFE_TEST_MIN_AVAIL_MB below the cap-coupled floor.` under `## Never`. |
-| `tests/test_carver_sim.py` | `L498, L753-L805, L1836+` | Add `"config"` to `TestSyntheticToolpaths._class_fixtures`. Rewrite `TestTiers.test_default_tier_sample_never_generates_on_a_real_target` to load `TestSyntheticToolpaths`, `TestHead2Target`, `TestSimulationAPI`, and `TestPatch10APIRegressions` via `unittest.defaultTestLoader` and run them under the `generate_synthetic_carve_path` probe, asserting zero calls with real-target vertex counts (`base_head.stl` / `head_2.stl`). Add a cheap stubbed test in `TestPatch10APIRegressions` returning a `SOFT_LIMIT_EXCEEDED` result and asserting HTTP 422. |
-| `tests/_phase_probe.py` $\to$ `scripts/probe_phase.py` | `[MOVE]` | Move `tests/_phase_probe.py` to `scripts/probe_phase.py` (update any docstring/reference if present). |
-| `openspec/changes/test-memory-scoping/verification.md` & `tasks.md` | `L27-L48` / `L32` | Fix `verification.md` wording (`2048` was *below* `4,521` headroom, not above). Re-run Task 4.3 with the prescribed `SAFE_TEST_MIN_AVAIL_MB=9216` **only if** `>= 9,216 MiB` is genuinely available; otherwise leave Task 4.3 unchecked (`[ ]`) and explicitly document it as headroom-blocked until `toolpath-memory` lowers the cap. |
+| `tests/test_carver_sim.py` | `L773-L818` | Update `real` to store `(len(mesh.vertices), float(mesh.extents[2]))`, update `is_real_target(mesh)` to check `len(mesh.vertices) == count and abs(float(mesh.extents[2]) - expected_h) < 0.1 * expected_h`, and add explicit self-test assertions for `is_real_target(sculpted_base_head) is True`, `is_real_target(head_2) is True`, and `is_real_target(short_stock_target) is False`. |
+| `scripts/probe_phase.py` $\to$ `tests/_phase_probe.py` | `[MOVE]`, `L1-L30` | Move `scripts/probe_phase.py` back to `tests/_phase_probe.py` (update `ROOT = Path(__file__).resolve().parents[1]`, keep `RUN_PHASE_PROBE=1` gate), and restore `RUN_PHASE_PROBE=1 SAFE_TEST_AS_KB=6291456 scripts/safe-test.sh tests/_phase_probe.py` in its docstring. |
+| `openspec/changes/test-memory-scoping/patch.md` | `L5-L15` & `PATCH-02` | Label the `SAFE_TEST_MIN_AVAIL_MB=2048` snippet in section `2.1` as a **historical/exploratory** command (do not rerun; superseded by cap-coupled floor), and mark `PATCH-02` `VERIFIED` after suites pass. |
+| `openspec/changes/test-memory-scoping/verification.md` | `L27-L48` | Document Task 4.3's formal deferral to the `toolpath-memory` follow-up change (which lowers `build_finishing`'s ~3.3 GB transient so the heavy cap/floor fits the shared 12 GiB container) unless `>= 9,216 MiB` is available to run 4.3 cleanly. |
 
 ## 3. Blast Radius & Invariant Guardrails
 - **STRICT BLAST RADIUS**: Modify ONLY the files and line ranges specified in the Target Context Map.
 - **FORBIDDEN**:
   - Do NOT modify any production code (`toolpath_sim.py`, `kinematics.py`, `face_sculpt.py`, `server.py`, `tool_model.py`, `static/*`).
-  - Do NOT lower `SAFE_TEST_MIN_AVAIL_MB` below `9216` to force Task 4.3 to run.
+  - Do NOT modify `scripts/safe-test.sh` or `AGENTS.md`.
+  - Do NOT lower `SAFE_TEST_MIN_AVAIL_MB` below `9216`.
   - Do NOT modify `.env` or credential files.
-- **INVARIANTS TO PRESERVE**:
-  - Default tier (`scripts/safe-test.sh`) must remain `<= 1536 MiB` peak RSS and `<= 600 s` wall time.
-  - `scripts/safe-test.sh --node` must remain `32 pass / 0 fail / 1 skip`.
 
 ## 4. Visual & UI Impact
 - Status: Non-visual patch. No CSS, HTML, or `DESIGN.md` token modifications permitted.
 
 ## 5. Reproduction & Verification Protocol
 1. **Reproduce First**:
-   - Add the new failing tests in `tests/test_safe_test_runner.py` and `tests/test_carver_sim.py`.
-   - Run `scripts/safe-test.sh tests/test_safe_test_runner.py` and `scripts/safe-test.sh tests/test_carver_sim.py` and confirm the new tests fail.
-2. **Apply Minimal Fixes**: Apply targeted edits in `scripts/safe-test.sh`, `AGENTS.md`, `tests/test_carver_sim.py`, and move `tests/_phase_probe.py` to `scripts/probe_phase.py`.
+   - Add the 3-mesh `is_real_target` self-test in `tests/test_carver_sim.py` (`TestTiers`), run `scripts/safe-test.sh tests/test_carver_sim.py`, and confirm `is_real_target(sculpted_base_head)` fails (`False != True`).
+2. **Apply Minimal Fixes**:
+   - Update `is_real_target` to `(len(vertices), extents[2])` in `tests/test_carver_sim.py`.
+   - Move `scripts/probe_phase.py` back to `tests/_phase_probe.py` with the `scripts/safe-test.sh` docstring.
+   - Update `patch.md` and `verification.md`.
 3. **Full Regression Suite**:
    - Run `scripts/safe-test.sh` (default tier, no args) — confirm `peak_rss_mb <= 1536`, `wall_s <= 600`, exit `0`.
    - Run `scripts/safe-test.sh --node` — confirm `32 pass / 0 fail / 1 skip`.
-   - Attempt Task 4.3 (`RUN_HEAVY_TESTS=1 SAFE_TEST_AS_KB=8388608 SAFE_TEST_MIN_AVAIL_MB=9216 SAFE_TEST_BUDGET_MB=8192 scripts/safe-test.sh`) ONLY with the prescribed `9216` floor; if it exits `75`, leave 4.3 unchecked and record the `75` refusal accurately.
-   - Run `openspec validate test-memory-scoping --strict --json`.
+   - Run `openspec validate test-memory-scoping --strict --json` — confirm `valid: true`.
 
 ## 6. Surgical Patch Checklist
-- [ ] P01.1 Scaffold failing tests in `tests/test_safe_test_runner.py` and `tests/test_carver_sim.py` and confirm failure.
-- [ ] P01.2 Fix `scripts/safe-test.sh` (cap-coupled floor + missing `.venv` exit `1`) and `AGENTS.md`.
-- [ ] P01.3 Fix `tests/test_carver_sim.py` (`TestTiers` real-suite probe, `"config"` in `_class_fixtures`, stubbed 422 `SOFT_LIMIT_EXCEEDED`) and move `tests/_phase_probe.py` $\to$ `scripts/probe_phase.py`.
-- [ ] P01.4 Run `scripts/safe-test.sh`, `scripts/safe-test.sh --node`, and (if headroom allows) Task 4.3 with `9216` floor.
-- [ ] P01.5 Fix `verification.md`, run `openspec validate test-memory-scoping --strict --json`, update `tasks.md` (`P01.1–P01.5`), and mark `PATCH-01` `VERIFIED` in `patch.md`.
+- [ ] P02.1 Add 3-mesh `is_real_target` self-test in `tests/test_carver_sim.py` (`TestTiers`) and confirm failure on sculpted `base_head`.
+- [ ] P02.2 Update `is_real_target` to `(len(vertices), extents[2])` within `10%`, and move `scripts/probe_phase.py` $\to$ `tests/_phase_probe.py` with `scripts/safe-test.sh` docstring.
+- [ ] P02.3 Label historical `2048` command in `patch.md` and document Task 4.3 deferral to `toolpath-memory` in `verification.md` (or run 4.3 if `>= 9,216 MiB` available).
+- [ ] P02.4 Run `scripts/safe-test.sh`, `scripts/safe-test.sh --node`, and `openspec validate test-memory-scoping --strict --json`; update `tasks.md` (`P02.1–P02.4`) and mark `PATCH-02` `VERIFIED` in `patch.md`.

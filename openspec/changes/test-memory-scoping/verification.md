@@ -8,16 +8,16 @@ Reference container: cgroup v1, 12 GiB limit, 3 vCPU.
 
 | Run | Result | Peak RSS | Wall | Exit |
 |---|---|---:|---:|---:|
-| `scripts/safe-test.sh` (default tier) | 157 tests, `OK (skipped=19)` | 356 MiB | 226 s | 0 |
-| `scripts/safe-test.sh --node` | 32 pass / 0 fail / 1 skip | 129 MiB | 3 s | 0 |
-| Task 4.3 heavy tier (prescribed 9,216 MiB floor) | **headroom-blocked**: refused at 4,889 MiB available | — | — | 75 |
+| `scripts/safe-test.sh` (default tier) | 158 tests, `OK (skipped=19)` | 356 MiB | 254 s | 0 |
+| `scripts/safe-test.sh --node` | 32 pass / 0 fail / 1 skip | 127 MiB | 3 s | 0 |
+| Task 4.3 heavy tier (prescribed 9,216 MiB floor) | **headroom-blocked**: refused at 4,784 MiB available | — | — | 75 |
 | `openspec validate test-memory-scoping --strict` | `valid: true`, 0 issues | — | — | 0 |
 
 ```text
-safe-test: status=0 peak_rss_mb=356 wall_s=226 tier=default
-safe-test: status=0 peak_rss_mb=129 wall_s=3 tier=default
-safe-test: available_mb=4889 threshold_mb=9216
-safe-test: only 4889 MiB available (< 9216 MiB); refusing to run
+safe-test: status=0 peak_rss_mb=356 wall_s=254 tier=default
+safe-test: status=0 peak_rss_mb=127 wall_s=3 tier=default
+safe-test: available_mb=4784 threshold_mb=9216
+safe-test: only 4784 MiB available (< 9216 MiB); refusing to run
 ```
 
 The 19 default-tier skips are the four OCP-gated extractor tests, the
@@ -34,11 +34,12 @@ RUN_HEAVY_TESTS=1 SAFE_TEST_AS_KB=8388608 SAFE_TEST_MIN_AVAIL_MB=9216 \
 ```
 
 It exited `75` both times because the shared container had far less headroom
-than the 9,216 MiB floor (4,521 MiB before PATCH-01, 4,889 MiB after):
+than the 9,216 MiB floor (4,521 MiB before PATCH-01, 4,889 MiB after PATCH-01,
+4,784 MiB for PATCH-02):
 
 ```text
-safe-test: available_mb=4521 threshold_mb=9216
-safe-test: only 4521 MiB available (< 9216 MiB); refusing to run
+safe-test: available_mb=4784 threshold_mb=9216
+safe-test: only 4784 MiB available (< 9216 MiB); refusing to run
 ```
 
 **Task 4.3 therefore stays unchecked.** An *exploratory* heavy run was made
@@ -48,8 +49,17 @@ before PATCH-01 with `SAFE_TEST_MIN_AVAIL_MB=2048`; it passed (153 tests,
 it is **not** evidence for 4.3. The runner now enforces
 `effective_floor = max(SAFE_TEST_MIN_AVAIL_MB, SAFE_TEST_AS_KB / 1024 + 512)`:
 8,704 MiB for the 8 GiB heavy cap, and 9,216 MiB with the prescribed minimum.
-The exploratory run can no longer start under those settings. Task 4.3 remains
-blocked until `toolpath-memory` lowers the transient `build_finishing` peak.
+**Task 4.3 is formally deferred to the `toolpath-memory` follow-up change.**
+That change lowers `build_finishing`'s ~3.3 GB transient so the prescribed
+heavy cap and 9,216 MiB floor fit the shared 12 GiB container; 4.3 is its
+acceptance gate. If the container reports `>= 9,216 MiB` available before then,
+4.3 can be run with the exact prescribed command and this section must be
+updated. Until either happens, 4.3 stays unchecked and the default tier remains
+the merge gate.
+
+The exploratory heavy run is also labelled historical/do-not-rerun in
+`patch.md`: its `SAFE_TEST_MIN_AVAIL_MB=2048` override is now clamped to the
+cap-coupled floor.
 
 The default-tier run uses the unmodified `scripts/safe-test.sh` (default floor
 4,608 MiB = 4 GiB cap + 512) with no overrides.
@@ -64,7 +74,7 @@ base_head `standard` test.
 | Metric | Before | After |
 |---|---:|---:|
 | Peak RSS | 4,872 MiB | **356 MiB** |
-| Wall time | 1,334 s (22 m 14 s) | **226 s** |
+| Wall time | 1,334 s (22 m 14 s) | **254 s** |
 | Full generations in the default tier | ~12 | **0** |
 | Class fixtures freed | no | yes (`tearDownClass` + `gc.collect`) |
 | Concurrent runs | overlap, second OOM | serialised by `flock`, second waits |
@@ -77,7 +87,7 @@ The spec budget is 1,536 MiB / 600 s; both are met with a wide margin.
 |---|---|---|
 | Default and heavy tiers | `tests/_tiers.py` `heavy`; every full-generation test decorated | 14 `@heavy` tests skipped in the default run with reason `heavy test: set RUN_HEAVY_TESTS=1`; the exploratory heavy run executed them (Task 4.3 itself is headroom-blocked, see above); `TestTiers` runs the four default-tier classes under a generator probe |
 | No real-target generation by default | Short-stock fixture and stubbed API generation | `TestTiers.test_default_tier_sample_never_generates_on_a_real_target` loads `TestSyntheticToolpaths`, `TestHead2Target`, `TestSimulationAPI`, `TestPatch10APIRegressions`; zero calls match a real target |
-| Default budget ≤ 1,536 MiB / 600 s | `tests/_run.py` reports `ru_maxrss`, exits 4 over `SAFE_TEST_BUDGET_MB` | 356 MiB / 226 s; `RunnerTest.test_budget_overrun_exits_4` |
+| Default budget ≤ 1,536 MiB / 600 s | `tests/_run.py` reports `ru_maxrss`, exits 4 over `SAFE_TEST_BUDGET_MB` | 356 MiB / 254 s; `RunnerTest.test_budget_overrun_exits_4` |
 | Budget overrun fails a passing run | `_run.py` returns 4 and prints `BUDGET EXCEEDED` | `RunnerTest.test_budget_overrun_exits_4` |
 | Cached fixtures released per class | `ReleasesClassFixtures` mixin in `test_carver_sim.py`, `test_tool_model.py`, `test_machine_cad.py`, `test_machine_cad_extract.py` | `TestFixtureRelease` (weakref dead after `tearDownClass`) |
 | Frame cap fails before materialising | `resample_path(..., max_frames=)` checked after each input segment; `generate_synthetic_carve_path` passes `api.max_frames`; post-check kept | `TestResampleFrameCap` (abort ≤ 500 + 2¹¹, identical under cap); `test_max_frames_exceedance_maps_to_422` (real generator, `api.max_frames = 500`) |
@@ -143,11 +153,10 @@ tier.
   `SAFE_TEST_MIN_AVAIL_MB` cannot start a run with less headroom than the
   address space it will allocate: default tier 4,608 MiB (4 GiB + 512), heavy
   tier 8,704 MiB (8 GiB + 512) or the prescribed 9,216 MiB, whichever is
-  higher. Earlier in the session the shared container reported 2,811–4,889 MiB
-  and the runner correctly refused (exit 75); the final default run saw at
+  higher. Earlier in the session the shared container reported 2,811–4,889 MiB  and the runner correctly refused (exit 75); the final default run saw at
   least 4,608 MiB and passed unmodified.
 - The Python `ulimit -v` is set as a **soft** limit so a nested `--node` run can
   lift it for V8; `--node` itself never sets an address-space cap.
-- `scripts/probe_phase.py` is tooling, excluded from discovery and skipped
-  unless `RUN_PHASE_PROBE=1`; it is run with an explicit `ulimit -S -v` outside
-  the runner.
+- `tests/_phase_probe.py` is tooling, excluded from discovery and skipped unless
+  `RUN_PHASE_PROBE=1`; run it through `scripts/safe-test.sh` so it shares the
+  flock and the cap-coupled memory floor.

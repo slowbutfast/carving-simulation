@@ -1,17 +1,14 @@
 """One-shot phase probe for the sculpted base_head `demo` spike (D7 / task 2.1).
 
-Tooling, not a test: it is excluded from discovery and skipped unless
-``RUN_PHASE_PROBE=1``. It runs the same phase sequence as
-``generate_synthetic_carve_path`` and writes per-phase wall time and peak RSS to
-``PHASE_PROBE_OUT`` (JSON) plus stdout.
+Not part of discovery (the module name does not match ``test*.py``) and skipped
+unless ``RUN_PHASE_PROBE=1``. Run it through the guarded runner, which takes the
+flock, applies the memory floor and caps the address space:
 
-Contain it with an explicit cap (the runner only accepts ``tests/`` targets):
+    RUN_PHASE_PROBE=1 SAFE_TEST_AS_KB=6291456 \
+        scripts/safe-test.sh tests/_phase_probe.py
 
-    ( ulimit -S -v 6291456; RUN_PHASE_PROBE=1 \
-        .venv/bin/python scripts/probe_phase.py )
-
-``scripts/safe-test.sh`` was used for the recorded 2.1 evidence while the probe
-lived under ``tests/``; the numbers are in ``patch.md``.
+It runs the same phase sequence as ``generate_synthetic_carve_path`` and writes
+per-phase wall time and peak RSS to ``PHASE_PROBE_OUT`` (JSON) plus stdout.
 """
 
 from __future__ import annotations

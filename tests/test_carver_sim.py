@@ -750,8 +750,49 @@ class TestResampleFrameCap(unittest.TestCase):
         self.assertEqual(capped, uncapped)
 
 
+def _real_target_signatures():
+    """Identity of the committed real targets: vertex count plus height.
+
+    Facial sliders move the head's extremes (the sculpted nose shifts max-x by
+    several millimetres), so a full bounding-box equality would miss the real
+    target. Height moves far less than 10% even at full slider amplitude.
+    """
+
+    return [
+        (len(mesh.vertices), float(mesh.extents[2]))
+        for mesh in (
+            trimesh.load(ROOT / "presets" / name, force="mesh")
+            for name in ("base_head.stl", "head_2.stl")
+        )
+    ]
+
+
+def _is_real_target(mesh, signatures) -> bool:
+    count = len(mesh.vertices)
+    height = float(mesh.extents[2])
+    return any(
+        count == expected_count and abs(height - expected_height) < 0.1 * expected_height
+        for expected_count, expected_height in signatures
+    )
+
+
 class TestTiers(unittest.TestCase):
     """D1: `heavy` skips full-generation tests unless RUN_HEAVY_TESTS=1."""
+
+    def test_is_real_target_recognises_sculpted_real_targets(self):
+        signatures = _real_target_signatures()
+        base_config = load_config(target_mesh=None)
+        base = face_sculpt.load_base_head(base_config)
+        sculpted = face_sculpt.apply_facial_modifications(
+            base, {"nose": 1.0, "chin": 0.6, "brow": 0.4}, base_config
+        ).mesh
+        head_2 = face_sculpt.load_base_head(load_config())
+        short = short_stock_target(
+            short_stock_config(), {"nose": 1.0, "chin": 0.6, "brow": 0.4}
+        )
+        self.assertTrue(_is_real_target(sculpted, signatures))
+        self.assertTrue(_is_real_target(head_2, signatures))
+        self.assertFalse(_is_real_target(short, signatures))
 
     def test_heavy_skip_reason_matches_the_documented_flag(self):
         class Probe(unittest.TestCase):
@@ -771,21 +812,8 @@ class TestTiers(unittest.TestCase):
             )
 
     def test_default_tier_sample_never_generates_on_a_real_target(self):
-        # Run the actual default-tier classes, not a synthetic self-call. The
-        # short-stock fixture reuses the analytic head's topology, so the vertex
-        # count alone cannot tell it apart from `base_head.stl`; the bounds do.
-        real = []
-        for name in ("base_head.stl", "head_2.stl"):
-            mesh = trimesh.load(ROOT / "presets" / name, force="mesh")
-            real.append((len(mesh.vertices), np.asarray(mesh.bounds, dtype=float)))
-
-        def is_real_target(mesh) -> bool:
-            bounds = np.asarray(mesh.bounds, dtype=float)
-            return any(
-                len(mesh.vertices) == count and np.allclose(bounds, expected, atol=1.0)
-                for count, expected in real
-            )
-
+        # Run the actual default-tier classes, not a synthetic self-call.
+        signatures = _real_target_signatures()
         seen = []
         original = toolpath_sim.generate_synthetic_carve_path
 
@@ -812,7 +840,7 @@ class TestTiers(unittest.TestCase):
         self.assertTrue(result.wasSuccessful(), (result.failures, result.errors))
         self.assertTrue(seen, "the default sample generated no toolpaths at all")
         self.assertEqual(
-            [target for target in seen if is_real_target(target)],
+            [target for target in seen if _is_real_target(target, signatures)],
             [],
             "the default tier generated on a real target mesh",
         )
