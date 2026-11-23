@@ -1,0 +1,23 @@
+---
+version: "alpha"
+name: "Windows XP Luna Progress Overlay (Toolpath Loading Bar)"
+description: "Emoji-free, accessible Windows XP Luna segmented progress bar inside .processing-overlay for async toolpath generation."
+colors:
+  surface: "#ece9d8"
+  surface-light: "#ffffff"
+  border-highlight: "#ffffff"
+  border-shadow: "#918e82"
+  on-surface: "#222222"
+  progress-fill: "#70c040"
+---
+
+## Overview
+Replaces `.processing-spinner` inside `.processing-overlay` with an authentic **Windows XP Luna segmented green progress bar** (`#70c040` blocks inside an inset `#ffffff` well on `#ece9d8` XP chrome), strictly emoji-free.
+
+## Components
+- **`#processing-overlay` / `.processing-progress-box`**:
+  - `#progress-label` (`aria-live="polite"`): updated **only** when `phase` changes (`Sculpting`, `Roughing`, `Finishing`, `Resampling`, `Trajectory`, `Gouge check`, `Encoding`).
+  - `#progress-bar` (`role="progressbar"`, `aria-labelledby="progress-label"`, `aria-valuemin="0"`, `aria-valuemax="100"`, `aria-valuenow`): houses `#progress-fill` (`repeating-linear-gradient` `#70c040` 8px blocks, 2px gap).
+  - `#progress-pct` and `#progress-elapsed` (`Courier New 11px`).
+  - `.processing-overlay[hidden] { display: none; }` guaranteed after `.processing-overlay`.
+  - `@media (prefers-reduced-motion: reduce)` sets `.xp-progress-fill { transition: none; }`.
