@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import trimesh
@@ -60,6 +60,51 @@ class FrameCapExceededError(RuntimeError):
             message=str(self),
             value=float(self.frames),
         )
+
+
+class JobCancelled(RuntimeError):
+    """Raised from an ``on_progress`` callback to abandon a running generation."""
+
+
+#: Global weight of every phase that reports progress, measured by the
+#: ``test-memory-scoping`` D7 probe on the sculpted ``base_head`` ``demo``
+#: target (~246 s total): roughing 0.4%, finishing 75.0%, resample 12.8%,
+#: trajectory 0.5%, gouges 11.4% and the post-gouge feed-direction pass.
+#: ``sculpt`` (0.00 -> 0.01) and ``encode`` (0.98 -> 1.00) are emitted by
+#: ``server.py``. This is the single table every local fraction maps through.
+_PHASE_WEIGHTS: dict[str, tuple[float, float]] = {
+    "roughing": (0.01, 0.02),
+    "finishing": (0.02, 0.77),
+    "resample": (0.77, 0.90),
+    "trajectory": (0.90, 0.91),
+    "gouges": (0.91, 0.97),
+    "feed_class": (0.97, 0.98),
+}
+
+
+def _local_reporter(
+    on_progress: Callable[[float, str], None] | None, message: str
+) -> Callable[[float], None]:
+    """Reporter for one phase's local ``[0.0, 1.0]`` progress.
+
+    Clamps to the unit interval and drops repeated fractions, so a phase that
+    reports at its loop boundaries always emits a ``0.0`` start and a ``1.0``
+    end even when its loop never runs. A ``JobCancelled`` raised by the sink
+    propagates unchanged: this is the cancellation boundary.
+    """
+    last = -1.0
+
+    def report(fraction: float) -> None:
+        nonlocal last
+        if on_progress is None:
+            return
+        value = min(max(float(fraction), 0.0), 1.0)
+        if value <= last:
+            return
+        last = value
+        on_progress(value, message)
+
+    return report
 
 
 @dataclass
@@ -513,6 +558,7 @@ def resample_path(
     stages: Sequence[str],
     config: Mapping[str, Any],
     max_frames: int | None = None,
+    on_progress: Callable[[float, str], None] | None = None,
 ) -> tuple[list[dict[str, float]], list[bool], list[str]]:
     """Adaptively subdivide until the heated-region corner bound is satisfied.
 
@@ -520,9 +566,16 @@ def resample_path(
     segment, so a path over ``api.max_frames`` raises before the rest of the
     path (and the trajectory) is materialised. One segment's subdivision is the
     most that can overshoot the cap.
+
+    Local progress is reported every ``len(joints) // 20`` segments: the input
+    path holds tens of thousands of segments, and one callback per segment
+    would cost more than it tells a poller.
     """
 
+    report = _local_reporter(on_progress, "Resampling")
+    report(0.0)
     if not joints:
+        report(1.0)
         return [], [], []
     tool = config["tool"]
     cut_limit = 0.5 * (
@@ -537,6 +590,8 @@ def resample_path(
     out_rapid: list[bool] = [False]
     out_stage: list[str] = [stages[0]]
 
+    total = len(joints) - 1
+    stride = max(1, total // 20)
     for index in range(1, len(joints)):
         pieces: list[dict[str, float]] = []
         limit = rapid_limit if rapid_flags[index] else cut_limit
@@ -547,6 +602,9 @@ def resample_path(
             out_stage.append(stages[index])
         if max_frames is not None and len(out_joints) > max_frames:
             raise FrameCapExceededError(len(out_joints), max_frames)
+        if index % stride == 0:
+            report(index / total)
+    report(1.0)
     return out_joints, out_rapid, out_stage
 
 
@@ -1226,6 +1284,7 @@ def detect_gouges_detailed(
     frames: Sequence[Mapping[str, Any]],
     stages: Sequence[str],
     config: Mapping[str, Any],
+    on_progress: Callable[[float, str], None] | None = None,
 ) -> GougeReport:
     """Run-grouped ``GOUGE`` events over the ``gouge_sample_poses`` set.
 
@@ -1234,8 +1293,12 @@ def detect_gouges_detailed(
     a clear sample, a stage change or a gap closes it.  The single worst-depth
     diagnostic :func:`detect_gouges` emits is produced here too, from the same
     scan, so the toolpath reports the same number either way.
+
+    Local progress is reported every ``len(poses) // 20`` sampled poses.
     """
 
+    report = _local_reporter(on_progress, "Gouge check")
+    report(0.0)
     allowance = float(config["stock"].get("finish_allowance_mm", 1.5))
     bounds = np.asarray(mesh.bounds, dtype=np.float64)
     events: list[dict[str, Any]] = []
@@ -1243,7 +1306,12 @@ def detect_gouges_detailed(
     previous: int | None = None
     deepest: tuple[float, np.ndarray] | None = None
 
-    for pose in gouge_sample_poses(frames, stages):
+    poses = gouge_sample_poses(frames, stages)
+    total = len(poses)
+    progress_stride = max(1, total // 20)
+    for position, pose in enumerate(poses):
+        if position % progress_stride == 0:
+            report(position / total)
         index = int(pose["frame"])
         stage = str(pose["stage"])
         stride = GOUGE_STRIDE_BY_STAGE.get(stage)
@@ -1307,6 +1375,7 @@ def detect_gouges_detailed(
     diagnostics: list[Diagnostic] = []
     if deepest is not None:
         diagnostics.append(_gouge_diagnostic(deepest[0], deepest[1], allowance))
+    report(1.0)
     return GougeReport(diagnostics=diagnostics, events=events)
 
 
@@ -1320,6 +1389,7 @@ def build_roughing(
     config: Mapping[str, Any],
     params: Mapping[str, Any],
     collector: DiagnosticCollector | None = None,
+    on_progress: Callable[[float, str], None] | None = None,
 ) -> tuple[list[dict[str, float]], list[bool], list[str], float]:
     """Returns joints, rapid flags, stages, and the final unwrapped theta.
 
@@ -1328,8 +1398,12 @@ def build_roughing(
     stays outside the material. Radial repositioning moves are
     ``roughing_link`` transitions, not cuts, so the cutting moves themselves are
     all slice-direction theta passes.
+
+    Local progress is reported once per Z level.
     """
 
+    report = _local_reporter(on_progress, "Roughing")
+    report(0.0)
     diagnostics = collector if collector is not None else DiagnosticCollector()
     stock = config["stock"]
     radius_stock = float(stock["R_stock_mm"])
@@ -1388,6 +1462,7 @@ def build_roughing(
 
     for level_index, level in enumerate(levels):
         level = float(level)
+        report(level_index / len(levels))
         if level_index > 0:
             joints.append(
                 _joint(
@@ -1572,6 +1647,7 @@ def build_roughing(
         rapid.append(False)
         stages.append("roughing_link")
 
+    report(1.0)
     return joints, rapid, stages, float(last_theta)
 
 
@@ -1866,6 +1942,7 @@ def build_finishing(
     diagnostics: DiagnosticCollector,
     theta_start: float,
     unreachable_samples: list[dict[str, Any]] | None = None,
+    on_progress: Callable[[float, str], None] | None = None,
 ) -> tuple[list[dict[str, float]], list[bool], list[str], int, float]:
     """Undercut-capable finishing, composed from the unit-tested helpers.
 
@@ -1877,8 +1954,13 @@ def build_finishing(
     Rejected points are counted into ``UNREACHABLE_UNDERCUT_AREA`` and, when
     ``unreachable_samples`` is given, appended there as ``theta_deg``/``z_mm``/
     ``required_phi_deg`` so the collision log can summarise the dead zone.
+
+    Local progress is reported once per slice: 75% of a ``demo`` run happens in
+    this loop, so it must be the dominant part of the global bar.
     """
 
+    report = _local_reporter(on_progress, "Finishing")
+    report(0.0)
     stock = config["stock"]
     radius_stock = float(stock["R_stock_mm"])
     z_plinth = _reachable_floor(config)
@@ -1920,7 +2002,8 @@ def build_finishing(
     rapid.append(True)
     stages.append("finishing")
 
-    for azimuth, theta_emit, branch in slices:
+    for slice_index, (azimuth, theta_emit, branch) in enumerate(slices):
+        report(slice_index / len(slices))
         e_r_tool = np.array([math.cos(theta_emit), math.sin(theta_emit), 0.0])
         polylines = section_polylines(mesh, azimuth % TAU, z_plinth, height_stock, step)
         if not polylines:
@@ -2114,6 +2197,7 @@ def build_finishing(
         stages.append("finishing")
 
     percentage = 0.0 if total_points == 0 else 100.0 * unreachable_points / total_points
+    report(1.0)
     return joints, rapid, stages, total_points, percentage
 
 
@@ -2126,12 +2210,34 @@ def generate_synthetic_carve_path(
     mesh: trimesh.Trimesh,
     config: Mapping[str, Any] | None = None,
     preset: str = "demo",
+    on_progress: Callable[[str, float, str], None] | None = None,
 ) -> ToolpathResult:
-    """Generate the full two-stage synthetic toolpath and its diagnostics."""
+    """Generate the full two-stage synthetic toolpath and its diagnostics.
+
+    ``on_progress(phase, global_fraction, message)`` receives global progress in
+    ``[0.01, 0.98]``. The phase functions report local ``[0.0, 1.0]`` fractions
+    and `_PHASE_WEIGHTS` is the single table that turns them into those global
+    fractions; ``server.py`` owns ``sculpt`` (0.00 -> 0.01) and ``encode``
+    (0.98 -> 1.00). A ``JobCancelled`` raised from the callback aborts at the
+    next loop boundary.
+    """
 
     cfg = kinematics.load_config(config) if config is not None else kinematics.load_config()
     if preset not in cfg["presets"]:
         raise ValueError(f"unknown preset {preset!r}; expected one of {list(cfg['presets'])}")
+
+    def phase_sink(phase: str) -> Callable[[float, str], None]:
+        """Local fraction -> global fraction, through the weight table."""
+
+        low, high = _PHASE_WEIGHTS[phase]
+
+        def report(fraction: float, message: str) -> None:
+            if on_progress is None:
+                return
+            clamped = min(max(float(fraction), 0.0), 1.0)
+            on_progress(phase, low + (high - low) * clamped, message)
+
+        return report
 
     params = dict(cfg["toolpath"])
     params.update(cfg["presets"][preset])
@@ -2143,7 +2249,7 @@ def generate_synthetic_carve_path(
     collector = DiagnosticCollector()
 
     rough_joints, rough_rapid, rough_stage, rough_last_theta = build_roughing(
-        mesh, cfg, params, collector
+        mesh, cfg, params, collector, on_progress=phase_sink("roughing")
     )
     unreachable_samples: list[dict[str, Any]] = []
     (
@@ -2153,7 +2259,13 @@ def generate_synthetic_carve_path(
         _finish_points,
         unreachable_percent,
     ) = build_finishing(
-        mesh, cfg, params, collector, rough_last_theta, unreachable_samples
+        mesh,
+        cfg,
+        params,
+        collector,
+        rough_last_theta,
+        unreachable_samples,
+        on_progress=phase_sink("finishing"),
     )
 
     joints = rough_joints + finish_joints
@@ -2164,6 +2276,8 @@ def generate_synthetic_carve_path(
         # An out-of-bounds joint or stock already makes the path unproducible;
         # don't spend minutes resampling (and trip the frame cap) to say so.
         # There is no trajectory, so there is nothing to log beyond the header.
+        # Progress simply stops here: every fraction emitted so far is in range
+        # and monotonic, and no later phase is announced.
         return ToolpathResult(
             frames=[],
             diagnostics=collector.as_list(),
@@ -2174,13 +2288,20 @@ def generate_synthetic_carve_path(
 
     max_frames = int(cfg.get("api", {}).get("max_frames", 250_000))
     joints, rapid_flags, stages = resample_path(
-        joints, rapid_flags, stages, cfg, max_frames=max_frames
+        joints,
+        rapid_flags,
+        stages,
+        cfg,
+        max_frames=max_frames,
+        on_progress=phase_sink("resample"),
     )
 
     if len(joints) > max_frames:
         # Fail loudly instead of truncating mid-stock with the tool buried.
         raise FrameCapExceededError(len(joints), max_frames)
 
+    trajectory = _local_reporter(phase_sink("trajectory"), "Trajectory")
+    trajectory(0.0)
     frames, trajectory_diagnostics = kinematics.build_trajectory(joints, rapid_flags, cfg)
     for frame, stage in zip(frames, stages):
         frame["stage"] = stage
@@ -2192,6 +2313,7 @@ def generate_synthetic_carve_path(
     # and log the exact out-of-travel frame ranges.
     for event in soft_limit_runs(frames, cfg):
         log.add_run(event["code"], event, weight=event["value"])
+    trajectory(1.0)
 
     if unreachable_percent > 0.0:
         collector.add(
@@ -2214,7 +2336,9 @@ def generate_synthetic_carve_path(
     # Link stages are checked too (PATCH-02), sampled as defined by
     # `gouge_sample_poses`; the tests use the same selection.  The same scan
     # groups the sampled poses back into run-grouped GOUGE events.
-    gouge_report = detect_gouges_detailed(mesh, frames, stages, cfg)
+    gouge_report = detect_gouges_detailed(
+        mesh, frames, stages, cfg, on_progress=phase_sink("gouges")
+    )
     for diag in gouge_report.diagnostics:
         collector.extend([diag])
     for event in gouge_report.events:
@@ -2237,7 +2361,14 @@ def generate_synthetic_carve_path(
         log.add_run(event["code"], event, weight=float(event["length_mm"]))
         open_run = None
 
+    feed = _local_reporter(phase_sink("feed_class"), "Feed check")
+    feed(0.0)
+    feed_total = max(1, len(frames) - 1)
+    feed_stride = max(1, feed_total // 20)
+
     for index in range(1, len(frames)):
+        if index % feed_stride == 0:
+            feed(index / feed_total)
         current = frames[index]
         if current["is_rapid"] or current["stage"] not in ("roughing", "finishing"):
             close_broadside_run()
@@ -2286,6 +2417,7 @@ def generate_synthetic_carve_path(
             }
         open_run["_last_frame"] = index
     close_broadside_run()
+    feed(1.0)
     if broadside_length > 0.0 and cutting_length > 0.0:
         fraction = broadside_length / cutting_length
         collector.add(

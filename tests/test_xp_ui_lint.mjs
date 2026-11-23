@@ -20,6 +20,15 @@ const read = (relative) => fs.readFileSync(path.join(ROOT, relative), 'utf8');
 const hasClass = (source, name) =>
   new RegExp(`class="[^"]*\\b${name}\\b[^"]*"`).test(source);
 
+/** The opening tag that carries `id="<id>"`, or null when it is absent. */
+const elementTag = (html, id) => {
+  const at = html.indexOf(`id="${id}"`);
+  if (at < 0) return null;
+  const open = html.lastIndexOf('<', at);
+  const close = html.indexOf('>', at);
+  return open >= 0 && close > at ? html.slice(open, close + 1) : null;
+};
+
 // Emoji and dingbat ranges only.  Typographic punctuation (em dash, middle dot,
 // multiplication sign, ellipsis, degree, greater-or-equal) is allowed.
 const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}]/u;
@@ -142,6 +151,110 @@ test('UI sources are free of Unicode emoji', () => {
       `${relative} contains emoji ${match ? JSON.stringify(match[0]) : ''}`
     );
   }
+});
+
+test('index.html renders the XP progress overlay inside the viewport well', () => {
+  const html = read('static/index.html');
+
+  const wellAt = html.indexOf('inset-well viewport-well');
+  const viewportAt = html.indexOf('<div id="viewport"');
+  const overlayAt = html.indexOf('id="processing-overlay"');
+  const dockAt = html.indexOf('class="transport-dock"');
+  assert.ok(wellAt >= 0 && viewportAt > wellAt, 'the viewport well must contain #viewport');
+  assert.ok(overlayAt > viewportAt, '#processing-overlay must follow #viewport');
+  assert.ok(
+    dockAt > overlayAt,
+    '#processing-overlay must sit inside .inset-well.viewport-well before .transport-dock'
+  );
+
+  const overlay = elementTag(html, 'processing-overlay');
+  assert.ok(overlay, 'index.html must contain id="processing-overlay"');
+  assert.ok(hasClass(overlay, 'processing-overlay'), 'overlay keeps the processing-overlay class');
+  assert.match(overlay, /\shidden\b/, 'overlay starts hidden');
+  assert.ok(hasClass(html, 'processing-progress-box'), 'processing-progress-box class');
+
+  const label = elementTag(html, 'progress-label');
+  assert.ok(label, 'index.html must contain id="progress-label"');
+  assert.match(label, /aria-live="polite"/);
+  assert.match(html, /id="progress-label"[^>]*>Sculpting</);
+
+  const bar = elementTag(html, 'progress-bar');
+  assert.ok(bar, 'index.html must contain id="progress-bar"');
+  assert.match(bar, /role="progressbar"/);
+  assert.match(bar, /aria-labelledby="progress-label"/);
+  assert.match(bar, /aria-valuemin="0"/);
+  assert.match(bar, /aria-valuemax="100"/);
+  assert.match(bar, /aria-valuenow="0"/);
+
+  const fill = elementTag(html, 'progress-fill');
+  assert.ok(fill, 'index.html must contain id="progress-fill"');
+  assert.ok(hasClass(fill, 'xp-progress-fill'), '#progress-fill keeps the xp-progress-fill class');
+  assert.ok(hasClass(html, 'xp-progress-track'), 'xp-progress-track class wraps the fill');
+
+  assert.match(html, /id="progress-pct"[^>]*>0%</);
+  assert.match(html, /id="progress-elapsed"[^>]*>0 s</);
+});
+
+test('xp.css styles the segmented XP Luna progress bar', () => {
+  const css = read('static/xp.css');
+
+  for (const selector of [
+    '.processing-overlay',
+    '.processing-overlay[hidden]',
+    '.processing-progress-box',
+    '.xp-progress-track',
+    '.xp-progress-fill',
+  ]) {
+    assert.ok(css.includes(selector), `xp.css must define ${selector}`);
+  }
+
+  assert.match(css, /\.processing-overlay\[hidden\]\s*\{[^}]*display:\s*none/);
+  assert.match(css, /\.processing-progress-box\s*\{[^}]*var\(--surface\)/);
+  assert.match(css, /\.xp-progress-track\s*\{[^}]*var\(--surface-light\)/);
+  assert.match(css, /\.xp-progress-fill\s*\{[^}]*repeating-linear-gradient\(\s*90deg,\s*#70c040/);
+  assert.match(css, /\.xp-progress-fill\s*\{[^}]*transition:\s*width/);
+  assert.match(
+    css,
+    /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*?\.xp-progress-fill\s*\{[^}]*transition:\s*none/
+  );
+  assert.match(css, /#progress-pct[^{]*\{[^}]*var\(--font-code\)/);
+  assert.match(css, /#progress-elapsed[^{]*\{[^}]*var\(--font-code\)/);
+});
+
+test('app.js polls the async toolpath job API and cleans up on unload', () => {
+  const app = read('static/app.js');
+
+  for (const needle of [
+    '/api/sculpt-and-sim/jobs',
+    'pagehide',
+    'keepalive: true',
+    'visibilitychange',
+    'aria-valuenow',
+    'Gouge check',
+    'Feed check',
+    'Previous generation is stopping',
+  ]) {
+    assert.ok(app.includes(needle), `app.js must contain ${needle}`);
+  }
+
+  assert.match(app, /POLL_INTERVAL_MS\s*=\s*500/);
+  assert.match(app, /MAX_TRANSIENT_FAILURES\s*=\s*3/);
+  assert.match(app, /method:\s*'DELETE'/);
+  assert.match(app, /\/api\/sculpt-and-sim\/jobs[\s\S]{0,300}?method:\s*'POST'/);
+  assert.match(app, /detail\?\.diagnostics|detail\.diagnostics/);
+  assert.ok(!app.includes('setInterval('), 'polling must chain setTimeout, not setInterval');
+  assert.ok(
+    !app.includes("requestJson('Sculpt & Simulate', '/api/sculpt-and-sim'"),
+    'sculptAndSimulate must no longer POST the synchronous endpoint'
+  );
+});
+
+test('package.json runs this lint suite through safe-test --node', () => {
+  const pkg = JSON.parse(read('package.json'));
+  assert.ok(
+    String(pkg.scripts?.['test:node'] || '').includes('tests/test_xp_ui_lint.mjs'),
+    'npm run test:node must include tests/test_xp_ui_lint.mjs'
+  );
 });
 
 test('DESIGN.md has YAML front matter and the ordered design sections', () => {
