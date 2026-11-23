@@ -1,0 +1,6 @@
+### Revision: 2026-11-23 15:53 UTC
+- **Feedback Source**: Dual Peer Review of `toolpath-loading-bar`
+- **Key Changes**:
+  - `specs/toolpath-loading-bar/spec.md` & `specs/face-sculpt-sim/spec.md`: Unified weight table (`0.00->0.01` `sculpt`, `0.01->0.02` `roughing`, `0.02->0.77` `finishing`, `0.77->0.90` `resample`, `0.90->0.91` `trajectory`, `0.91->0.97` `gouges`, `0.97->0.98` `feed_class`, `0.98->1.00` `encode`), split Requirement 2 into 9 focused scenarios, enumerated `status` (`running | cancelling | cancelled | done | error`), added `specs/face-sculpt-sim/spec.md` delta for `429`, specified `pagehide` `fetch(..., { method: "DELETE", keepalive: true })`, and increased abandon-on-silence to `90 s` + `visibilitychange` poll.
+  - `architecture.md`, `proposal.md`, `research.md`, `design.md`: Fixed `~246 s` timing, named `_start_job_worker` test seam, moved throttling pre-check outside `_JOBS_LOCK`, documented cancel latency & `--workers 1` requirement, and reused PR #3's `.processing-overlay` / `[hidden]` CSS rules.
+  - `tests.md` & `tasks.md`: Added deterministic tests for `120 s` TTL, 4-job FIFO eviction + active-job protection, `DELETE` `202` `cancelling -> cancelled`, `90 s` abandon-on-silence, and pre-flight `tool_cfg` `422`; reused existing `@heavy` fixture for real-target `on_progress`; marked PR #5 & PR #3 precondition complete.

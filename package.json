@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test:node": "node --experimental-vm-modules --test tests/test_wax_sdf.mjs tests/test_wax_worker.mjs tests/test_cad_rig.mjs",
+    "test:node": "node --experimental-vm-modules --test tests/test_wax_sdf.mjs tests/test_wax_worker.mjs tests/test_cad_rig.mjs tests/test_xp_ui_lint.mjs",
     "bench:sdf": "BENCH=1 node --experimental-vm-modules --test tests/test_wax_sdf.mjs"
   },
   "dependencies": {

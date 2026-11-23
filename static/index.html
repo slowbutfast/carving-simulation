@@ -179,6 +179,28 @@
           <div class="inset-well viewport-well">
             <div id="viewport" class="viewport" aria-label="3D model viewport"></div>
 
+            <div id="processing-overlay" class="processing-overlay" hidden>
+              <div class="processing-box processing-progress-box">
+                <div id="progress-label" aria-live="polite">Sculpting</div>
+                <div
+                  id="progress-bar"
+                  role="progressbar"
+                  aria-labelledby="progress-label"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-valuenow="0"
+                >
+                  <div class="xp-progress-track">
+                    <div class="xp-progress-fill" id="progress-fill"></div>
+                  </div>
+                </div>
+                <div class="processing-progress-readout">
+                  <span id="progress-pct">0%</span>
+                  <span id="progress-elapsed">0 s</span>
+                </div>
+              </div>
+            </div>
+
             <div class="transport-dock" role="toolbar" aria-label="Playback transport">
               <button class="transport-btn" id="prevBtn" type="button" disabled>Prev</button>
               <button class="transport-btn play" id="playBtn" type="button" disabled>Play</button>

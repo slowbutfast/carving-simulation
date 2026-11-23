@@ -30,6 +30,7 @@ import kinematics  # noqa: E402
 import face_sculpt  # noqa: E402
 import tool_model  # noqa: E402
 import toolpath_sim  # noqa: E402
+import server  # noqa: E402
 from server import app  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -495,7 +496,7 @@ class TestFacialSculpting(ReleasesClassFixtures, unittest.TestCase):
 class TestSyntheticToolpaths(ReleasesClassFixtures, unittest.TestCase):
     """The toolpath invariants on the 40 mm short-stock fixture (default tier)."""
 
-    _class_fixtures = ("config", "mesh", "sculpt", "result")
+    _class_fixtures = ("config", "mesh", "sculpt", "result", "progress")
 
     @classmethod
     def setUpClass(cls):
@@ -509,8 +510,14 @@ class TestSyntheticToolpaths(ReleasesClassFixtures, unittest.TestCase):
             cls.config, {"nose": 1.0, "chin": 0.6, "brow": 0.4}
         )
         cls.sculpt = cls.mesh
+        cls.progress = []
         cls.result = toolpath_sim.generate_synthetic_carve_path(
-            cls.sculpt, cls.config, preset="demo"
+            cls.sculpt,
+            cls.config,
+            preset="demo",
+            on_progress=lambda phase, fraction, message: cls.progress.append(
+                (phase, fraction, message)
+            ),
         )
 
     def test_frames_are_columnar_and_well_formed(self):
@@ -651,6 +658,24 @@ class TestSyntheticToolpaths(ReleasesClassFixtures, unittest.TestCase):
             self.assertGreaterEqual(delta, -0.5)
             self.assertLessEqual(delta, 5.0)
 
+    def test_progress_callback_is_monotonic_within_the_weight_table(self):
+        fractions = [fraction for _phase, fraction, _message in self.progress]
+        self.assertGreater(len(fractions), 10)
+        self.assertEqual(fractions, sorted(fractions), "progress regressed")
+        self.assertGreaterEqual(fractions[0], 0.01)
+        self.assertLessEqual(fractions[-1], 0.98)
+        self.assertEqual(
+            {phase for phase, _fraction, _message in self.progress},
+            {"roughing", "finishing", "resample", "trajectory", "gouges", "feed_class"},
+        )
+        self.assertTrue(
+            all(message for _phase, _fraction, message in self.progress),
+            "every progress callback must carry a phase label",
+        )
+        finishing = [fraction for phase, fraction, _m in self.progress if phase == "finishing"]
+        self.assertAlmostEqual(finishing[0], 0.02)
+        self.assertAlmostEqual(finishing[-1], 0.77)
+
     def test_gouge_detection_flags_tool_inside_target(self):
         # Construct a deliberately bad CL pose that buries the tool in the target.
         centre = np.asarray(self.mesh.bounds, dtype=float).mean(axis=0)
@@ -707,9 +732,34 @@ class TestSyntheticToolpathsFullTarget(TestSyntheticToolpaths):
         cls.sculpt = face_sculpt.apply_facial_modifications(
             cls.mesh, {"nose": 1.0, "chin": 0.6, "brow": 0.4}, cls.config
         ).mesh
+        cls.progress = []
         cls.result = toolpath_sim.generate_synthetic_carve_path(
-            cls.sculpt, cls.config, preset="demo"
+            cls.sculpt,
+            cls.config,
+            preset="demo",
+            on_progress=lambda phase, fraction, message: cls.progress.append(
+                (phase, fraction, message)
+            ),
         )
+
+    def test_real_target_progress_is_monotonic_and_weighted(self):
+        # Reuses the class fixture above: a second full generation would double
+        # the heavy tier's cost for the same information.
+        fractions = [fraction for _phase, fraction, _message in self.progress]
+        self.assertGreater(len(fractions), 20)
+        self.assertEqual(fractions, sorted(fractions), "real-target progress regressed")
+        self.assertGreaterEqual(fractions[0], 0.01)
+        self.assertLessEqual(fractions[-1], 0.98)
+        self.assertEqual(
+            {phase for phase, _fraction, _message in self.progress},
+            {"roughing", "finishing", "resample", "trajectory", "gouges", "feed_class"},
+        )
+        finishing = [fraction for phase, fraction, _m in self.progress if phase == "finishing"]
+        self.assertAlmostEqual(finishing[0], 0.02)
+        self.assertAlmostEqual(finishing[-1], 0.77)
+        # 75% of the wall clock is finishing, so it must dominate the weights.
+        self.assertGreater(finishing[-1] - finishing[0], 0.5)
+
 
 
 class TestResampleFrameCap(unittest.TestCase):
@@ -748,6 +798,215 @@ class TestResampleFrameCap(unittest.TestCase):
         )
         uncapped = toolpath_sim.resample_path(joints, rapid, stages, self.config)
         self.assertEqual(capped, uncapped)
+
+
+class TestProgressWeights(unittest.TestCase):
+    """`generate_synthetic_carve_path` maps local fractions through one table.
+
+    The phase functions report local ``[0.0, 1.0]`` progress; only the weight
+    table in ``generate_synthetic_carve_path`` (measured on ``base_head``
+    ``demo``) turns those into global fractions, so the mapping is asserted
+    against stubbed phases. The real-pipeline assertions live in
+    ``TestSyntheticToolpaths``.
+    """
+
+    #: `test-memory-scoping` D7 phase timings: 0.4%, 75.0%, 12.8%, 0.5%,
+    #: 11.4%, plus the post-gouge feed-direction pass.
+    WEIGHTS = (
+        ("roughing", 0.01, 0.02),
+        ("finishing", 0.02, 0.77),
+        ("resample", 0.77, 0.90),
+        ("trajectory", 0.90, 0.91),
+        ("gouges", 0.91, 0.97),
+        ("feed_class", 0.97, 0.98),
+    )
+
+    def _generate_with_stubbed_phases(self, on_progress, calls, *, error=False):
+        """Run the real entry point with every phase replaced by a stub.
+
+        Each stub reports local ``[0.0, 1.0]`` fractions, so the assertions
+        isolate the single weight table from the phase implementations.
+        """
+        config = load_config()
+        joints = [
+            {"r": 30.0, "theta": 0.0, "h": 100.0, "phi": 0.0},
+            {"r": 30.0, "theta": 0.1, "h": 100.0, "phi": 0.0},
+        ]
+        frames = [
+            {
+                "t": 0.0, "r": 30.0, "theta": 0.0, "h": 100.0, "phi": 0.0,
+                "r_s": 30.0, "theta_s": 0.0, "z_s": 100.0, "v_tip": 1.0,
+                "is_rapid": False,
+                "tip_xyz_wax": (30.0, 0.0, 100.0),
+                "tool_axis_wax": (0.0, 0.0, -1.0),
+            },
+            {
+                "t": 0.5, "r": 30.0, "theta": 0.1, "h": 100.0, "phi": 0.0,
+                "r_s": 30.0, "theta_s": 0.1, "z_s": 100.0, "v_tip": 1.0,
+                "is_rapid": False,
+                "tip_xyz_wax": (30.0, 0.5, 100.0),
+                "tool_axis_wax": (0.0, 0.0, -1.0),
+            },
+        ]
+
+        def roughing(mesh, cfg, params, collector=None, on_progress=None):
+            calls.append("roughing")
+            on_progress(0.0, "Roughing")
+            on_progress(1.0, "Roughing")
+            return [dict(joint) for joint in joints], [False, False], ["roughing"] * 2, 0.1
+
+        def finishing(
+            mesh,
+            cfg,
+            params,
+            diagnostics,
+            theta_start,
+            unreachable_samples=None,
+            on_progress=None,
+        ):
+            calls.append("finishing")
+            if error:
+                diagnostics.add(
+                    "SOFT_LIMIT_EXCEEDED",
+                    "error",
+                    "radial joint r=300.000 mm outside [-51.0, 135.0] mm",
+                    axis="r",
+                    value=300.0,
+                )
+            for fraction in (0.0, 0.5, 1.0):
+                on_progress(fraction, "Finishing")
+            return [], [], [], 0, 0.0
+
+        def resample(path, rapid, stages, cfg, max_frames=None, on_progress=None):
+            calls.append("resample")
+            on_progress(0.0, "Resampling")
+            on_progress(1.0, "Resampling")
+            return [dict(joint) for joint in path], list(rapid), list(stages)
+
+        def trajectory(path, rapid, cfg):
+            calls.append("trajectory")
+            return [dict(frame) for frame in frames], []
+
+        def gouges(mesh, path, stages, cfg, on_progress=None):
+            calls.append("gouges")
+            on_progress(0.0, "Gouge check")
+            on_progress(1.0, "Gouge check")
+            return toolpath_sim.GougeReport()
+
+        def feed_class(direction, pose, cfg):
+            calls.append("feed_class")
+            return "slice"
+
+        with unittest.mock.patch.multiple(
+            toolpath_sim,
+            build_roughing=roughing,
+            build_finishing=finishing,
+            resample_path=resample,
+            detect_gouges_detailed=gouges,
+            soft_limit_runs=lambda path, cfg: [],
+        ), unittest.mock.patch.multiple(
+            kinematics, build_trajectory=trajectory
+        ), unittest.mock.patch.multiple(
+            tool_model,
+            tool_pose=lambda *args, **kwargs: object(),
+            feed_class=feed_class,
+        ):
+            return toolpath_sim.generate_synthetic_carve_path(
+                trimesh.creation.box(extents=(1.0, 1.0, 1.0)),
+                config,
+                preset="demo",
+                on_progress=on_progress,
+            )
+
+    def test_local_fractions_map_through_the_measured_weight_table(self):
+        seen: list[tuple[str, float, str]] = []
+        calls: list[str] = []
+        self._generate_with_stubbed_phases(
+            lambda phase, fraction, message: seen.append((phase, fraction, message)),
+            calls,
+        )
+        self.assertEqual(calls, [name for name, _low, _high in self.WEIGHTS])
+
+        per_phase: dict[str, list[float]] = {}
+        for phase, fraction, _message in seen:
+            per_phase.setdefault(phase, []).append(fraction)
+        self.assertEqual(
+            list(per_phase), [name for name, _low, _high in self.WEIGHTS]
+        )
+        for phase, low, high in self.WEIGHTS:
+            with self.subTest(phase=phase):
+                self.assertAlmostEqual(per_phase[phase][0], low, places=9)
+                self.assertAlmostEqual(per_phase[phase][-1], high, places=9)
+        # Local 0.5 of the finishing phase is 75% of the wall clock.
+        self.assertAlmostEqual(per_phase["finishing"][1], 0.395, places=9)
+        self.assertEqual(len(seen), 13)
+
+        fractions = [fraction for _phase, fraction, _message in seen]
+        self.assertEqual(fractions, sorted(fractions), "global progress regressed")
+        self.assertGreaterEqual(fractions[0], 0.01)
+        self.assertLessEqual(fractions[-1], 0.98)
+        self.assertEqual(
+            {message for _phase, _fraction, message in seen},
+            {"Roughing", "Finishing", "Resampling", "Trajectory", "Gouge check", "Feed check"},
+        )
+
+    def test_collector_errors_return_early_without_regressing(self):
+        seen: list[tuple[str, float]] = []
+        calls: list[str] = []
+        result = self._generate_with_stubbed_phases(
+            lambda phase, fraction, _message: seen.append((phase, fraction)),
+            calls,
+            error=True,
+        )
+        self.assertEqual(result.frames, [])
+        self.assertIn("SOFT_LIMIT_EXCEEDED", {d.code for d in result.diagnostics})
+        self.assertEqual(calls, ["roughing", "finishing"])
+        fractions = [fraction for _phase, fraction in seen]
+        self.assertEqual(fractions, sorted(fractions))
+        self.assertGreaterEqual(fractions[0], 0.01)
+        self.assertLessEqual(fractions[-1], 0.98)
+
+    def test_zero_iteration_phases_still_emit_start_and_end(self):
+        config = load_config()
+        seen: list[float] = []
+
+        self.assertEqual(
+            toolpath_sim.resample_path(
+                [], [], [], config, on_progress=lambda fraction, message: seen.append(fraction)
+            ),
+            ([], [], []),
+        )
+        self.assertEqual(seen, [0.0, 1.0])
+
+        seen.clear()
+        report = toolpath_sim.detect_gouges_detailed(
+            trimesh.creation.box(extents=(1.0, 1.0, 1.0)),
+            [],
+            [],
+            config,
+            on_progress=lambda fraction, message: seen.append(fraction),
+        )
+        self.assertEqual(seen, [0.0, 1.0])
+        self.assertEqual(report.diagnostics, [])
+        self.assertEqual(report.events, [])
+
+    def test_job_cancelled_from_a_callback_aborts_the_generation(self):
+        self.assertTrue(issubclass(toolpath_sim.JobCancelled, RuntimeError))
+        seen: list[str] = []
+        calls: list[str] = []
+
+        def on_progress(phase, fraction, message):
+            seen.append(phase)
+            if phase == "finishing":
+                raise toolpath_sim.JobCancelled("cancelled by DELETE")
+
+        with self.assertRaises(toolpath_sim.JobCancelled):
+            self._generate_with_stubbed_phases(on_progress, calls)
+
+        self.assertEqual(calls, ["roughing", "finishing"])
+        self.assertNotIn("resample", seen)
+        self.assertNotIn("gouges", seen)
+        self.assertNotIn("feed_class", seen)
 
 
 def _real_target_signatures():
@@ -1341,6 +1600,346 @@ class TestSimulationAPI(ReleasesClassFixtures, unittest.TestCase):
         self.assertGreater(body["trajectory"]["frame_count"], 50_000)
         self.assertEqual(body["collision_log"]["status"], "ok")
         self.assertGreater(body["target_mesh"]["face_count"], 100)
+
+
+class TestSimulationJobs(ReleasesClassFixtures, unittest.TestCase):
+    """Split job/result endpoints, single-flight guard, retention and errors.
+
+    The generation worker never runs on a thread here: ``_start_job_worker`` is
+    patched to capture ``(job_id, request)`` and the test runs ``_run_job``
+    inline with ``generate_synthetic_carve_path`` stubbed, so every ordering is
+    deterministic and no multi-minute generation is paid for.
+    """
+
+    _class_fixtures = ("client",)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        self._clear_jobs()
+        self.addCleanup(self._clear_jobs)
+        # A leaked permit from an earlier test would make every 429 check lie.
+        if not server._GEN_SEMAPHORE.acquire(blocking=False):
+            self.fail("_GEN_SEMAPHORE was already held before the test")
+        server._GEN_SEMAPHORE.release()
+
+    # -- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _clear_jobs() -> None:
+        with server._JOBS_LOCK:
+            server._JOBS.clear()
+
+    def _clock(self, start: float = 1000.0) -> list[float]:
+        """Replace the module clock seam; returns the mutable current time."""
+
+        clock = [float(start)]
+        patcher = unittest.mock.patch.object(
+            server, "_monotonic", side_effect=lambda: clock[0]
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return clock
+
+    def _capture_worker(self) -> list[tuple[str, object]]:
+        """Patch `_start_job_worker` so the worker is captured, never started."""
+
+        captured: list[tuple[str, object]] = []
+        patcher = unittest.mock.patch.object(
+            server,
+            "_start_job_worker",
+            side_effect=lambda job_id, request: captured.append((job_id, request)),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return captured
+
+    def _start_job(self, payload: dict | None = None):
+        captured = self._capture_worker()
+        response = self.client.post(
+            "/api/sculpt-and-sim/jobs",
+            json={"preset": "demo"} if payload is None else payload,
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(len(captured), 1, "the worker was not started exactly once")
+        job_id, request = captured[0]
+        self.assertEqual(response.json(), {"job_id": job_id, "status": "running"})
+        return job_id, request
+
+    def _run_worker(self, job_id: str, request: object, generate: object) -> None:
+        with unittest.mock.patch.object(
+            toolpath_sim, "generate_synthetic_carve_path", new=generate
+        ):
+            server._run_job(job_id, request)
+
+    def _semaphore_free(self) -> bool:
+        if not server._GEN_SEMAPHORE.acquire(blocking=False):
+            return False
+        server._GEN_SEMAPHORE.release()
+        return True
+
+    @staticmethod
+    def _progressing_stub(phases: tuple[str, ...] = ("finishing",)):
+        """A generate stub that reports progress, then returns a real payload."""
+
+        def generate(mesh, config=None, preset="demo", on_progress=None):
+            for phase in phases:
+                on_progress(phase, 0.5, phase.title())
+            return _stub_toolpath_result(config)
+
+        return generate
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def test_async_job_lifecycle_and_retry_safe_result(self):
+        job_id, request = self._start_job({"sliders": {"nose": 0.8}, "preset": "demo"})
+
+        running = self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}")
+        self.assertEqual(running.status_code, 200, running.text)
+        self.assertEqual(running.json()["status"], "running")
+        self.assertEqual(running.json()["progress"], 0.0)
+        self.assertEqual(running.json()["job_id"], job_id)
+        self.assertIn("elapsed_ms", running.json())
+        conflict = self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}/result")
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+
+        self._run_worker(job_id, request, self._progressing_stub(("finishing",)))
+
+        done = self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}")
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertEqual(done.json()["status"], "done")
+        self.assertEqual(done.json()["progress"], 1.0)
+
+        first = self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}/result")
+        second = self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}/result")
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json(), second.json())
+        self.assertEqual(first.json()["status"], "ok")
+        self.assertGreater(first.json()["trajectory"]["frame_count"], 0)
+
+        deleted = self.client.delete(f"/api/sculpt-and-sim/jobs/{job_id}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(deleted.json()["status"], "deleted")
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}").status_code, 404
+        )
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}/result").status_code,
+            404,
+        )
+        self.assertTrue(self._semaphore_free())
+
+    def test_both_endpoints_return_429_while_a_generation_is_held(self):
+        captured = self._capture_worker()
+        self.assertTrue(server._GEN_SEMAPHORE.acquire(blocking=False))
+        try:
+            sync = self.client.post("/api/sculpt-and-sim", json={"preset": "demo"})
+            async_job = self.client.post(
+                "/api/sculpt-and-sim/jobs", json={"preset": "demo"}
+            )
+        finally:
+            server._GEN_SEMAPHORE.release()
+        self.assertEqual(sync.status_code, 429, sync.text)
+        self.assertEqual(async_job.status_code, 429, async_job.text)
+        self.assertEqual(captured, [], "a rejected submission started a worker")
+        self.assertEqual(server._JOBS, {})
+
+    # -- retention ---------------------------------------------------------
+
+    def test_finished_job_expires_after_the_ttl(self):
+        clock = self._clock()
+        status_id, status_request = self._start_job()
+        self._run_worker(status_id, status_request, self._progressing_stub())
+        result_id, result_request = self._start_job()
+        self._run_worker(result_id, result_request, self._progressing_stub())
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{status_id}").status_code, 200
+        )
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{result_id}/result").status_code,
+            200,
+        )
+
+        clock[0] += server._JOB_TTL_S + 1.0
+
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{status_id}").status_code, 404
+        )
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{result_id}/result").status_code,
+            404,
+        )
+
+    def test_retention_cap_evicts_the_oldest_finished_job(self):
+        clock = self._clock()
+        active_id, _active_request = self._start_job()
+        # Keep the job `running` (its worker is never run) but hand the permit
+        # back so later submissions are accepted.
+        server._GEN_SEMAPHORE.release()
+
+        finished = []
+        for _ in range(server._MAX_RETAINED_JOBS + 1):
+            clock[0] += 1.0
+            job_id, request = self._start_job()
+            self._run_worker(job_id, request, self._progressing_stub())
+            finished.append(job_id)
+
+        active = self.client.get(f"/api/sculpt-and-sim/jobs/{active_id}")
+        self.assertEqual(active.json()["status"], "running", "the active job was evicted")
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{finished[0]}").status_code,
+            404,
+            "the oldest finished job survived the retention cap",
+        )
+        for job_id in finished[1:]:
+            self.assertEqual(
+                self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}").status_code, 200
+            )
+        self.assertEqual(len(server._JOBS), server._MAX_RETAINED_JOBS + 1)
+        self.assertTrue(self._semaphore_free())
+
+    # -- cancellation ------------------------------------------------------
+
+    def test_delete_cancels_a_running_job_and_frees_the_guard(self):
+        job_id, request = self._start_job()
+        deleted = self.client.delete(f"/api/sculpt-and-sim/jobs/{job_id}")
+        self.assertEqual(deleted.status_code, 202, deleted.text)
+        self.assertEqual(deleted.json(), {"job_id": job_id, "status": "cancelling"})
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}").json()["status"],
+            "cancelling",
+        )
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}/result").status_code, 409
+        )
+
+        self._run_worker(job_id, request, self._progressing_stub(("finishing",)))
+
+        status = self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}")
+        self.assertEqual(status.json()["status"], "cancelled")
+        self.assertNotIn("error_kind", status.json())
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}/result").status_code, 404
+        )
+        self.assertTrue(self._semaphore_free())
+
+    def test_unpolled_job_is_abandoned_after_ninety_seconds(self):
+        clock = self._clock()
+        job_id, request = self._start_job()
+        clock[0] += server._SILENCE_S + 1.0
+
+        self._run_worker(job_id, request, self._progressing_stub(("finishing",)))
+
+        status = self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}")
+        self.assertEqual(status.json()["status"], "cancelled")
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}/result").status_code, 404
+        )
+        self.assertTrue(self._semaphore_free())
+
+    # -- validation and errors --------------------------------------------
+
+    def test_tool_cfg_preflight_is_422_before_the_guard(self):
+        captured = self._capture_worker()
+        response = self.client.post(
+            "/api/sculpt-and-sim/jobs",
+            json={"preset": "demo", "tool_cfg": {"heated_length_mm": 99.0}},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        detail = response.json()["detail"]
+        self.assertEqual(detail["diagnostics"][0]["code"], "TOOL_CFG_INVALID")
+        self.assertIsNone(detail["collision_log"])
+        self.assertEqual(captured, [])
+        self.assertEqual(server._JOBS, {})
+        self.assertTrue(self._semaphore_free())
+
+    def test_job_time_validation_error_keeps_the_detail(self):
+        job_id, request = self._start_job()
+        stub = _stub_toolpath_result(kinematics.load_config())
+        stub.diagnostics = [
+            kinematics.Diagnostic(
+                code="SOFT_LIMIT_EXCEEDED",
+                severity="error",
+                message="radial joint r=200.000 mm outside [-51.0, 135.0] mm",
+                axis="r",
+                value=200.0,
+                frame=1,
+            )
+        ]
+
+        self._run_worker(job_id, request, unittest.mock.Mock(return_value=stub))
+
+        status = self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}").json()
+        self.assertEqual(status["status"], "error")
+        self.assertEqual(status["error_kind"], "validation")
+        self.assertEqual(status["http_status"], 422)
+        self.assertEqual(status["detail"]["status"], "error")
+        self.assertIn(
+            "SOFT_LIMIT_EXCEEDED",
+            {d["code"] for d in status["detail"]["diagnostics"]},
+        )
+        self.assertEqual(status["detail"]["collision_log"]["status"], "error")
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}/result").status_code, 404
+        )
+        self.assertTrue(self._semaphore_free())
+
+    def test_unexpected_error_reports_a_safe_500(self):
+        job_id, request = self._start_job()
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("boom: /home/secret/path")
+
+        with self.assertLogs(server.LOGGER, level="ERROR") as records:
+            self._run_worker(job_id, request, explode)
+        self.assertTrue(
+            any("Traceback" in line for line in records.output),
+            "the traceback was not logged server-side",
+        )
+
+        body = self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}").json()
+        self.assertEqual(body["status"], "error")
+        self.assertEqual(body["error_kind"], "internal")
+        self.assertEqual(body["http_status"], 500)
+        self.assertIn("generation failed", body["detail"]["message"])
+        encoded = json.dumps(body)
+        self.assertNotIn("secret", encoded)
+        self.assertNotIn("Traceback", encoded)
+        self.assertEqual(
+            self.client.get(f"/api/sculpt-and-sim/jobs/{job_id}/result").status_code, 404
+        )
+        self.assertTrue(self._semaphore_free())
+
+    def test_run_sculpt_and_sim_emits_sculpt_and_encode_bounds(self):
+        seen: list[tuple[str, float, str]] = []
+        request = server.SimulationRequest(preset="demo")
+        with unittest.mock.patch.object(
+            toolpath_sim,
+            "generate_synthetic_carve_path",
+            new=self._progressing_stub(("finishing",)),
+        ):
+            payload = server._run_sculpt_and_sim(
+                request,
+                lambda phase, fraction, message: seen.append(
+                    (phase, fraction, message)
+                ),
+            )
+        self.assertEqual(payload["status"], "ok")
+
+        phases = [phase for phase, _fraction, _message in seen]
+        self.assertEqual(phases[0], "sculpt")
+        self.assertEqual(phases[-1], "encode")
+        sculpt = [fraction for phase, fraction, _m in seen if phase == "sculpt"]
+        self.assertEqual(sculpt[0], 0.0)
+        self.assertEqual(sculpt[-1], 0.01)
+        encode = [fraction for phase, fraction, _m in seen if phase == "encode"]
+        self.assertEqual(encode[0], 0.98)
+        self.assertGreater(encode[-1], 0.98)
+        self.assertLess(encode[-1], 1.0)
+        fractions = [fraction for _phase, fraction, _message in seen]
+        self.assertEqual(fractions, sorted(fractions), "progress regressed")
 
 
 class _FakeNeedle(trimesh.Trimesh):

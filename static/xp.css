@@ -848,6 +848,59 @@ select {
   }
 }
 
+/* XP Luna segmented progress box (toolpath generation) */
+.processing-progress-box {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-sm);
+  min-width: 280px;
+  max-width: 360px;
+  padding: var(--space-md) var(--space-lg);
+  background: var(--surface);
+  color: var(--on-surface);
+  border: 2px solid;
+  border-color: var(--border-highlight) var(--border-shadow) var(--border-shadow) var(--border-highlight);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.xp-progress-track {
+  height: 18px;
+  padding: 2px;
+  background: var(--surface-light);
+  border: 2px solid;
+  border-color: var(--border-shadow) var(--border-highlight) var(--border-highlight) var(--border-shadow);
+  overflow: hidden;
+}
+
+.xp-progress-fill {
+  height: 100%;
+  width: 0;
+  background: repeating-linear-gradient(90deg, #70c040 0 8px, transparent 8px 10px);
+  transition: width 0.2s linear;
+}
+
+.processing-progress-readout {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-md);
+}
+
+#progress-pct,
+#progress-elapsed {
+  font-family: var(--font-code);
+  font-size: 11px;
+  color: var(--on-surface-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .xp-progress-fill {
+    transition: none;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Status bar                                                          */
 /* ------------------------------------------------------------------ */

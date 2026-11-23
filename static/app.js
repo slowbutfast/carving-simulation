@@ -77,6 +77,25 @@ const WARNING_CODES = new Set([
 const SLIDER_IDS = ['nose', 'brow', 'cheeks', 'jaw', 'chin'];
 const MOBILE_TABS = ['model', 'sculpt', 'sim'];
 
+/** Async toolpath job polling: 500 ms ticks, 3 transient failures tolerated. */
+const JOB_POLL_INTERVAL_MS = 500;
+const JOB_MAX_TRANSIENT_FAILURES = 3;
+const JOB_STOPPING_MESSAGE = 'Previous generation is stopping — try again in a moment';
+
+/** Backend phase keys -> the label announced once per phase transition. */
+const JOB_PHASE_LABELS = new Map([
+  ['sculpt', 'Sculpting'],
+  ['roughing', 'Roughing'],
+  ['finishing', 'Finishing'],
+  ['resample', 'Resampling'],
+  ['resampling', 'Resampling'],
+  ['trajectory', 'Trajectory'],
+  ['gouges', 'Gouge check'],
+  ['feed_class', 'Feed check'],
+  ['encode', 'Encoding'],
+  ['encoding', 'Encoding'],
+]);
+
 const state = {
   data: null,
   frames: null,
@@ -136,6 +155,12 @@ for (const id of [
   'status-state',
   'diagnostics',
   'diag-count',
+  'processing-overlay',
+  'progress-label',
+  'progress-bar',
+  'progress-fill',
+  'progress-pct',
+  'progress-elapsed',
   'help-dialog',
   'help-dialog-close',
   'help-dialog-ok',
@@ -597,6 +622,248 @@ function stockPresetValue() {
   return checked ? checked.value : 'demo';
 }
 
+// ---------------------------------------------------------------------------
+// Async toolpath jobs (poll / result / delete-ack)
+// ---------------------------------------------------------------------------
+
+/** The job the current poll loop owns; `null` when nothing is generating. */
+let activeJob = null;
+
+function phaseLabel(phase) {
+  if (!phase) return 'Generating';
+  return JOB_PHASE_LABELS.get(phase) || String(phase);
+}
+
+/**
+ * `aria-live="polite"` announces every text change, so the label is written
+ * only when the phase really changed (once per phase, not once per tick).
+ */
+function setProgressLabel(text) {
+  const label = dom['progress-label'];
+  if (label && label.textContent !== text) label.textContent = text;
+}
+
+function resetProgress() {
+  if (dom['progress-fill']) dom['progress-fill'].style.width = '0%';
+  if (dom['progress-bar']) dom['progress-bar'].setAttribute('aria-valuenow', '0');
+  if (dom['progress-pct']) dom['progress-pct'].textContent = '0%';
+  if (dom['progress-elapsed']) dom['progress-elapsed'].textContent = '0 s';
+  setProgressLabel('Sculpting');
+}
+
+function showProcessingOverlay() {
+  resetProgress();
+  if (dom['processing-overlay']) dom['processing-overlay'].hidden = false;
+}
+
+function hideProcessingOverlay() {
+  if (dom['processing-overlay']) dom['processing-overlay'].hidden = true;
+}
+
+function updateProgressElapsed() {
+  if (!activeJob || !dom['progress-elapsed']) return;
+  const seconds = Math.max(0, (Date.now() - activeJob.startedAt) / 1000);
+  dom['progress-elapsed'].textContent = `${seconds.toFixed(1)} s`;
+}
+
+/** One poll tick: bar width, aria value, percentage, elapsed and phase label. */
+function updateProgress(status) {
+  const raw = Number(status && status.progress);
+  const fraction = Number.isFinite(raw) ? Math.min(1, Math.max(0, raw)) : 0;
+  const percent = Math.round(fraction * 100);
+  if (dom['progress-fill']) dom['progress-fill'].style.width = `${fraction * 100}%`;
+  if (dom['progress-bar']) dom['progress-bar'].setAttribute('aria-valuenow', String(percent));
+  if (dom['progress-pct']) dom['progress-pct'].textContent = `${percent}%`;
+  setProgressLabel(phaseLabel(status && status.phase));
+  updateProgressElapsed();
+}
+
+/**
+ * One job-API round trip.  Unlike `requestJson` this keeps the HTTP status and
+ * the parsed body, so 202/404/422/429/5xx each take their own path, and it
+ * flags transient failures (network, 5xx) so the poller can retry them.
+ */
+async function jobRequest(url, options = {}) {
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    return { status: 0, ok: false, body: null, transient: true, failure: error.message };
+  }
+  let text = '';
+  try {
+    text = await response.text();
+  } catch (error) {
+    return {
+      status: response.status,
+      ok: false,
+      body: null,
+      transient: response.status >= 500,
+      failure: error.message,
+    };
+  }
+  let body = null;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = null;
+    }
+  }
+  return {
+    status: response.status,
+    ok: response.ok,
+    body,
+    transient: response.status >= 500,
+    failure: null,
+  };
+}
+
+/** First human-readable message out of an error body (`detail` or `message`). */
+function jobErrorText(body) {
+  if (!body || typeof body !== 'object') return null;
+  const detail = body.detail;
+  const diagnostics = detail && typeof detail === 'object' ? detail.diagnostics : null;
+  if (Array.isArray(diagnostics) && diagnostics.length) {
+    const first = diagnostics[0] || {};
+    const message = String(first.message || first.code || '').trim();
+    if (message) return message;
+  }
+  if (Array.isArray(detail) && detail.length) {
+    // FastAPI's own request-validation shape: [{ loc, msg, type }].
+    const first = detail[0] || {};
+    return String(first.msg || first.message || JSON.stringify(first));
+  }
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (typeof body.message === 'string' && body.message.trim()) return body.message;
+  if (detail && typeof detail === 'object') return JSON.stringify(detail);
+  return null;
+}
+
+function jobFailureMessage(result) {
+  if (result.status === 0) return 'Lost contact with the server while generating the toolpath.';
+  if (result.status >= 500) return 'The server could not generate the toolpath. Try again.';
+  return jobErrorText(result.body) || `Toolpath generation failed (HTTP ${result.status}).`;
+}
+
+function reportJobFailure(message) {
+  if (dom['sculpt-hint']) dom['sculpt-hint'].textContent = 'error';
+  setStatusState('ERROR', 'collision');
+  setStatusText(message);
+  appendDiagnostic({
+    code: 'API_ERROR',
+    severity: 'error',
+    message,
+    count: 1,
+  });
+}
+
+/** Chain the next tick with `setTimeout`; `visibilitychange` can resolve it early. */
+function waitForNextPoll(job) {
+  return new Promise((resolve) => {
+    job.wake = resolve;
+    job.timer = window.setTimeout(() => {
+      job.timer = null;
+      job.wake = null;
+      resolve();
+    }, JOB_POLL_INTERVAL_MS);
+  });
+}
+
+/** Returning to a visible tab polls at once instead of waiting out the tick. */
+function wakeActiveJob() {
+  if (!activeJob) return;
+  if (activeJob.timer) {
+    window.clearTimeout(activeJob.timer);
+    activeJob.timer = null;
+  }
+  const wake = activeJob.wake;
+  activeJob.wake = null;
+  if (wake) wake();
+}
+
+function attachPageHide(job) {
+  if (job.onPageHide) return;
+  job.onPageHide = () => {
+    // Best effort: the server cancels the worker and frees its semaphore.
+    fetch(`/api/sculpt-and-sim/jobs/${encodeURIComponent(job.id)}`, {
+      method: 'DELETE',
+      keepalive: true,
+    }).catch(() => {});
+  };
+  window.addEventListener('pagehide', job.onPageHide);
+}
+
+function detachPageHide(job) {
+  if (!job || !job.onPageHide) return;
+  window.removeEventListener('pagehide', job.onPageHide);
+  job.onPageHide = null;
+}
+
+/** The result is retained until this ack, so a late fetch can still succeed. */
+function acknowledgeJob(jobId) {
+  fetch(`/api/sculpt-and-sim/jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' }).catch(
+    () => {}
+  );
+}
+
+async function fetchJobResult(job) {
+  const url = `/api/sculpt-and-sim/jobs/${encodeURIComponent(job.id)}/result`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await jobRequest(url);
+    if (result.ok) {
+      if (result.body) return result.body;
+      reportJobFailure('The toolpath result arrived empty. Try again.');
+      return null;
+    }
+    if (!result.transient || attempt > 0) {
+      reportJobFailure(jobFailureMessage(result));
+      return null;
+    }
+  }
+  return null;
+}
+
+async function pollJob(job) {
+  const url = `/api/sculpt-and-sim/jobs/${encodeURIComponent(job.id)}`;
+  for (;;) {
+    const result = await jobRequest(url);
+    if (!result.ok) {
+      if (result.status === 404) {
+        reportJobFailure('The toolpath job expired. Press SCULPT & SIMULATE to try again.');
+        return null;
+      }
+      if (result.transient) {
+        // Tolerate three consecutive dropped ticks, then give up cleanly.
+        job.transientFailures += 1;
+        if (job.transientFailures <= JOB_MAX_TRANSIENT_FAILURES) {
+          await waitForNextPoll(job);
+          continue;
+        }
+        reportJobFailure('Lost contact with the toolpath job. Try again.');
+        return null;
+      }
+      reportJobFailure(jobFailureMessage(result));
+      return null;
+    }
+    job.transientFailures = 0;
+    const status = result.body || {};
+    updateProgress(status);
+    if (status.status === 'done') return fetchJobResult(job);
+    if (status.status === 'error') {
+      reportJobFailure(jobFailureMessage(result));
+      return null;
+    }
+    if (status.status === 'cancelled' || status.status === 'cancelling') {
+      if (dom['sculpt-hint']) dom['sculpt-hint'].textContent = 'cancelled';
+      setStatusState('PAUSED', '');
+      setStatusText(status.message || 'Toolpath generation cancelled.');
+      return null;
+    }
+    await waitForNextPoll(job);
+  }
+}
+
 async function sculptAndSimulate() {
   if (state.generating) return;
   state.generating = true;
@@ -604,6 +871,9 @@ async function sculptAndSimulate() {
   setStatusText('Generating toolpath...');
   if (dom['simulate-button']) dom['simulate-button'].disabled = true;
   if (dom['sculpt-hint']) dom['sculpt-hint'].textContent = 'generating...';
+  showProcessingOverlay();
+
+  let job = null;
   try {
     const sliders = {};
     for (const id of SLIDER_IDS) {
@@ -614,7 +884,7 @@ async function sculptAndSimulate() {
       R_stock_mm: Number(dom['R_stock']?.value) || DEFAULT_CONFIG.stock.R_stock_mm,
       H_stock_mm: Number(dom['H_stock']?.value) || DEFAULT_CONFIG.stock.H_stock_mm,
     };
-    const body = await requestJson('Sculpt & Simulate', '/api/sculpt-and-sim', {
+    const started = await jobRequest('/api/sculpt-and-sim/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -623,18 +893,50 @@ async function sculptAndSimulate() {
         stock_cfg: stockConfig,
       }),
     });
-    loadSimulation(body);
+
+    if (started.status === 429) {
+      reportJobFailure(JOB_STOPPING_MESSAGE);
+      return;
+    }
+    if (!started.ok) {
+      reportJobFailure(
+        started.status === 422
+          ? jobErrorText(started.body) || 'The sculpt request is not valid.'
+          : jobFailureMessage(started)
+      );
+      return;
+    }
+    if (!started.body || !started.body.job_id) {
+      reportJobFailure('The server did not return a toolpath job id.');
+      return;
+    }
+
+    job = {
+      id: started.body.job_id,
+      startedAt: Date.now(),
+      timer: null,
+      wake: null,
+      transientFailures: 0,
+      onPageHide: null,
+    };
+    activeJob = job;
+    attachPageHide(job);
+
+    const payload = await pollJob(job);
+    if (!payload) return;
+    loadSimulation(payload);
+    acknowledgeJob(job.id);
   } catch (error) {
-    if (dom['sculpt-hint']) dom['sculpt-hint'].textContent = 'error';
-    setStatusState('ERROR', 'collision');
-    setStatusText(String(error.message || error));
-    appendDiagnostic({
-      code: 'API_ERROR',
-      severity: 'error',
-      message: String(error.message || error),
-      count: 1,
-    });
+    reportJobFailure(String(error.message || error));
   } finally {
+    if (job) {
+      if (job.timer) window.clearTimeout(job.timer);
+      job.timer = null;
+      job.wake = null;
+      detachPageHide(job);
+    }
+    activeJob = null;
+    hideProcessingOverlay();
     state.generating = false;
     if (dom['simulate-button']) dom['simulate-button'].disabled = false;
   }
@@ -1209,6 +1511,12 @@ function wireEvents() {
       closeMenus();
       closeHelpDialog();
     }
+  });
+
+  // A background tab throttles timers and the server abandons silent jobs, so
+  // the first thing a returning tab does is poll.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') wakeActiveJob();
   });
 
   dom['menu-upload']?.addEventListener('click', () => {
