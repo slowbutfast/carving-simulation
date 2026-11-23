@@ -1,0 +1,56 @@
+{
+  "mesh": "presets/base_head.stl (sculpted)",
+  "sliders": {
+    "nose": 1.0,
+    "chin": 0.6,
+    "brow": 0.4
+  },
+  "preset": "demo",
+  "frames": 85004,
+  "unreachable_percent": 16.93548387096774,
+  "gouge_events": 0,
+  "phases": [
+    {
+      "phase": "build_roughing",
+      "wall_s": 0.89,
+      "rss_before_mb": 85.3,
+      "rss_after_mb": 91.6,
+      "peak_mb": 175.6
+    },
+    {
+      "phase": "build_finishing",
+      "wall_s": 184.49,
+      "rss_before_mb": 91.6,
+      "rss_after_mb": 272.8,
+      "peak_mb": 3313.1
+    },
+    {
+      "phase": "resample_path",
+      "wall_s": 31.49,
+      "rss_before_mb": 266.0,
+      "rss_after_mb": 266.0,
+      "peak_mb": 3313.1
+    },
+    {
+      "phase": "build_trajectory",
+      "wall_s": 1.21,
+      "rss_before_mb": 266.0,
+      "rss_after_mb": 266.0,
+      "peak_mb": 3313.1
+    },
+    {
+      "phase": "soft_limit_runs",
+      "wall_s": 0.07,
+      "rss_before_mb": 266.0,
+      "rss_after_mb": 266.0,
+      "peak_mb": 3313.1
+    },
+    {
+      "phase": "detect_gouges_detailed",
+      "wall_s": 28.15,
+      "rss_before_mb": 266.0,
+      "rss_after_mb": 294.4,
+      "peak_mb": 3313.1
+    }
+  ]
+}
